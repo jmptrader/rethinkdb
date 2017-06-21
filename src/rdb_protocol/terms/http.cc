@@ -1,21 +1,23 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include <stdint.h>
 
 #include <string>
 #include "debug.hpp"
 
+#include "clustering/administration/metadata.hpp"
+#include "extproc/http_runner.hpp"
 #include "math.hpp"
 #include "rdb_protocol/error.hpp"
 #include "rdb_protocol/func.hpp"
 #include "rdb_protocol/op.hpp"
 #include "rdb_protocol/terms/terms.hpp"
-#include "extproc/http_runner.hpp"
+#include "rpc/semilattice/view.hpp"
 
 namespace ql {
 
 class http_term_t : public op_term_t {
 public:
-    http_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    http_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1),
                     optargspec_t({"data",
                                   "timeout",
@@ -34,8 +36,8 @@ private:
     virtual const char *name() const { return "http"; }
 
     // No HTTP term is considered deterministic
-    virtual bool is_deterministic() const {
-        return false;
+    virtual deterministic_t is_deterministic() const {
+        return deterministic_t::no;
     }
 
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const;
@@ -138,8 +140,8 @@ public:
     http_datum_stream_t(http_opts_t &&_opts,
                         counted_t<const func_t> &&_depaginate_fn,
                         int64_t _depaginate_limit,
-                        backtrace_id_t bt) :
-        eager_datum_stream_t(bt),
+                        backtrace_id_t _bt) :
+        eager_datum_stream_t(_bt),
         opts(std::move(_opts)),
         depaginate_fn(_depaginate_fn),
         depaginate_limit(_depaginate_limit),
@@ -222,6 +224,12 @@ void dispatch_http(env_t *env,
 
 scoped_ptr_t<val_t> http_term_t::eval_impl(scope_env_t *env, args_t *args,
                                            eval_flags_t) const {
+    try {
+        env->env->get_user_context().require_connect_permission(env->env->get_rdb_ctx());
+    } catch (auth::permission_error_t const &permission_error) {
+        rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
+    }
+
     http_opts_t opts;
     opts.limits = env->env->limits();
     opts.version = env->env->reql_version();
@@ -566,7 +574,7 @@ std::string http_term_t::get_auth_item(const datum_t &datum,
 // The `auth` optarg takes an object consisting of the following fields:
 //  type - STRING, the type of authentication to perform 'basic' or 'digest'
 //      defaults to 'basic'
-//  user - STRING, the username to use
+//  user - STRING, the user_context to use
 //  pass - STRING, the password to use
 void http_term_t::get_auth(scope_env_t *env,
                            args_t *args,
@@ -773,7 +781,7 @@ void http_term_t::get_bool_optarg(const std::string &optarg_name,
 }
 
 counted_t<term_t> make_http_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<http_term_t>(env, term);
 }
 

@@ -71,7 +71,7 @@ static void validate_params(
             "to put the data.",
             query_state_t::FAILED);
     }
-    static const size_t max_shards = 32;
+    static const size_t max_shards = 64;
     if (params.num_shards > max_shards) {
         throw admin_op_exc_t(
             strprintf("Maximum number of shards is %zu.", max_shards),
@@ -100,6 +100,12 @@ static void validate_params(
     for (auto it = params.num_replicas.begin(); it != params.num_replicas.end(); ++it) {
         if (it->second == 0) {
             continue;
+        }
+        if (servers_with_tags.count(it->first) == 0) {
+            throw admin_op_exc_t(
+                strprintf("Could not find any servers with server tag `%s`.",
+                          it->first.c_str()),
+                query_state_t::FAILED);
         }
         for (const server_id_t &server : servers_with_tags.at(it->first)) {
             if (servers_claimed.count(server) == 0) {
@@ -388,7 +394,7 @@ void table_generate_config(
                 &yielder,
                 interruptor,
                 [&](size_t shard, const server_id_t &server) {
-                    guarantee(config_shards_out->at(shard).primary_replica.is_unset());
+                    guarantee(config_shards_out->at(shard).primary_replica.get_uuid().is_unset());
                     config_shards_out->at(shard).all_replicas.insert(server);
                     config_shards_out->at(shard).primary_replica = server;
                     /* We have to update `pairings` as priamry replicas are selected so
@@ -431,7 +437,7 @@ void table_generate_config(
 
     for (size_t shard_ix = 0; shard_ix < params.num_shards; ++shard_ix) {
         const table_config_t::shard_t &shard = (*config_shards_out)[shard_ix];
-        guarantee(!shard.primary_replica.is_unset());
+        guarantee(!shard.primary_replica.get_uuid().is_unset());
         guarantee(shard.all_replicas.size() == total_replicas);
         for (const server_id_t &replica : shard.all_replicas) {
             server_names_out->names[replica] = server_names.names.at(replica);

@@ -10,12 +10,6 @@
 #include "arch/runtime/runtime_utils.hpp"
 #include "arch/runtime/event_queue_types.hpp"
 
-const int poll_event_in = 1;
-const int poll_event_out = 2;
-const int poll_event_err = 4;
-const int poll_event_hup = 8;
-const int poll_event_rdhup = 16;
-
 std::string format_poll_event(int event);
 
 // Queue stats (declared here so whichever queue is chosen can access it)
@@ -28,7 +22,14 @@ struct pm_eventloop_singleton_t {
 };
 
 /* Pick the queue now*/
-#if defined(__MACH__)
+
+#if defined(_WIN32)
+
+// Use IOCP
+#include "arch/runtime/event_queue/iocp.hpp"
+typedef iocp_event_queue_t linux_event_queue_t;
+
+#elif defined(__MACH__)
 
 // Use kqueue, which is much faster than poll on OS X
 #include "arch/runtime/event_queue/kqueue.hpp"

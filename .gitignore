@@ -1,5 +1,5 @@
 *.pyc
-*.swp
+*.sw?
 *~
 .DS_Store
 .tags
@@ -14,6 +14,9 @@ last_tested_versions
 /config.mk
 /mk/gen/*
 /build
+
+/drivers/ruby/coverage/*
+/drivers/ruby/Gemfile.lock
 
 /src/quickrun_rethinkdb
 /src/debug_rethinkdb
@@ -44,3 +47,13 @@ last_tested_versions
 /**/.rethinkdbTestTemp-*
 /**/run
 /test_results.*
+
+/windows_deps/
+/x64/
+/RethinkDB.sdf
+/RethinkDB.vcxproj.filters
+/RethinkDB.vcxproj.user
+/RethinkDB.vcxproj.xml
+/precompiled
+*.xml
+*.iml

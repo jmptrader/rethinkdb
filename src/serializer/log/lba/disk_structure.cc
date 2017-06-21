@@ -1,21 +1,25 @@
 // Copyright 2010-2014 RethinkDB, all rights reserved.
 #include "serializer/log/lba/disk_structure.hpp"
 
+#include <algorithm>
+
 #include "containers/scoped.hpp"
 #include "math.hpp"
 
 lba_disk_structure_t::lba_disk_structure_t(extent_manager_t *_em, file_t *_file)
-    : em(_em), file(_file), superblock_extent(NULL), last_extent(NULL)
+    : em(_em), file(_file), superblock_extent(nullptr), last_extent(nullptr)
 {
 }
 
-lba_disk_structure_t::lba_disk_structure_t(extent_manager_t *_em, file_t *_file, lba_shard_metablock_t *metablock)
+lba_disk_structure_t::lba_disk_structure_t(extent_manager_t *_em, file_t *_file,
+                                           lba_shard_metablock_t *metablock)
     : em(_em), file(_file)
 {
     if (metablock->last_lba_extent_offset != NULL_OFFSET) {
-        last_extent = new lba_disk_extent_t(em, file, metablock->last_lba_extent_offset, metablock->last_lba_extent_entries_count);
+        last_extent = new lba_disk_extent_t(em, file, metablock->last_lba_extent_offset,
+                                            metablock->last_lba_extent_entries_count);
     } else {
-        last_extent = NULL;
+        last_extent = nullptr;
     }
 
     if (metablock->lba_superblock_offset != NULL_OFFSET) {
@@ -29,14 +33,14 @@ lba_disk_structure_t::lba_disk_structure_t(extent_manager_t *_em, file_t *_file,
         superblock_extent = new extent_t(em, file, superblock_extent_offset,
             superblock_offset + superblock_size - superblock_extent_offset);
 
-        startup_superblock_buffer = reinterpret_cast<lba_superblock_t *>(malloc_aligned(superblock_size, DEVICE_BLOCK_SIZE));
+        startup_superblock_buffer = scoped_device_block_aligned_ptr_t<lba_superblock_t>(superblock_size);
         superblock_extent->read(
             superblock_offset - superblock_extent_offset,
             superblock_size,
-            startup_superblock_buffer,
+            startup_superblock_buffer.get(),
             this);
     } else {
-        superblock_extent = NULL;
+        superblock_extent = nullptr;
     }
 }
 
@@ -59,21 +63,23 @@ void lba_disk_structure_t::on_extent_read() {
                 startup_superblock_buffer->entries[i].lba_entries_count));
     }
 
-    free(startup_superblock_buffer);
+    startup_superblock_buffer.reset();
 
     start_callback->on_lba_load();
 }
 
 void lba_disk_structure_t::add_entry(block_id_t block_id, repli_timestamp_t recency,
-                                     flagged_off64_t offset, uint32_t ser_block_size,
-                                     file_account_t *io_account, extent_transaction_t *txn) {
+                                     flagged_off64_t offset, uint16_t ser_block_size,
+                                     file_account_t *io_account,
+                                     extent_transaction_t *txn) {
     if (last_extent && last_extent->full()) {
         /* We have filled up an extent. Transfer it to the superblock. */
 
         extents_in_superblock.push_back(last_extent);
-        last_extent = NULL;
+        last_extent = nullptr;
 
-        /* Since there is a new extent on the superblock, we need to rewrite the superblock. */
+        /* Since there is a new extent on the superblock, we need to rewrite the
+           superblock. */
 
         write_superblock(io_account, txn);
     }
@@ -90,7 +96,7 @@ void lba_disk_structure_t::add_entry(block_id_t block_id, repli_timestamp_t rece
 std::set<lba_disk_extent_t *> lba_disk_structure_t::get_inactive_extents() const {
     std::set<lba_disk_extent_t *> result;
     for (lba_disk_extent_t *e = extents_in_superblock.head();
-         e != NULL; e = extents_in_superblock.next(e)) {
+         e != nullptr; e = extents_in_superblock.next(e)) {
         result.insert(e);
     }
     return result;
@@ -118,7 +124,7 @@ void lba_disk_structure_t::write_superblock(file_account_t *io_account,
     if (superblock_extent
             && superblock_extent->amount_filled + superblock_size > em->extent_size) {
         superblock_extent->destroy(txn);
-        superblock_extent = NULL;
+        superblock_extent = nullptr;
     }
 
     if (!superblock_extent) {
@@ -128,13 +134,13 @@ void lba_disk_structure_t::write_superblock(file_account_t *io_account,
     /* Prepare the new superblock. */
 
     scoped_malloc_t<char> buffer(ceil_aligned(superblock_size, DEVICE_BLOCK_SIZE));
-    bzero(buffer.get(), ceil_aligned(superblock_size, DEVICE_BLOCK_SIZE));
+    memset(buffer.get(), 0, ceil_aligned(superblock_size, DEVICE_BLOCK_SIZE));
 
     lba_superblock_t *new_superblock = reinterpret_cast<lba_superblock_t *>(buffer.get());
     memcpy(new_superblock->magic, lba_super_magic, LBA_SUPER_MAGIC_SIZE);
     int i = 0;
     for (lba_disk_extent_t *e = extents_in_superblock.head();
-         e != NULL; e = extents_in_superblock.next(e)) {
+         e != nullptr; e = extents_in_superblock.next(e)) {
         new_superblock->entries[i].offset = e->data->extent_ref.offset();
         new_superblock->entries[i].lba_entries_count = e->count;
         i++;
@@ -148,45 +154,57 @@ void lba_disk_structure_t::write_superblock(file_account_t *io_account,
             ceil_aligned(superblock_size, DEVICE_BLOCK_SIZE), io_account);
 }
 
-class lba_writer_t :
-    public extent_t::sync_callback_t
+class lba_disk_structure_writer_t :
+    public extent_t::completion_callback_t
 {
 public:
     int outstanding_cbs;
-    lba_disk_structure_t::sync_callback_t *callback;
+    lba_disk_structure_t::completion_callback_t *callback;
 
-    explicit lba_writer_t(lba_disk_structure_t::sync_callback_t *cb) {
+    explicit lba_disk_structure_writer_t(
+            lba_disk_structure_t::completion_callback_t *cb) {
         outstanding_cbs = 0;
         callback = cb;
     }
 
-    void on_extent_sync() {
+    void on_extent_completion() {
         outstanding_cbs--;
         if (outstanding_cbs == 0) {
-            if (callback) callback->on_lba_sync();
+            if (callback) {
+                callback->on_lba_completion();
+            }
             delete this;
         }
     }
 };
 
-void lba_disk_structure_t::sync(file_account_t *io_account, sync_callback_t *cb) {
-    lba_writer_t *writer = new lba_writer_t(cb);
+void lba_disk_structure_t::write_outstanding(file_account_t *io_account,
+                                             completion_callback_t *cb) {
+    lba_disk_structure_writer_t *writer = new lba_disk_structure_writer_t(cb);
 
-    /* Count how many things need to be synced */
-    if (last_extent) writer->outstanding_cbs++;
-    if (superblock_extent) writer->outstanding_cbs++;
+    /* Count how many things need to be completed */
+    if (last_extent) {
+        writer->outstanding_cbs++;
+    }
+    if (superblock_extent) {
+        writer->outstanding_cbs++;
+    }
     writer->outstanding_cbs += extents_in_superblock.size();
 
     /* Sync the things that need to be synced */
     if (writer->outstanding_cbs == 0) {
-        cb->on_lba_sync();
+        cb->on_lba_completion();
         delete writer;
     } else {
-        if (last_extent) last_extent->sync(io_account, writer);
-        if (superblock_extent) superblock_extent->sync(writer);
+        if (last_extent) {
+            last_extent->write_outstanding(io_account, writer);
+        }
+        if (superblock_extent) {
+            superblock_extent->wait_for_write_completion(writer);
+        }
         for (lba_disk_extent_t *e = extents_in_superblock.head();
-             e != NULL; e = extents_in_superblock.next(e)) {
-            e->sync(io_account, writer);
+             e != nullptr; e = extents_in_superblock.next(e)) {
+            e->write_outstanding(io_account, writer);
         }
     }
 }
@@ -254,24 +272,25 @@ struct reader_t
     };
     std::vector< extent_reader_t* > readers;
 
-    int next_reader;   // The index of the next reader that we should call start_reading() on
+    // The index of the next reader that we should call start_reading() on
+    int next_reader;
 
-    // The number of readers that have done start_reading() but not done(). Used to throttle the
-    // reading process so that we stay under LBA_READ_BUFFER_SIZE.
+    // The number of readers that have done start_reading() but not done(). Used to
+    // throttle the reading process so that we stay under LBA_READ_BUFFER_SIZE.
     int active_readers;
 
     reader_t(lba_disk_structure_t *_ds, in_memory_index_t *_index, lba_disk_structure_t::read_callback_t *cb)
         : ds(_ds), index(_index), rcb(cb)
     {
         for (lba_disk_extent_t *e = ds->extents_in_superblock.head();
-             e != NULL; e = ds->extents_in_superblock.next(e)) {
+             e != nullptr; e = ds->extents_in_superblock.next(e)) {
             new extent_reader_t(this, e);
         }
         if (ds->last_extent) new extent_reader_t(this, ds->last_extent);
 
-        /* The constructor for extent_reader_t pushed them onto our 'readers' vector. So now we
-        have a vector with an extent_reader_t object for each extent we need to read, but none
-        of them have been started yet. */
+        /* The constructor for extent_reader_t pushed them onto our 'readers' vector. So
+        now we have a vector with an extent_reader_t object for each extent we need to
+        read, but none of them have been started yet. */
 
         if (readers.empty()) {
             done();
@@ -284,7 +303,8 @@ struct reader_t
 
     void start_more_readers() {
         int limit = std::max<int>(LBA_READ_BUFFER_SIZE / ds->em->extent_size / LBA_SHARD_FACTOR, 1);
-        while (next_reader != static_cast<int>(readers.size()) && active_readers < limit) {
+        while (next_reader != static_cast<int>(readers.size())
+               && active_readers < limit) {
             readers[next_reader++]->start_reading();
         }
     }

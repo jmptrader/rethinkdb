@@ -6,7 +6,7 @@
 #include "btree/depth_first_traversal.hpp"
 #include "btree/leaf_node.hpp"
 #include "concurrency/pmap.hpp"
-#include "containers/archive/boost_types.hpp"
+#include "containers/archive/optional.hpp"
 #include "containers/archive/stl_types.hpp"
 
 /* `MAX_CONCURRENT_VALUE_LOADS` is the maximum number of coroutines we'll use for loading
@@ -130,7 +130,7 @@ continue_bool_t btree_send_backfill_pre(
                     });
                 for (const btree_key_t *key : keys) {
                     backfill_pre_item_t pre_item;
-                    pre_item.range = key_range_t(key);
+                    pre_item.range = key_range_t::one_key(key);
                     if (continue_bool_t::ABORT ==
                             pre_item_consumer->on_pre_item(std::move(pre_item))) {
                         return continue_bool_t::ABORT;
@@ -189,7 +189,7 @@ public:
             backfill_item_t &&item,
             const counted_t<counted_buf_lock_and_read_t> &buf,
             signal_t *interruptor) {
-        new_semaphore_acq_t sem_acq(&semaphore, item.pairs.size());
+        new_semaphore_in_line_t sem_acq(&semaphore, item.pairs.size());
         wait_interruptible(sem_acq.acquisition_signal(), interruptor);
         coro_t::spawn_sometime(std::bind(
             &backfill_item_loader_t::handle_item, this,
@@ -199,7 +199,7 @@ public:
 
     void on_empty_range(
             const key_range_t::right_bound_t &empty_range, signal_t *interruptor) {
-        new_semaphore_acq_t sem_acq(&semaphore, 1);
+        new_semaphore_in_line_t sem_acq(&semaphore, 1);
         wait_interruptible(sem_acq.acquisition_signal(), interruptor);
         /* Unlike `handle_item()`, `handle_empty_range()` doesn't do any expensive work,
         but we spawn it in a coroutine anyway so that it runs in the right order with
@@ -228,7 +228,7 @@ private:
             to handle that. */
             backfill_item_t &item,   // NOLINT runtime/references
             const counted_t<counted_buf_lock_and_read_t> &buf,
-            const new_semaphore_acq_t &,
+            const new_semaphore_in_line_t &,
             fifo_enforcer_write_token_t token,
             auto_drainer_t::lock_t keepalive) {
         try {
@@ -266,7 +266,7 @@ private:
 
     void handle_empty_range(
             const key_range_t::right_bound_t &threshold,
-            const new_semaphore_acq_t &,
+            const new_semaphore_in_line_t &,
             fifo_enforcer_write_token_t token,
             auto_drainer_t::lock_t keepalive) {
         try {
@@ -412,9 +412,9 @@ private:
                         /* Store `value_or_null` in the `value` field as a sequence of
                         8 (or 4 or whatever) `char`s describing its actual pointer value.
                         */
-                        item.pairs[i].value = std::vector<char>(
+                        item.pairs[i].value.set(std::vector<char>(
                             reinterpret_cast<const char *>(&value_or_null),
-                            reinterpret_cast<const char *>(1 + &value_or_null));
+                            reinterpret_cast<const char *>(1 + &value_or_null)));
                     }
                     return continue_bool_t::CONTINUE;
                 });
@@ -495,7 +495,7 @@ private:
                                 "item %" PRIu64, timestamp.longtime));
                             items_from_time.push_back(backfill_item_t());
                             item = &items_from_time.back();
-                            item->range = key_range_t(key);
+                            item->range = key_range_t::one_key(key);
                             item->min_deletion_timestamp =
                                 repli_timestamp_t::distant_past;
                         } else {
@@ -520,9 +520,9 @@ private:
                         /* Store `value_or_null` in the `value` field as a sequence of
                         8 (or 4 or whatever) `char`s describing its actual pointer value.
                         */
-                        item->pairs[i].value = std::vector<char>(
+                        item->pairs[i].value.set(std::vector<char>(
                             reinterpret_cast<const char *>(&value_or_null),
-                            reinterpret_cast<const char *>(1 + &value_or_null));
+                            reinterpret_cast<const char *>(1 + &value_or_null)));
                     }
                     return continue_bool_t::CONTINUE;
                 });
@@ -709,7 +709,8 @@ public:
         *skip_out = true;
         buf_write_t buf_write(&buf->lock);
         leaf_node_t *lnode = static_cast<leaf_node_t *>(buf_write.get_data_write());
-        leaf::erase_deletions(sizer, lnode, min_deletion_timestamp);
+        leaf::erase_deletions(sizer, lnode,
+                              make_optional(min_deletion_timestamp));
         buf->lock.set_recency(superceding_recency(
             min_deletion_timestamp, buf->lock.get_recency()));
         return continue_bool_t::CONTINUE;

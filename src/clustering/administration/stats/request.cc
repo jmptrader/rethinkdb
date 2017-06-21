@@ -54,7 +54,7 @@ parsed_stats_t::parsed_stats_t(const std::vector<ql::datum_t> &stats) {
                                                   ql::throw_bool_t::NOTHROW);
         server_id_t server_id;
         admin_err_t error;
-        bool res = convert_uuid_from_datum(server_id_datum, &server_id, &error);
+        bool res = convert_server_id_from_datum(server_id_datum, &server_id, &error);
         guarantee(res, "Stats contained an invalid server id. %s", error.msg.c_str());
 
         server_stats_t &serv_stats = servers[server_id];
@@ -143,20 +143,21 @@ void parsed_stats_t::store_serializer_values(const ql::datum_t &ser_perf,
     store_perfmon_value(ser_perf, "serializer_written_bytes_total",
                         &stats_out->written_bytes_total);
 
-    // TODO: these are not entirely accurate, but the underlying stats would need
-    // a good overhaul
     store_perfmon_value(ser_perf, "serializer_data_extents",
                         &stats_out->data_bytes);
     store_perfmon_value(ser_perf, "serializer_lba_extents",
                         &stats_out->metadata_bytes);
     store_perfmon_value(ser_perf, "serializer_old_garbage_block_bytes",
                         &stats_out->garbage_bytes);
-    store_perfmon_value(ser_perf, "serializer_bytes_in_use",
+    store_perfmon_value(ser_perf, "serializer_file_size_bytes",
                         &stats_out->preallocated_bytes);
     stats_out->data_bytes = stats_out->data_bytes * DEFAULT_EXTENT_SIZE - stats_out->garbage_bytes;
     stats_out->metadata_bytes *= DEFAULT_EXTENT_SIZE;
     stats_out->preallocated_bytes -= stats_out->data_bytes +
         stats_out->garbage_bytes + stats_out->metadata_bytes;
+    // The file size might temporarily lack behind if allocated extents haven't
+    // been written to disk yet.
+    stats_out->preallocated_bytes = std::max(0.0, stats_out->preallocated_bytes);
 }
 
 void parsed_stats_t::store_query_engine_stats(const ql::datum_t &qe_perf,
@@ -391,9 +392,9 @@ bool server_stats_request_t::parse(const ql::datum_t &info,
         return false;
     }
 
-    admin_err_t dummy_error;
     server_id_t s;
-    if (!convert_uuid_from_datum(info.get(1), &s, &dummy_error)) {
+    admin_err_t dummy_error;
+    if (!convert_server_id_from_datum(info.get(1), &s, &dummy_error)) {
         return false;
     }
     request_out->init(new server_stats_request_t(s));
@@ -412,9 +413,9 @@ std::set<std::vector<std::string> > server_stats_request_t::get_filter() const {
 std::vector<peer_id_t> server_stats_request_t::get_peers(
         const std::map<peer_id_t, cluster_directory_metadata_t> &,
         server_config_client_t *server_config_client) const {
-    boost::optional<peer_id_t> peer =
+    optional<peer_id_t> peer =
         server_config_client->get_server_to_peer_map()->get_key(server_id);
-    if (!static_cast<bool>(peer)) {
+    if (!peer.has_value()) {
         return std::vector<peer_id_t>();
     }
     return std::vector<peer_id_t>(1, peer.get());
@@ -429,7 +430,7 @@ bool server_stats_request_t::to_datum(const parsed_stats_t &stats,
     ql::datum_object_builder_t row_builder;
     ql::datum_array_builder_t id_builder(ql::configured_limits_t::unlimited);
     id_builder.add(ql::datum_t(get_name()));
-    id_builder.add(convert_uuid_to_datum(server_id));
+    id_builder.add(convert_uuid_to_datum(server_id.get_uuid()));
     row_builder.overwrite("id", std::move(id_builder).to_datum());
 
     ql::datum_t server_identifier;
@@ -479,7 +480,7 @@ bool table_server_stats_request_t::parse(const ql::datum_t &info,
     if (!convert_uuid_from_datum(info.get(1), &t, &dummy_error)) {
         return false;
     }
-    if (!convert_uuid_from_datum(info.get(2), &s, &dummy_error)) {
+    if (!convert_server_id_from_datum(info.get(2), &s, &dummy_error)) {
         return false;
     }
     request_out->init(new table_server_stats_request_t(t, s));
@@ -499,9 +500,9 @@ std::set<std::vector<std::string> > table_server_stats_request_t::get_filter() c
 std::vector<peer_id_t> table_server_stats_request_t::get_peers(
         const std::map<peer_id_t, cluster_directory_metadata_t> &,
         server_config_client_t *server_config_client) const {
-    boost::optional<peer_id_t> peer =
+    optional<peer_id_t> peer =
         server_config_client->get_server_to_peer_map()->get_key(server_id);
-    if (!static_cast<bool>(peer)) {
+    if (!peer.has_value()) {
         return std::vector<peer_id_t>();
     }
     return std::vector<peer_id_t>(1, peer.get());
@@ -517,7 +518,7 @@ bool table_server_stats_request_t::to_datum(const parsed_stats_t &stats,
     ql::datum_array_builder_t id_builder(ql::configured_limits_t::unlimited);
     id_builder.add(ql::datum_t(get_name()));
     id_builder.add(convert_uuid_to_datum(table_id));
-    id_builder.add(convert_uuid_to_datum(server_id));
+    id_builder.add(convert_uuid_to_datum(server_id.get_uuid()));
     row_builder.overwrite("id", std::move(id_builder).to_datum());
 
     ql::datum_t server_identifier;

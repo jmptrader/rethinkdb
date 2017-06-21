@@ -17,7 +17,7 @@ DEFAULT_GOAL ?= all
 IGNORE_MAKEFILE_CHANGES ?= 0
 
 # If set to 1, do not use -Werror
-ALLOW_WARNINGS ?= 0
+ALLOW_WARNINGS ?= 1
 
 # Show the number of targets left to build
 SHOW_COUNTDOWN ?= 1
@@ -118,7 +118,7 @@ THREADED_COROUTINES ?= 0
 
 # Require MacOS package to be signed with a developer certificate
 REQUIRE_SIGNED ?= 0
-OSX_SIGNATURE_NAME ?= Developer ID Installer: Hexagram 49, Inc. (99WDWQ7WDJ)
+OSX_SIGNATURE_NAME ?= Hexagram 49, Inc. (99WDWQ7WDJ)
 
 # Adds default configure flags to the package being built
 DIST_CONFIGURE_DEFAULT ?=
@@ -126,12 +126,16 @@ DIST_CONFIGURE_DEFAULT ?=
 # Minify the webui source code with "uglify".
 UGLIFY ?= 1
 
+# Sets the `-fno-omit-frame-pointer` compiler flag. Important for some profiling tools
+# such as oprofile.
+NO_OMIT_FRAME_POINTER ?= 0
+
+# Check the hash of fetched archives
+VERIFY_FETCH_HASH=1
+
 # TODO: Document these variables
 STATIC_LIBGCC ?= 0
 DISABLE_BREAKPOINTS ?= 0
-NO_OMIT_FRAME_POINTER ?= 0
-AGRESSIVE_BUF_UNLOADING ?= 0
-SEMANTIC_SERIALIZER_CHECK ?= 0
 BUILD_PORTABLE ?= 0
 LEGACY_LINUX ?= 0
 LEGACY_GCC ?= 0
@@ -139,12 +143,8 @@ RT_FORCE_NATIVE ?= 0
 RT_COPY_NATIVE ?= 0
 RT_REDUCE_NATIVE ?= 0
 KEEP_INLINE ?= 0
-OPROFILE ?= 0
-BTREE_DEBUG ?= 0
-SERIALIZER_DEBUG ?= 0
 NO_EVENTFD ?= 0
 NO_EPOLL ?= 0
-LEGACY_PROC_STAT ?= 0
 UNIT_TEST_FILTER ?= *
 PACKAGE_FOR_SUSE_10 ?= 0
 NO_COMPILE_JS ?= 0

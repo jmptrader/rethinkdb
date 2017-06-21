@@ -7,18 +7,17 @@
 #include <vector>
 #include <utility>
 
-#include "errors.hpp"
-#include <boost/optional.hpp>
-
+#include "clustering/administration/auth/user.hpp"
+#include "clustering/administration/auth/username.hpp"
 #include "clustering/administration/issues/local.hpp"
 #include "clustering/administration/jobs/report.hpp"
 #include "clustering/administration/logs/log_transfer.hpp"
 #include "clustering/administration/servers/server_metadata.hpp"
 #include "clustering/administration/stats/stat_manager.hpp"
 #include "clustering/administration/tables/database_metadata.hpp"
+#include "containers/optional.hpp"
 #include "clustering/table_manager/table_metadata.hpp"
 #include "arch/address.hpp"
-#include "containers/auth_key.hpp"
 #include "rpc/connectivity/peer_id.hpp"
 #include "rpc/semilattice/joins/macros.hpp"
 #include "rpc/semilattice/joins/versioned.hpp"
@@ -37,9 +36,41 @@ RDB_DECLARE_EQUALITY_COMPARABLE(cluster_semilattice_metadata_t);
 
 class auth_semilattice_metadata_t {
 public:
+    // For deserialization only
     auth_semilattice_metadata_t() { }
 
-    versioned_t<auth_key_t> auth_key;
+    explicit auth_semilattice_metadata_t(const std::string &initial_password)
+        : m_users({create_initial_admin_pair(initial_password)}) { }
+
+    static std::pair<auth::username_t, versioned_t<optional<auth::user_t>>>
+        create_initial_admin_pair(const std::string &initial_password) {
+        // Generate a timestamp that's minus our current time, so that the oldest
+        // initial password wins. Unless the initial password is empty, which
+        // should always lose.
+        time_t version_ts = std::numeric_limits<time_t>::min();
+        if (!initial_password.empty()) {
+            time_t current_time = time(nullptr);
+            if (current_time > 0) {
+                version_ts = -current_time;
+            } else {
+                logWRN("The system time seems to be incorrectly set. Metadata "
+                       "versioning will behave unexpectedly.");
+            }
+        }
+        // Use a single iteration for better efficiency when starting out with an empty
+        // password.
+        uint32_t iterations = initial_password.empty()
+                              ? 1
+                              : auth::password_t::default_iteration_count;
+        auth::password_t pw(initial_password, iterations);
+        return std::make_pair(
+            auth::username_t("admin"),
+            versioned_t<optional<auth::user_t>>::make_with_manual_timestamp(
+                version_ts,
+                make_optional(auth::user_t(std::move(pw)))));
+    }
+
+    std::map<auth::username_t, versioned_t<optional<auth::user_t>>> m_users;
 };
 
 RDB_DECLARE_SERIALIZABLE(auth_semilattice_metadata_t);
@@ -76,7 +107,7 @@ public:
     int64_t pid;   /* really a `pid_t`, but we need a platform-independent type */
     std::string hostname;
     uint16_t cluster_port, reql_port;
-    boost::optional<uint16_t> http_admin_port;
+    optional<uint16_t> http_admin_port;
     std::set<host_and_port_t> canonical_addresses;
     std::vector<std::string> argv;
 };
@@ -97,7 +128,7 @@ public:
             const log_server_business_card_t &lmb,
             const local_issue_bcard_t &lib,
             const server_config_versioned_t &sc,
-            const boost::optional<server_config_business_card_t> &scbc,
+            const optional<server_config_business_card_t> &scbc,
             cluster_directory_peer_type_t _peer_type) :
         server_id(_server_id),
         peer_id(_peer_id),
@@ -134,7 +165,7 @@ public:
     /* For proxies, `server_config` is meaningless and `server_config_business_card` is
     empty. */
     server_config_versioned_t server_config;
-    boost::optional<server_config_business_card_t> server_config_business_card;
+    optional<server_config_business_card_t> server_config_business_card;
 
     cluster_directory_peer_type_t peer_type;
 };

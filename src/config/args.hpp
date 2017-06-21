@@ -12,17 +12,10 @@
 #define BILLION (THOUSAND * MILLION)
 
 /*!
- * Version strings
+ * Name strings
  */
 
 #define SOFTWARE_NAME_STRING "RethinkDB"
-
-// The SERIALIZER_VERSION_STRING might remain unchanged for a while -- individual
-// metablocks now have a disk_format_version field that can be incremented for
-// on-the-fly version updating.
-#define SERIALIZER_VERSION_STRING "1.13"
-
-// See also CLUSTER_VERSION_STRING and cluster_version_t.
 
 /**
  * Basic configuration parameters.
@@ -79,9 +72,6 @@
 // Size of the device block size (in bytes)
 #define DEVICE_BLOCK_SIZE                         512
 
-// Size of the metablock (in bytes)
-#define METABLOCK_SIZE                            (4 * KILOBYTE)
-
 // Size of each btree node (in bytes) on disk
 #define DEFAULT_BTREE_BLOCK_SIZE                  (4 * KILOBYTE)
 
@@ -112,14 +102,6 @@
 // Ticks (in milliseconds) the internal timed tasks are performed at
 #define TIMER_TICKS_IN_MS                         5
 
-// How many milliseconds to allow changes to sit in memory before flushing to disk
-#define DEFAULT_FLUSH_TIMER_MS                    1000
-
-// If non-null disk_ack_signals are present, concurrent flushing can be used to reduce the
-// latency of each single flush. max_concurrent_flushes controls how many flushes can be active
-// on a specific slice at any given time.
-#define DEFAULT_MAX_CONCURRENT_FLUSHES            1
-
 // How many times the page replacement algorithm tries to find an eligible page before giving up.
 // Note that (MAX_UNSAVED_DATA_LIMIT_FRACTION ** PAGE_REPL_NUM_TRIES) is the probability that the
 // page replacement algorithm will succeed on a given try, and if that probability is less than 1/2
@@ -147,13 +129,9 @@
 // How many block ids should the LBA garbage collector rewrite before yielding?
 #define LBA_GC_BATCH_SIZE                         (1024 * 8)
 
-// How many LBA structures to have for each file
+// How many LBA structures to have for each file (This value defines the disk format!
+// It can't change unless you're very careful.)
 #define LBA_SHARD_FACTOR                          4
-
-// How much space to reserve in the metablock to store inline LBA entries
-// Make sure that it fits into METABLOCK_SIZE, including all other meta data
-// TODO (daniel): Tune
-#define LBA_INLINE_SIZE                           (METABLOCK_SIZE - 512)
 
 // How many bytes of buffering space we can use per disk when reading the LBA. If it's set
 // too high, then RethinkDB will eat a lot of memory at startup. This is bad because tcmalloc
@@ -167,14 +145,6 @@
 #define LBA_RECONSTRUCTION_BATCH_SIZE             1024
 
 #define COROUTINE_STACK_SIZE                      131072
-
-// How many unused coroutine stacks to keep around (maximally), before they are
-// freed. This value is per thread.
-#define COROUTINE_FREE_LIST_SIZE                  64
-
-// In debug mode, we print a warning if more than this many coroutines have been
-// allocated on one thread.
-#define COROS_PER_THREAD_WARN_LEVEL               10000
 
 
 /**

@@ -134,6 +134,12 @@ int64_t pool_diskmgr_t::action_t::perform_read_write(iovec *vecs,
                    "%" PRIi64 " bytes. Assuming we ran out of disk space.",
                    total_bytes, partial_offset);
             return -ENOSPC;
+        } else if (res == 0 && type == ACTION_READ) {
+            // A 0 result from a read means that we've tried to read
+            // behind the file.
+            logERR("Failed I/O: we tried to read from behind the end of the file. "
+                   "Either the file got truncated, or there is a bug in RethinkDB.");
+            return -EINVAL;
         }
 
         // Advance the vector in DEVICE_BLOCK_SIZE chunks and update our offset
@@ -153,6 +159,17 @@ void pool_diskmgr_t::action_t::run() {
 
     switch (type) {
     case ACTION_RESIZE: {
+#ifdef _WIN32
+        FILE_END_OF_FILE_INFO new_eof;
+        new_eof.EndOfFile.QuadPart = offset;
+        BOOL res = SetFileInformationByHandle(fd, FileEndOfFileInfo, &new_eof, sizeof(new_eof));
+        if (!res) {
+            logWRN("SetFileInformationByHandle failed: %s", winerr_string(GetLastError()).c_str());
+            io_result = -EIO;
+            return;
+        }
+        io_result = 0;
+#else
         CT_ASSERT(sizeof(off_t) == sizeof(int64_t));
         int res;
         do {
@@ -164,6 +181,7 @@ void pool_diskmgr_t::action_t::run() {
             io_result = -get_errno();
             return;
         }
+#endif
     } break;
     case ACTION_READ:
     case ACTION_WRITE: {

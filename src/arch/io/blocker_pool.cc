@@ -3,10 +3,11 @@
 
 #include <string.h>
 
+#include "arch/compiler.hpp"
 #include "config/args.hpp"
 #include "utils.hpp"
 
-__thread int thread_is_blocker_pool_thread = 0;
+THREAD_LOCAL int thread_is_blocker_pool_thread = 0;
 // Access functions to thread_is_blocker_pool_thread. Marked as NOINLINE
 // to avoid certain compiler optimizations that can break TLS. See
 // thread_local.hpp for a more detailed explanation.
@@ -17,7 +18,9 @@ NOINLINE bool i_am_in_blocker_pool_thread() {
     return thread_is_blocker_pool_thread == 1;
 }
 // Make sure thread_is_blocker_pool_thread is not accessed directly
+#ifdef __GNUC__
 #pragma GCC poison thread_is_blocker_pool_thread
+#endif
 
 // IO thread function
 void* blocker_pool_t::event_loop(void *arg) {
@@ -26,6 +29,7 @@ void* blocker_pool_t::event_loop(void *arg) {
 
     blocker_pool_t *parent = reinterpret_cast<blocker_pool_t*>(arg);
 
+#ifndef _WIN32
     // Disable signals on this thread. This ensures that signals like SIGINT are
     // handled by one of the main threads.
     {
@@ -33,9 +37,10 @@ void* blocker_pool_t::event_loop(void *arg) {
         int res = sigfillset(&sigmask);
         guarantee_err(res == 0, "Could not get a full sigmask");
 
-        res = pthread_sigmask(SIG_SETMASK, &sigmask, NULL);
+        res = pthread_sigmask(SIG_SETMASK, &sigmask, nullptr);
         guarantee_xerr(res == 0, res, "Could not block signal");
     }
+#endif
 
     while (true) {
         // Wait for an IO command or shutdown command. The while-loop guards against spurious
@@ -47,7 +52,7 @@ void* blocker_pool_t::event_loop(void *arg) {
 
         if (parent->shutting_down) {
             // or_lock's destructor gets called, so everything is OK.
-            return NULL;
+            return nullptr;
 
         } else {
 
@@ -107,13 +112,13 @@ blocker_pool_t::blocker_pool_t(int nthreads, linux_event_queue_t *_queue)
     }
 
     // Register with event queue so we get the completion events
-    queue->watch_resource(ce_signal.get_notify_fd(), poll_event_in, this);
+    queue->watch_event(&ce_signal, this);
 }
 
 blocker_pool_t::~blocker_pool_t() {
 
     // Deregister with the event queue
-    queue->forget_resource(ce_signal.get_notify_fd(), this);
+    queue->forget_event(&ce_signal, this);
 
     /* Send out the order to shut down */
     {
@@ -129,7 +134,7 @@ blocker_pool_t::~blocker_pool_t() {
 
     /* Wait for stuff to actually shut down */
     for (size_t i = 0; i < threads.size(); ++i) {
-        int res = pthread_join(threads[i], NULL);
+        int res = pthread_join(threads[i], nullptr);
         guarantee_xerr(res == 0, res, "Could not join blocker-pool thread.");
     }
 }

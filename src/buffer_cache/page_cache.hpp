@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,8 @@
 #include "repli_timestamp.hpp"
 #include "serializer/types.hpp"
 
+// HSI: unordered_map allocates too much, use a different hash table type.
+
 class alt_txn_throttler_t;
 class cache_balancer_t;
 class auto_drainer_t;
@@ -42,11 +45,13 @@ enum class page_create_t { no, yes };
 
 enum class alt_create_t { create };
 
+enum class block_type_t { normal, aux };
+
 class cache_conn_t {
 public:
-    explicit cache_conn_t(cache_t *cache)
-        : cache_(cache),
-          newest_txn_(NULL) { }
+    explicit cache_conn_t(cache_t *_cache)
+        : cache_(_cache),
+          newest_txn_(nullptr) { }
     ~cache_conn_t();
 
     cache_t *cache() const { return cache_; }
@@ -78,7 +83,7 @@ class current_page_t {
 public:
     current_page_t(block_id_t block_id, buf_ptr_t buf, page_cache_t *page_cache);
     current_page_t(block_id_t block_id, buf_ptr_t buf,
-                   const counted_t<standard_block_token_t> &token,
+                   const counted_t<block_token_t> &token,
                    page_cache_t *page_cache);
     // Constructs a page to be loaded from the serializer.
     explicit current_page_t(block_id_t block_id);
@@ -180,7 +185,8 @@ public:
                        access_t access,
                        page_create_t create = page_create_t::no);
     current_page_acq_t(page_txn_t *txn,
-                       alt_create_t create);
+                       alt_create_t create,
+                       block_type_t block_type);
     current_page_acq_t(page_cache_t *cache,
                        block_id_t block_id,
                        read_access_t read);
@@ -217,7 +223,8 @@ private:
               access_t access,
               page_create_t create);
     void init(page_txn_t *txn,
-              alt_create_t create);
+              alt_create_t create,
+              block_type_t block_type);
     void init(page_cache_t *page_cache,
               block_id_t block_id,
               read_access_t read);
@@ -273,7 +280,7 @@ public:
 
     void offer_read_ahead_buf(block_id_t block_id,
                               buf_ptr_t *buf,
-                              const counted_t<standard_block_token_t> &token);
+                              const counted_t<block_token_t> &token);
 
     void destroy_self();
 
@@ -310,8 +317,8 @@ private:
     // dirtied_count_.  Once the number of dirty pages gets bigger than the original
     // value of *_changes_semaphore_acq_.count(), we use
     // *_changes_semaphore_acq_.change_count() to keep the numbers equal.
-    new_semaphore_acq_t block_changes_semaphore_acq_;
-    new_semaphore_acq_t index_changes_semaphore_acq_;
+    new_semaphore_in_line_t block_changes_semaphore_acq_;
+    new_semaphore_in_line_t index_changes_semaphore_acq_;
 
     DISABLE_COPYING(throttler_acq_t);
 };
@@ -330,9 +337,13 @@ public:
     void flush_and_destroy_txn(
             scoped_ptr_t<page_txn_t> txn,
             std::function<void(throttler_acq_t *)> on_flush_complete);
+    // More efficient version of `flush_and_destroy_txn` for read transactions.
+    void end_read_txn(scoped_ptr_t<page_txn_t> txn);
 
     current_page_t *page_for_block_id(block_id_t block_id);
-    current_page_t *page_for_new_block_id(block_id_t *block_id_out);
+    current_page_t *page_for_new_block_id(
+        block_type_t block_type,
+        block_id_t *block_id_out);
     current_page_t *page_for_new_chosen_block_id(block_id_t block_id);
 
     // Returns how much memory is being used by all the pages in the cache at this
@@ -366,8 +377,8 @@ public:
 private:
     friend class page_read_ahead_cb_t;
     void add_read_ahead_buf(block_id_t block_id,
-                            ser_buffer_t *buf,
-                            const counted_t<standard_block_token_t> &token);
+                            scoped_device_block_aligned_ptr_t<ser_buffer_t> ptr,
+                            const counted_t<block_token_t> &token);
 
     void read_ahead_cb_is_destroyed();
 
@@ -393,17 +404,17 @@ private:
 
     friend class page_txn_t;
     static void do_flush_changes(page_cache_t *page_cache,
-                                 const std::map<block_id_t, block_change_t> &changes,
+                                 std::unordered_map<block_id_t, block_change_t> &&changes,
                                  const std::vector<page_txn_t *> &txns,
                                  fifo_enforcer_write_token_t index_write_token);
     static void do_flush_txn_set(page_cache_t *page_cache,
-                                 std::map<block_id_t, block_change_t> *changes_ptr,
+                                 std::unordered_map<block_id_t, block_change_t> *changes_ptr,
                                  const std::vector<page_txn_t *> &txns);
 
     static void remove_txn_set_from_graph(page_cache_t *page_cache,
                                           const std::vector<page_txn_t *> &txns);
 
-    static std::map<block_id_t, block_change_t>
+    static std::unordered_map<block_id_t, block_change_t>
     compute_changes(const std::vector<page_txn_t *> &txns);
 
     static std::vector<page_txn_t *> maximal_flushable_txn_set(page_txn_t *base);
@@ -412,12 +423,22 @@ private:
 
     friend class current_page_acq_t;
     repli_timestamp_t recency_for_block_id(block_id_t id) {
+        // This `if` is redundant, since `recencies_.size()` will always be smaller
+        // than any aux block ID. It's probably a good idea to be explicit about this
+        // though.
+        if (is_aux_block_id(id)) {
+            return repli_timestamp_t::invalid;
+        }
         return recencies_.size() <= id
             ? repli_timestamp_t::invalid
             : recencies_[id];
     }
 
     void set_recency_for_block_id(block_id_t id, repli_timestamp_t recency) {
+        if(is_aux_block_id(id)) {
+            guarantee(recency == repli_timestamp_t::invalid);
+            return;
+        }
         while (recencies_.size() <= id) {
             recencies_.push_back(repli_timestamp_t::invalid);
         }
@@ -426,8 +447,6 @@ private:
 
     friend class current_page_t;
     free_list_t *free_list() { return &free_list_; }
-
-    void resize_current_pages_to_id(block_id_t block_id);
 
     static void consider_evicting_all_current_pages(page_cache_t *page_cache,
                                                     auto_drainer_t::lock_t lock);
@@ -449,7 +468,7 @@ private:
     serializer_t *serializer_;
     segmented_vector_t<repli_timestamp_t> recencies_;
 
-    segmented_vector_t<current_page_t *> current_pages_;
+    std::unordered_map<block_id_t, current_page_t *> current_pages_;
 
     free_list_t free_list_;
 
@@ -639,7 +658,7 @@ private:
     bool began_waiting_for_flush_;
     bool spawned_flush_;
 
-    enum mark_state_t {
+    enum mark_state_t : uint8_t {
         marked_not,
         marked_red,
         marked_blue,

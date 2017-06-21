@@ -435,13 +435,13 @@ TEST(UTF8CodepointIterationTest, Zalgo) {
         "o"
         ".\xcc\x9b\xcc\xab\xcc\xa9";
     const char32_t zalgo_codepoints[] = U"\u0048\u0355\u0061\u0315\u034d\u0319\u034d"
-        "\u032b\u0347\u0325\u0323\u0076\u0334\u0065\u0358\u0316\u0331\u0356\u0020\u0361"
-        "\u032c\u0073\u034e\u0325\u033a\u0348\u032b\u006f\u0323\u0333\u032e\u0345\u0329"
-        "\u006d\u0362\u0354\u031e\u0319\u0359\u031c\u0065\u0020\u0325\u005a\u0336\u0061"
-        "\u032b\u0329\u034e\u0332\u032c\u033a\u006c\u0318\u0347\u0354\u0067\u0336\u031e"
-        "\u0359\u033c\u006f\u002e\u031b\u032b\u0329";
+        U"\u032b\u0347\u0325\u0323\u0076\u0334\u0065\u0358\u0316\u0331\u0356\u0020\u0361"
+        U"\u032c\u0073\u034e\u0325\u033a\u0348\u032b\u006f\u0323\u0333\u032e\u0345\u0329"
+        U"\u006d\u0362\u0354\u031e\u0319\u0359\u031c\u0065\u0020\u0325\u005a\u0336\u0061"
+        U"\u032b\u0329\u034e\u0332\u032c\u033a\u006c\u0318\u0347\u0354\u0067\u0336\u031e"
+        U"\u0359\u033c\u006f\u002e\u031b\u032b\u0329";
     auto start = zalgo;
-    auto end = zalgo + strlen(zalgo);
+    auto end = zalgo + sizeof(zalgo) - 1;
     const char32_t *current = zalgo_codepoints;
     char32_t codepoint;
     utf8::reason_t reason;
@@ -476,7 +476,7 @@ TEST(UTF8IterationTest, SimpleString) {
 TEST(UTF8IterationTest, SimpleStringNormalIteration) {
     std::string demo = "this is a demonstration string";
     utf8::string_iterator_t it(demo);
-    utf8::string_iterator_t end;
+    utf8::string_iterator_t end(utf8::string_iterator_t::make_end(demo));
     auto following = demo.begin();
     while (it != end) {
         ASSERT_EQ(*following++, *it++);
@@ -523,7 +523,8 @@ TEST(UTF8IterationTest, SimpleStringRange) {
 
 TEST(UTF8IterationTest, EmptyString) {
     {
-        utf8::string_iterator_t it;
+        std::string s;
+        utf8::string_iterator_t it(utf8::string_iterator_t::make_end(s));
         ASSERT_TRUE(it.is_done());
     }
 
@@ -559,17 +560,19 @@ TEST(UTF8IterationTest, Zalgo) {
         "o"
         ".\xcc\x9b\xcc\xab\xcc\xa9";
     const char32_t zalgo_codepoints[] = U"\u0048\u0355\u0061\u0315\u034d\u0319\u034d"
-        "\u032b\u0347\u0325\u0323\u0076\u0334\u0065\u0358\u0316\u0331\u0356\u0020\u0361"
-        "\u032c\u0073\u034e\u0325\u033a\u0348\u032b\u006f\u0323\u0333\u032e\u0345\u0329"
-        "\u006d\u0362\u0354\u031e\u0319\u0359\u031c\u0065\u0020\u0325\u005a\u0336\u0061"
-        "\u032b\u0329\u034e\u0332\u032c\u033a\u006c\u0318\u0347\u0354\u0067\u0336\u031e"
-        "\u0359\u033c\u006f\u002e\u031b\u032b\u0329";
+        U"\u032b\u0347\u0325\u0323\u0076\u0334\u0065\u0358\u0316\u0331\u0356\u0020\u0361"
+        U"\u032c\u0073\u034e\u0325\u033a\u0348\u032b\u006f\u0323\u0333\u032e\u0345\u0329"
+        U"\u006d\u0362\u0354\u031e\u0319\u0359\u031c\u0065\u0020\u0325\u005a\u0336\u0061"
+        U"\u032b\u0329\u034e\u0332\u032c\u033a\u006c\u0318\u0347\u0354\u0067\u0336\u031e"
+        U"\u0359\u033c\u006f\u002e\u031b\u032b\u0329";
     utf8::array_iterator_t it(zalgo, zalgo + strlen(zalgo));
-    utf8::array_iterator_t end;
+    utf8::array_iterator_t end(utf8::array_iterator_t::make_end(zalgo + strlen(zalgo)));
     const char32_t *current = zalgo_codepoints;
     size_t seen = 0;
     while (it != end) {
-        ASSERT_EQ(*current++, *it++);
+        ASSERT_EQ(*current, *it);
+        ++current;
+        ++it;
         ++seen;
     }
     ASSERT_EQ(66, seen);

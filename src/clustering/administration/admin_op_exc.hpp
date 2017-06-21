@@ -32,11 +32,18 @@ class admin_op_exc_t : public std::runtime_error {
 public:
     explicit admin_op_exc_t(admin_err_t err)
         : std::runtime_error(std::move(err.msg)),
-          query_state(err.query_state) { }
-    admin_op_exc_t(std::string msg, query_state_t _query_state)
-        : std::runtime_error(std::move(msg)),
-          query_state(_query_state) { }
-    const query_state_t query_state;
+          m_query_state(err.query_state) { }
+
+    admin_op_exc_t(std::string message, query_state_t query_state)
+        : std::runtime_error(std::move(message)),
+          m_query_state(query_state) { }
+
+    admin_err_t to_admin_err() const {
+        return admin_err_t{what(), m_query_state};
+    }
+
+private:
+    query_state_t m_query_state;
 };
 
 /* `CATCH_NAME_ERRORS` and `CATCH_OP_ERRORS` are helper macros for catching the
@@ -72,7 +79,11 @@ may not have been performed. */
     catch (const failed_table_op_exc_t &) {                                           \
         *(error_out) = admin_err_t{                                                   \
             strprintf("The server(s) hosting table `%s.%s` are currently "            \
-                      "unreachable. " no_msg, (db).c_str(), (name).c_str()),          \
+                      "unreachable. " no_msg " If you do not expect the server(s) "   \
+                      "to recover, you can use `emergency_repair` to restore "        \
+                      "availability of the table. "                                   \
+                      "<http://rethinkdb.com/api/javascript/reconfigure/"             \
+                      "#emergency-repair-mode>", (db).c_str(), (name).c_str()),       \
             query_state_t::FAILED};                                                   \
         return false;                                                                 \
     } catch (const maybe_failed_table_op_exc_t &) {                                   \

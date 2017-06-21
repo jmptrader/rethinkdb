@@ -29,7 +29,7 @@ public:
         order_sink_.rethread(new_thread);
     }
 
-    void note_reshard() { }
+    void note_reshard(const region_t &) { }
 
     void new_read_token(read_token_t *token_out);
     void new_write_token(write_token_t *token_out);
@@ -87,6 +87,7 @@ public:
 
     void wait_until_ok_to_receive_backfill(signal_t *interruptor)
             THROWS_ONLY(interrupted_exc_t);
+    bool check_ok_to_receive_backfill() THROWS_NOTHING;
 
     void reset_data(
             const binary_blob_t &zero_version,
@@ -105,7 +106,6 @@ private:
 
     order_sink_t order_sink_;
 
-    rng_t rng_;
     region_map_t<binary_blob_t> metainfo_;
     std::map<store_key_t, std::pair<repli_timestamp_t, ql::datum_t> > table_;
 

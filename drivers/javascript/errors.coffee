@@ -1,44 +1,43 @@
-class RqlDriverError extends Error
-    constructor: (msg) ->
-        @name = @constructor.name
-        @msg = msg
-        @message = msg
-        if Error.captureStackTrace?
-            Error.captureStackTrace @, @
-
-class RqlServerError extends Error
+class ReqlError extends Error
     constructor: (msg, term, frames) ->
         @name = @constructor.name
         @msg = msg
-        @frames = frames[0..]
+        @frames = frames?[0..]
         if term?
             if msg[msg.length-1] is '.'
-                @message = "#{msg.slice(0, msg.length-1)} in:\n#{RqlQueryPrinter::printQuery(term)}\n#{RqlQueryPrinter::printCarrots(term, frames)}"
+                @message = "#{msg.slice(0, msg.length-1)} in:\n#{ReqlQueryPrinter::printQuery(term)}\n#{ReqlQueryPrinter::printCarrots(term, frames)}"
             else
-                @message = "#{msg} in:\n#{RqlQueryPrinter::printQuery(term)}\n#{RqlQueryPrinter::printCarrots(term, frames)}"
+                @message = "#{msg} in:\n#{ReqlQueryPrinter::printQuery(term)}\n#{ReqlQueryPrinter::printCarrots(term, frames)}"
         else
             @message = "#{msg}"
         if Error.captureStackTrace?
             Error.captureStackTrace @, @
 
-class RqlRuntimeError extends RqlServerError
+class ReqlCompileError extends ReqlError
 
-class RqlCompileError extends RqlServerError
-class RqlClientError extends RqlServerError
+class ReqlDriverCompileError extends ReqlCompileError
 
-class RqlInternalError extends RqlRuntimeError
-class RqlResourceError extends RqlRuntimeError
+class ReqlServerCompileError extends ReqlCompileError
 
-class RqlLogicError extends RqlRuntimeError
-class RqlNonExistenceError extends RqlLogicError
+class ReqlDriverError extends ReqlError
 
-class RqlOpError extends RqlRuntimeError
-class RqlOpFailedError extends RqlOpError
-class RqlOpIndeterminateError extends RqlOpError
+class ReqlAuthError extends ReqlDriverError
 
-class RqlUserError extends RqlRuntimeError
+class ReqlRuntimeError extends ReqlError
 
-class RqlQueryPrinter
+class ReqlQueryLogicError extends ReqlRuntimeError
+class ReqlNonExistenceError extends ReqlQueryLogicError
+class ReqlResourceLimitError extends ReqlRuntimeError
+class ReqlUserError extends ReqlRuntimeError
+class ReqlInternalError extends ReqlRuntimeError
+class ReqlTimeoutError extends ReqlError
+class ReqlAvailabilityError extends ReqlRuntimeError
+class ReqlOpFailedError extends ReqlAvailabilityError
+class ReqlOpIndeterminateError extends ReqlAvailabilityError
+class ReqlPermissionError extends ReqlRuntimeError
+
+
+class ReqlQueryPrinter
     printQuery: (term) ->
         tree = composeTerm(term)
         joinTree tree
@@ -96,22 +95,35 @@ class RqlQueryPrinter
 
 
 module.exports = {
-    RqlDriverError
-    RqlRuntimeError
+    ReqlError
+    ReqlCompileError
+    RqlCompileError: ReqlCompileError
+    ReqlServerCompileError
+    ReqlDriverCompileError
 
-    RqlCompileError
-    RqlClientError
+    RqlClientError: ReqlDriverError
 
-    RqlInternalError
-    RqlResourceError
-    RqlLogicError
-    RqlNonExistenceError
+    ReqlRuntimeError
+    RqlRuntimeError: ReqlRuntimeError
+    RqlServerError: ReqlRuntimeError  # no direct equivalent
 
-    RqlOpError
-    RqlOpFailedError
-    RqlOpIndeterminateError
+    ReqlQueryLogicError
+    ReqlNonExistenceError
 
-    RqlUserError
+    ReqlResourceLimitError
+    ReqlUserError
+    ReqlInternalError
+    ReqlTimeoutError
 
-    printQuery: RqlQueryPrinter::printQuery
+    ReqlAvailabilityError
+    ReqlOpFailedError
+    ReqlOpIndeterminateError
+
+    ReqlPermissionError
+
+    ReqlDriverError
+    RqlDriverError: ReqlDriverError
+    ReqlAuthError
+
+    printQuery: ReqlQueryPrinter::printQuery
 }

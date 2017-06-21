@@ -50,8 +50,8 @@ S1Angle S2Cap::angle() const {
 S2Cap S2Cap::Complement() const {
   // The complement of a full cap is an empty cap, not a singleton.
   // Also make sure that the complement of an empty cap has height 2.
-  double height = is_full() ? -1 : 2 - max(height_, 0.0);
-  return S2Cap::FromAxisHeight(-axis_, height);
+  double _height = is_full() ? -1 : 2 - max(height_, 0.0);
+  return S2Cap::FromAxisHeight(-axis_, _height);
 }
 
 bool S2Cap::Contains(S2Cap const& other) const {
@@ -155,8 +155,8 @@ S2LatLngRect S2Cap::GetRectBound() const {
     double sin_c = cos(axis_ll.lat().radians());
     if (sin_a <= sin_c) {
       double angle_A = asin(sin_a / sin_c);
-      lng[0] = drem(axis_ll.lng().radians() - angle_A, 2 * M_PI);
-      lng[1] = drem(axis_ll.lng().radians() + angle_A, 2 * M_PI);
+      lng[0] = remainder(axis_ll.lng().radians() - angle_A, 2 * M_PI);
+      lng[1] = remainder(axis_ll.lng().radians() + angle_A, 2 * M_PI);
     }
   }
   return S2LatLngRect(R1Interval(lat[0], lat[1]),

@@ -160,8 +160,8 @@ render_outdated_index = (issue) ->
             h "br"
             "Use ", h("code", help_command)
             " to apply the latest bug fixes and improvements."
-            "See ", h("a", href: help_link, "the troubleshooting page")
-            "for more details."
+            " See ", h("a", href: help_link, "the troubleshooting page")
+            " for more details."
         ]
         h "ul", issue.info.tables.map((table) ->
             h "li", [
@@ -176,13 +176,62 @@ render_outdated_index = (issue) ->
 
     ]
 
+render_memory_error = (issue) ->
+    # Issue raised when the server has problems with swapping memory.
+    title: "Memory issue"
+    subtitle: [
+        "A server is using swap memory."
+    ]
+    details: [
+        h "p", [
+            "The following "
+            util.pluralize_noun('server', issue.info.servers.length)
+            " encountered a memory problem:"
+        ]
+        h "ul", issue.info.servers.map((server) ->
+            h "li",
+                h "a", href: "/#servers/#{server.server_id}", server.server)
+        h "p", [
+            "The issue reported is: ",
+            h "code", issue.info.message
+        ]
+        h "p", [
+            "Please fix the problem that is causing the "
+            util.pluralize_noun("server", issue.info.servers.length)
+            " to use swap memory. This issue will go away "
+            "after ten minutes have passed since a significant amount "
+            "of swap memory was used,"
+            " or after you restart RethinkDB."
+        ]
+    ]
+
+render_non_transitive_error = (issue) ->
+    # Issue raised when network connectivity is non-transitive
+    title: "Connectivity issue"
+    subtitle: [
+        "Some servers are only partially connected to the cluster."
+    ]
+    details: [
+        h "p", [
+           "The following servers are not fully connected:"
+        ]
+        h "ul", issue.info.servers.map((server) ->
+            h "li",
+                h "a", href: "/#servers/#{server.server_id}", server.server)
+        h "p", [
+            "Partial connectivity can cause tables to remain unavailable"
+            " and queries to fail. Please check your network configuration"
+            " if this issue persists for more than a few seconds."
+        ]
+    ]
+
 render_log_write_error = (issue) ->
     # Issue raised when the server can't write to its log file.
     title: "Cannot write logs"
     subtitle: [
         "Log "
         util.pluralize_noun('file', issue.info.servers.length)
-        "cannot be written to"
+        " cannot be written to"
     ]
     details: [
         h "p", [
@@ -194,7 +243,7 @@ render_log_write_error = (issue) ->
             h "li",
                 h "a", href: "/#servers/#{server.server_id}", server.server)
         h "p", [
-            "The error message reported is:",
+            "The error message reported is: ",
             h "code", issue.info.message
         ]
         h "p", [
@@ -209,6 +258,8 @@ render_log_write_error = (issue) ->
 render_issue = (issue) ->
     details = switch issue.type
         when 'log_write_error' then render_log_write_error(issue)
+        when 'memory_error' then render_memory_error(issue)
+        when 'non_transitive_error' then render_non_transitive_error(issue)
         when 'outdated_index' then render_outdated_index(issue)
         when 'table_availability' then render_table_availability(issue)
         when 'db_name_collision' then render_name_collision('database', issue)

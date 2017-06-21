@@ -6,6 +6,7 @@
 
 #include "arch/address.hpp"
 #include "btree/secondary_operations.hpp"
+#include "clustering/administration/auth/user_context.hpp"
 #include "clustering/administration/datum_adapter.hpp"
 #include "concurrency/signal.hpp"
 #include "containers/archive/stl_types.hpp"
@@ -138,7 +139,8 @@ public:
             double duration,
             server_id_t const &server_id,
             ip_and_port_t const &client_addr_port,
-            std::string const &query);
+            std::string const &query,
+            auth::user_context_t const &user_context);
 
     void merge_derived(query_job_report_t const &job_report);
 
@@ -151,17 +153,18 @@ public:
 
     ip_and_port_t client_addr_port;
     std::string query;
+    auth::user_context_t user_context;
 };
 RDB_DECLARE_SERIALIZABLE_FOR_CLUSTER(query_job_report_t);
 
 class jobs_manager_business_card_t {
 public:
-    typedef mailbox_t<void(std::vector<query_job_report_t>,
-                           std::vector<disk_compaction_job_report_t>,
-                           std::vector<index_construction_job_report_t>,
-                           std::vector<backfill_job_report_t>)> return_mailbox_t;
-    typedef mailbox_t<void(return_mailbox_t::address_t)> get_job_reports_mailbox_t;
-    typedef mailbox_t<void(uuid_u)> job_interrupt_mailbox_t;
+    typedef mailbox_t<std::vector<query_job_report_t>,
+                      std::vector<disk_compaction_job_report_t>,
+                      std::vector<index_construction_job_report_t>,
+                      std::vector<backfill_job_report_t>> return_mailbox_t;
+    typedef mailbox_t<return_mailbox_t::address_t> get_job_reports_mailbox_t;
+    typedef mailbox_t<uuid_u, auth::user_context_t> job_interrupt_mailbox_t;
 
     get_job_reports_mailbox_t::address_t get_job_reports_mailbox_address;
     job_interrupt_mailbox_t::address_t job_interrupt_mailbox_address;

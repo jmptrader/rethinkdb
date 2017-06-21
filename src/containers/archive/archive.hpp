@@ -7,8 +7,8 @@
 #include <string>
 #include <type_traits>
 
-#include "containers/printf_buffer.hpp"
 #include "containers/intrusive_list.hpp"
+#include "containers/printf_buffer.hpp"
 #include "version.hpp"
 #include "valgrind.hpp"
 
@@ -112,6 +112,7 @@ private:
 class write_message_t {
 public:
     write_message_t() { }
+    explicit write_message_t(write_message_t &&) = default;
     ~write_message_t();
 
     void append(const void *p, int64_t n);

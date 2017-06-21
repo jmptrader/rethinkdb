@@ -8,6 +8,7 @@
 #include <string>
 
 #include "errors.hpp"
+#include "arch/runtime/runtime_utils.hpp"
 
 template <class> class scoped_array_t;
 struct iovec;
@@ -96,22 +97,12 @@ typedef linux_tcp_conn_descriptor_t tcp_conn_descriptor_t;
 class linux_tcp_conn_t;
 typedef linux_tcp_conn_t tcp_conn_t;
 
+class linux_secure_tcp_conn_t;
+typedef linux_secure_tcp_conn_t secure_tcp_conn_t;
+
 enum class file_direct_io_mode_t {
     direct_desired,
     buffered_desired
-};
-
-class semantic_checking_file_t {
-public:
-    semantic_checking_file_t() { }
-    virtual ~semantic_checking_file_t() { }
-    // May not return -1.  Crashes instead.
-    virtual size_t semantic_blocking_read(void *buf, size_t length) = 0;
-    // May not return -1.  Crashes instead.
-    virtual size_t semantic_blocking_write(const void *buf, size_t length) = 0;
-
-private:
-    DISABLE_COPYING(semantic_checking_file_t);
 };
 
 // A linux file.  It expects reads and writes and buffers to have an
@@ -125,7 +116,7 @@ public:
     virtual ~file_t() { }
     virtual int64_t get_file_size() = 0;
     virtual void set_file_size(int64_t size) = 0;
-    virtual void set_file_size_at_least(int64_t size) = 0;
+    virtual void set_file_size_at_least(int64_t size, int64_t extent_size) = 0;
 
     virtual void read_async(int64_t offset, size_t length, void *buf,
                             file_account_t *account, linux_iocallback_t *cb) = 0;

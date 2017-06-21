@@ -20,7 +20,17 @@ direct_query_bcard_t direct_query_server_t::get_bcard() {
 void direct_query_server_t::on_read(
         signal_t *interruptor,
         const read_t &read,
-        const mailbox_addr_t<void(read_response_t)> &cont) {
+        const mailbox_addr_t<read_response_t> &cont) {
+
+    // Shortcut: Dummy reads for checking table status are fulfilled
+    // without hitting the store.
+    if (boost::get<dummy_read_t>(&read.read) != nullptr) {
+        read_response_t response;
+        response.response = dummy_read_response_t();
+        response.n_shards = 1;
+        send(mailbox_manager, cont, response);
+        return;
+    }
 
     try {
         /* Leave the token empty. We're not actually interested in ordering here. */

@@ -1,36 +1,37 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "unittest/rdb_protocol.hpp"
 
+#include <functional>
 #include <vector>
-
-#include "errors.hpp"
-#include <boost/function.hpp>
-#include <boost/shared_ptr.hpp>
 
 #include "arch/io/disk.hpp"
 #include "buffer_cache/cache_balancer.hpp"
+#include "clustering/administration/artificial_reql_cluster_interface.hpp"
 #include "clustering/administration/metadata.hpp"
+#include "clustering/administration/tables/name_resolver.hpp"
 #include "extproc/extproc_pool.hpp"
 #include "extproc/extproc_spawner.hpp"
 #include "rdb_protocol/changefeed.hpp"
+#include "rdb_protocol/datum_stream/vector.hpp"
 #include "rdb_protocol/minidriver.hpp"
-#include "rdb_protocol/pb_utils.hpp"
 #include "rdb_protocol/protocol.hpp"
 #include "rdb_protocol/store.hpp"
 #include "rpc/directory/read_manager.hpp"
 #include "rpc/semilattice/semilattice_manager.hpp"
-#include "serializer/config.hpp"
+#include "serializer/log/log_serializer.hpp"
+#include "serializer/merger.hpp"
 #include "serializer/translator.hpp"
 #include "stl_utils.hpp"
 #include "store_subview.hpp"
 #include "unittest/dummy_namespace_interface.hpp"
+#include "unittest/dummy_metadata_controller.hpp"
 #include "unittest/gtest.hpp"
 #include "unittest/unittest_utils.hpp"
 
 namespace unittest {
 
 void run_with_namespace_interface(
-        boost::function<void(
+        std::function<void(
             namespace_interface_t *,
             order_source_t *,
             const std::vector<scoped_ptr_t<store_t> > *
@@ -64,15 +65,18 @@ void run_with_namespace_interface(
     scoped_array_t<scoped_ptr_t<serializer_t> > serializers(store_shards.size());
     for (size_t i = 0; i < store_shards.size(); ++i) {
         filepath_file_opener_t file_opener(temp_files[i]->name(), &io_backender);
-        standard_serializer_t::create(&file_opener,
-                                      standard_serializer_t::static_config_t());
-        serializers[i].init(new standard_serializer_t(standard_serializer_t::dynamic_config_t(),
-                                                      &file_opener,
-                                                      &get_global_perfmon_collection()));
+        log_serializer_t::create(&file_opener,
+                                 log_serializer_t::static_config_t());
+        scoped_ptr_t<log_serializer_t> log_ser(
+            new log_serializer_t(log_serializer_t::dynamic_config_t(),
+                                 &file_opener,
+                                 &get_global_perfmon_collection()));
+        serializers[i].init(new merger_serializer_t(std::move(log_ser), 1));
     }
 
     extproc_pool_t extproc_pool(2);
-    rdb_context_t ctx(&extproc_pool, NULL);
+    dummy_semilattice_controller_t<auth_semilattice_metadata_t> auth_manager;
+    rdb_context_t ctx(&extproc_pool, nullptr, auth_manager.get_view());
 
     for (int rep = 0; rep < num_restarts; ++rep) {
         const bool do_create = rep == 0;
@@ -82,8 +86,7 @@ void run_with_namespace_interface(
                     make_scoped<store_t>(region_t::universe(), serializers[i].get(),
                         &balancer, temp_files[i]->name().permanent_path(), do_create,
                         &get_global_perfmon_collection(), &ctx, &io_backender,
-                        base_path_t("."), scoped_ptr_t<outdated_index_report_t>(),
-                        generate_uuid()));
+                        base_path_t("."), generate_uuid(), update_sindexes_t::UPDATE));
         }
 
         std::vector<scoped_ptr_t<store_view_t> > stores;
@@ -112,7 +115,7 @@ void run_with_namespace_interface(
 }
 
 void run_in_thread_pool_with_namespace_interface(
-        boost::function<void(
+        std::function<void(
             namespace_interface_t *,
             order_source_t *,
             const std::vector<scoped_ptr_t<store_t> > *)> fun,
@@ -155,7 +158,12 @@ void run_get_set_test(
         write_response_t response;
 
         cond_t interruptor;
-        nsi->write(write, &response, osource->check_in("unittest::run_get_set_test(rdb_protocol.cc-A)"), &interruptor);
+        nsi->write(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+            write,
+            &response,
+            osource->check_in("unittest::run_get_set_test(rdb_protocol.cc-A)"),
+            &interruptor);
 
         if (point_write_response_t *maybe_point_write_response_t = boost::get<point_write_response_t>(&response.response)) {
             ASSERT_EQ(maybe_point_write_response_t->result, point_write_result_t::STORED);
@@ -170,7 +178,12 @@ void run_get_set_test(
         read_response_t response;
 
         cond_t interruptor;
-        nsi->read(read, &response, osource->check_in("unittest::run_get_set_test(rdb_protocol.cc-B)"), &interruptor);
+        nsi->read(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::False, tribool::False, tribool::False)),
+            read,
+            &response,
+            osource->check_in("unittest::run_get_set_test(rdb_protocol.cc-B)"),
+            &interruptor);
 
         if (point_read_response_t *maybe_point_read_response = boost::get<point_read_response_t>(&response.response)) {
             ASSERT_TRUE(maybe_point_read_response->data.has());
@@ -194,9 +207,12 @@ std::string create_sindex(const std::vector<scoped_ptr_t<store_t> > *stores) {
     std::string id = uuid_to_str(generate_uuid());
 
     const ql::sym_t arg(1);
-    ql::protob_t<const Term> mapping = ql::r::var(arg)["sid"].release_counted();
+
+    ql::minidriver_t r(ql::backtrace_id_t::empty());
+    ql::raw_term_t mapping = r.var(arg)["sid"].root_term();
+
     sindex_config_t sindex(
-        ql::map_wire_func_t(mapping, make_vector(arg), ql::backtrace_id_t::empty()),
+        ql::map_wire_func_t(mapping, make_vector(arg)),
         reql_version_t::LATEST,
         sindex_multi_bool_t::SINGLE,
         sindex_geo_bool_t::REGULAR);
@@ -213,7 +229,7 @@ void wait_for_sindex(
         const std::vector<scoped_ptr_t<store_t> > *stores,
         const std::string &id) {
     cond_t non_interruptor;
-    for (int attempts = 0; attempts < 35; ++attempts) {
+    for (int attempts = 0; attempts < 50; ++attempts) {
         bool all_ok = true;
         for (const auto &store : *stores) {
             std::map<std::string, std::pair<sindex_config_t, sindex_status_t> > res =
@@ -268,11 +284,12 @@ void run_create_drop_sindex_test(
         write_response_t response;
 
         cond_t interruptor;
-        nsi->write(write,
-                   &response,
-                   osource->check_in(
-                       "unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"),
-                   &interruptor);
+        nsi->write(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+            write,
+            &response,
+            osource->check_in("unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"),
+            &interruptor);
 
         if (point_write_response_t *maybe_point_write_response
             = boost::get<point_write_response_t>(&response.response)) {
@@ -288,19 +305,24 @@ void run_create_drop_sindex_test(
         read_response_t response;
 
         cond_t interruptor;
-        nsi->read(read, &response, osource->check_in("unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"), &interruptor);
+        nsi->read(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::False, tribool::False, tribool::False)),
+            read,
+            &response,
+            osource->check_in("unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"),
+            &interruptor);
 
         if (rget_read_response_t *rget_resp = boost::get<rget_read_response_t>(&response.response)) {
             auto streams = boost::get<ql::grouped_t<ql::stream_t> >(
                 &rget_resp->result);
-            ASSERT_TRUE(streams != NULL);
+            ASSERT_TRUE(streams != nullptr);
             ASSERT_EQ(1, streams->size());
             // Order doesn't matter because streams->size() is 1.
             auto stream = &streams->begin()->second;
-            ASSERT_TRUE(stream != NULL);
-            ASSERT_EQ(1u, stream->size());
+            ASSERT_TRUE(stream != nullptr);
+            ASSERT_EQ(1u, stream->substreams.size());
             ASSERT_EQ(ql::to_datum(data, limits, reql_version_t::LATEST),
-                      stream->at(0).data);
+                      stream->substreams.begin()->second.stream.at(0).data);
         } else {
             ADD_FAILURE() << "got wrong type of result back";
         }
@@ -314,7 +336,12 @@ void run_create_drop_sindex_test(
         write_response_t response;
 
         cond_t interruptor;
-        nsi->write(write, &response, osource->check_in("unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"), &interruptor);
+        nsi->write(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+            write,
+            &response,
+            osource->check_in("unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"),
+            &interruptor);
 
         if (point_delete_response_t *maybe_point_delete_response = boost::get<point_delete_response_t>(&response.response)) {
             ASSERT_EQ(maybe_point_delete_response->result, point_delete_result_t::DELETED);
@@ -329,12 +356,17 @@ void run_create_drop_sindex_test(
         read_response_t response;
 
         cond_t interruptor;
-        nsi->read(read, &response, osource->check_in("unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"), &interruptor);
+        nsi->read(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::False, tribool::False, tribool::False)),
+            read,
+            &response,
+            osource->check_in("unittest::run_create_drop_sindex_test(rdb_protocol.cc-A"),
+            &interruptor);
 
         if (rget_read_response_t *rget_resp = boost::get<rget_read_response_t>(&response.response)) {
             auto streams = boost::get<ql::grouped_t<ql::stream_t> >(
                 &rget_resp->result);
-            ASSERT_TRUE(streams != NULL);
+            ASSERT_TRUE(streams != nullptr);
             ASSERT_EQ(0, streams->size());
         } else {
             ADD_FAILURE() << "got wrong type of result back";
@@ -366,11 +398,13 @@ void populate_sindex(namespace_interface_t *nsi,
         write_response_t response;
 
         cond_t interruptor;
-        nsi->write(write,
-                   &response,
-                   osource->check_in(
-                       "unittest::run_create_drop_sindex_with_data_test(rdb_protocol.cc-A"),
-                   &interruptor);
+        nsi->write(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+            write,
+            &response,
+            osource->check_in(
+                "unittest::run_create_drop_sindex_with_data_test(rdb_protocol.cc-A"),
+            &interruptor);
 
         /* The result can be either STORED or DUPLICATE (in case this
          * test has been run before on the same store). Either is fine.*/
@@ -378,6 +412,103 @@ void populate_sindex(namespace_interface_t *nsi,
             ADD_FAILURE() << "got wrong type of result back";
         }
     }
+}
+
+/* Randomly inserts and drops documents */
+void fuzz_sindex(namespace_interface_t *nsi,
+                 order_source_t *osource,
+                 int goal_size,
+                 auto_drainer_t::lock_t drainer_lock) {
+    // We assume that about half of the ids up to goal_size * 2 will be deleted at any
+    // time.
+    std::vector<bool> doc_exists(goal_size * 2, false);
+    while (!drainer_lock.get_drain_signal()->is_pulsed()) {
+        int id = randint(goal_size * 2);
+        write_t write;
+        ql::configured_limits_t limits;
+        if (randint(2) == 0) {
+            // Insert
+            if (doc_exists[id]) {
+                continue;
+            }
+
+            std::string json_doc = strprintf("{\"id\" : %d, \"sid\" : %d}",
+                                             id, randint(goal_size));
+            rapidjson::Document data;
+            data.Parse(json_doc.c_str());
+            ASSERT_FALSE(data.HasParseError());
+            ql::datum_t d(static_cast<double>(id));
+            store_key_t pk = store_key_t(d.print_primary());
+
+            write = write_t(point_write_t(pk, ql::to_datum(data, limits,
+                                                         reql_version_t::LATEST)),
+                            DURABILITY_REQUIREMENT_SOFT, profile_bool_t::PROFILE, limits);
+            doc_exists[id] = true;
+        } else {
+            // Delete
+            if (!doc_exists[id]) {
+                continue;
+            }
+
+            ql::datum_t d(static_cast<double>(id));
+            store_key_t pk = store_key_t(d.print_primary());
+
+            write = write_t(point_delete_t(pk),
+                            DURABILITY_REQUIREMENT_SOFT, profile_bool_t::PROFILE, limits);
+            doc_exists[id] = false;
+        }
+        write_response_t response;
+
+        cond_t interruptor;
+        nsi->write(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+            write,
+            &response,
+            osource->check_in("unittest::fuzz_sindex(rdb_protocol.cc"),
+            &interruptor);
+
+        /* The result can be either STORED or DUPLICATE (in case this
+         * test has been run before on the same store). Either is fine.*/
+        if (!boost::get<point_write_response_t>(&response.response)
+            && !boost::get<point_delete_response_t>(&response.response)) {
+            ADD_FAILURE() << "got wrong type of result back";
+        }
+
+        nap(2);
+    }
+}
+
+void run_fuzz_create_drop_sindex(
+        namespace_interface_t *nsi,
+        order_source_t *osource,
+        const std::vector<scoped_ptr_t<store_t> > *stores) {
+    const int num_docs = 500;
+
+    /* Start fuzzing the table. */
+
+    auto_drainer_t fuzzing_drainer;
+    /* spawn_dangerously_now so that we can capture the fuzzing_drainer inside the
+    lambda.*/
+    coro_t::spawn_now_dangerously([&]() {
+        fuzz_sindex(nsi, osource, num_docs, fuzzing_drainer.lock());
+    });
+
+    /* Let some time pass to allow `fuzz_sindex` to populate the table. */
+    nap(2 * num_docs);
+
+    /* Create a secondary index (this will post construct the index while under load). */
+    std::string id = create_sindex(stores);
+    wait_for_sindex(stores, id);
+
+    /* Drop the index in the middle of fuzzing to test proper interruption under load. */
+    drop_sindex(stores, id);
+
+    /* Fuzzing is stopped here by draining `fuzzing_drainer`. */
+}
+
+TEST(RDBProtocol, SindexFuzzCreateDrop) {
+    // Run the test 3 times (on the same data file)
+    run_in_thread_pool_with_namespace_interface(&run_fuzz_create_drop_sindex, false, 3);
 }
 
 void run_create_drop_sindex_with_data_test(
@@ -457,17 +588,23 @@ void read_sindex(namespace_interface_t *nsi,
     read_response_t response;
 
     cond_t interruptor;
-    nsi->read(read, &response, osource->check_in("unittest::run_rename_sindex_test(rdb_protocol.cc-A"), &interruptor);
+    nsi->read(
+        auth::user_context_t(auth::permissions_t(tribool::True, tribool::False, tribool::False, tribool::False)),
+        read,
+        &response,
+        osource->check_in("unittest::run_rename_sindex_test(rdb_protocol.cc-A"),
+        &interruptor);
 
     if (rget_read_response_t *rget_resp = boost::get<rget_read_response_t>(&response.response)) {
         auto streams = boost::get<ql::grouped_t<ql::stream_t> >(
             &rget_resp->result);
-        ASSERT_TRUE(streams != NULL);
+        ASSERT_TRUE(streams != nullptr);
         ASSERT_EQ(1, streams->size());
         // Order doesn't matter because streams->size() is 1.
         ql::stream_t *stream = &streams->begin()->second;
-        ASSERT_TRUE(stream != NULL);
-        ASSERT_EQ(expected_size, stream->size());
+        ASSERT_TRUE(stream != nullptr);
+        ASSERT_EQ(1ul, stream->substreams.size());
+        ASSERT_EQ(expected_size, stream->substreams.begin()->second.stream.size());
     } else {
         ADD_FAILURE() << "got wrong type of result back";
     }
@@ -631,12 +768,13 @@ void run_sindex_oversized_keys_test(
                 write_response_t response;
 
                 cond_t interruptor;
-                nsi->write(write,
-                           &response,
-                           osource->check_in(
-                               "unittest::run_sindex_oversized_keys_test("
-                               "rdb_protocol.cc-A"),
-                           &interruptor);
+                nsi->write(
+                    auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+                    write,
+                    &response,
+                    osource->check_in(
+                        "unittest::run_sindex_oversized_keys_test(rdb_protocol.cc-A"),
+                    &interruptor);
 
                 auto resp = boost::get<point_write_response_t>(
                         &response.response);
@@ -654,20 +792,27 @@ void run_sindex_oversized_keys_test(
                 read_response_t response;
 
                 cond_t interruptor;
-                nsi->read(read, &response, osource->check_in("unittest::run_sindex_oversized_keys_test(rdb_protocol.cc-A"), &interruptor);
+                nsi->read(
+                    auth::user_context_t(auth::permissions_t(tribool::True, tribool::False, tribool::False, tribool::False)),
+                    read,
+                    &response,
+                    osource->check_in(
+                        "unittest::run_sindex_oversized_keys_test(rdb_protocol.cc-A"),
+                    &interruptor);
 
                 if (rget_read_response_t *rget_resp
                     = boost::get<rget_read_response_t>(&response.response)) {
                     auto streams = boost::get<ql::grouped_t<ql::stream_t> >(
                         &rget_resp->result);
-                    ASSERT_TRUE(streams != NULL);
+                    ASSERT_TRUE(streams != nullptr);
                     ASSERT_EQ(1, streams->size());
                     // Order doesn't matter because streams->size() is 1.
                     auto stream = &streams->begin()->second;
-                    ASSERT_TRUE(stream != NULL);
+                    ASSERT_TRUE(stream != nullptr);
                     // There should be results equal to the number of iterations
                     // performed
-                    ASSERT_EQ(i + 1, stream->size());
+                    ASSERT_EQ(1ul, stream->substreams.size());
+                    ASSERT_EQ(i + 1, stream->substreams.begin()->second.stream.size());
                 } else {
                     ADD_FAILURE() << "got wrong type of result back";
                 }
@@ -709,11 +854,13 @@ void run_sindex_missing_attr_test(
         write_response_t response;
 
         cond_t interruptor;
-        nsi->write(write,
-                   &response,
-                   osource->check_in(
-                       "unittest::run_sindex_missing_attr_test(rdb_protocol.cc-A"),
-                   &interruptor);
+        nsi->write(
+            auth::user_context_t(auth::permissions_t(tribool::True, tribool::True, tribool::False, tribool::False)),
+            write,
+            &response,
+            osource->check_in(
+                "unittest::run_sindex_missing_attr_test(rdb_protocol.cc-A"),
+            &interruptor);
 
         if (!boost::get<point_write_response_t>(&response.response)) {
             ADD_FAILURE() << "got wrong type of result back";
@@ -737,48 +884,84 @@ TPTEST(RDBProtocol, ArtificialChangefeeds) {
     using ql::changefeed::artificial_t;
     using ql::changefeed::keyspec_t;
     using ql::changefeed::msg_t;
+
+    extproc_pool_t extproc_pool(2);
+    dummy_semilattice_controller_t<auth_semilattice_metadata_t> auth_manager;
+    rdb_context_t rdb_context(&extproc_pool, nullptr, auth_manager.get_view());
+    artificial_reql_cluster_interface_t artificial_reql_cluster_interface(
+        auth_manager.get_view(),
+        &rdb_context);
+    dummy_semilattice_controller_t<cluster_semilattice_metadata_t> cluster_manager;
+    name_resolver_t name_resolver(
+        cluster_manager.get_view(),
+        nullptr,
+        make_lifetime(artificial_reql_cluster_interface));
+
     class dummy_artificial_t : public artificial_t {
     public:
+        explicit dummy_artificial_t(lifetime_t<name_resolver_t const &> name_resolver_)
+            : artificial_t(generate_uuid(), name_resolver_) { }
         /* This gets a notification when the last changefeed disconnects, but we don't
         care about that. */
         void maybe_remove() { }
     };
-    dummy_artificial_t artificial_cfeed;
+    dummy_artificial_t artificial_cfeed(make_lifetime(name_resolver));
+
     struct cfeed_bundle_t {
         cfeed_bundle_t(ql::env_t *env, artificial_t *a)
             : bt(ql::backtrace_id_t::empty()),
               point_0(a->subscribe(
                           env,
-                          true,
-                          false,
-                          ql::configured_limits_t(),
-                          keyspec_t::point_t{ql::datum_t(0.0)},
+                          ql::changefeed::streamspec_t(
+                              make_counted<ql::vector_datum_stream_t>(
+                                  bt, std::vector<ql::datum_t>(), r_nullopt),
+                              "test",
+                              false,
+                              false,
+                              false,
+                              ql::configured_limits_t(),
+                              ql::datum_t::boolean(false),
+                              keyspec_t::point_t{ql::datum_t(0.0)}),
                           "id",
                           std::vector<ql::datum_t>(),
                           bt)),
               point_10(a->subscribe(
                            env,
-                           true,
-                           false,
-                           ql::configured_limits_t(),
-                           keyspec_t::point_t{ql::datum_t(10.0)},
+                           ql::changefeed::streamspec_t(
+                               make_counted<ql::vector_datum_stream_t>(
+                                   bt, std::vector<ql::datum_t>(), r_nullopt),
+                               "test",
+                               false,
+                               false,
+                               false,
+                               ql::configured_limits_t(),
+                               ql::datum_t::boolean(false),
+                               keyspec_t::point_t{ql::datum_t(10.0)}),
                            "id",
                            std::vector<ql::datum_t>(),
                            bt)),
               range(a->subscribe(
                         env,
-                        true,
-                        false,
-                        ql::configured_limits_t(),
-                        keyspec_t::range_t{
-                          std::vector<ql::transform_variant_t>(),
-                          boost::optional<std::string>(),
-                          sorting_t::UNORDERED,
-                          ql::datum_range_t(
-                              ql::datum_t(0.0),
-                              key_range_t::closed,
-                              ql::datum_t(10.0),
-                              key_range_t::open)},
+                        ql::changefeed::streamspec_t(
+                            make_counted<ql::vector_datum_stream_t>(
+                                bt, std::vector<ql::datum_t>(), r_nullopt),
+                            "test",
+                            false,
+                            false,
+                            false,
+                            ql::configured_limits_t(),
+                            ql::datum_t::boolean(false),
+                            keyspec_t::range_t{
+                                std::vector<ql::transform_variant_t>(),
+                                    optional<std::string>(),
+                                    sorting_t::UNORDERED,
+                                    ql::datumspec_t(
+                                        ql::datum_range_t(
+                                            ql::datum_t(0.0),
+                                            key_range_t::closed,
+                                            ql::datum_t(10.0),
+                                            key_range_t::open)),
+                                    r_nullopt}),
                         "id",
                         std::vector<ql::datum_t>(),
                         bt)) { }

@@ -1,17 +1,16 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/term.hpp"
 
 #include "arch/address.hpp"
 #include "clustering/administration/jobs/report.hpp"
 #include "concurrency/cross_thread_watchable.hpp"
-#include "rdb_protocol/backtrace.hpp"
-#include "rdb_protocol/counted_term.hpp"
+#include "rdb_protocol/rdb_backtrace.hpp"
 #include "rdb_protocol/env.hpp"
 #include "rdb_protocol/func.hpp"
 #include "rdb_protocol/minidriver.hpp"
 #include "rdb_protocol/query_cache.hpp"
+#include "rdb_protocol/response.hpp"
 #include "rdb_protocol/term_walker.hpp"
-#include "rdb_protocol/validate.hpp"
 #include "rdb_protocol/terms/terms.hpp"
 #include "thread_local.hpp"
 
@@ -19,21 +18,14 @@ namespace ql {
 
 // The minimum amount of stack space we require to be available on a coroutine
 // before attempting to compile or evaluate a term.
-const size_t MIN_EVAL_STACK_SPACE = 16 * KILOBYTE;
+const size_t MIN_COMPILE_STACK_SPACE = 16 * KILOBYTE;
+const size_t MIN_EVAL_STACK_SPACE = 32 * KILOBYTE;
 
-counted_t<const term_t> compile_term(compile_env_t *env, const protob_t<const Term> t) {
-    // Check that we have enough stack space available to evaluate the term
-    rcheck_toplevel(
-        has_n_bytes_free_stack_space(MIN_EVAL_STACK_SPACE),
-        base_exc_t::RESOURCE,
-        "Insufficient stack space available to compile query.  This is usually "
-        "caused by running a very deeply-nested query.");
-
-    // HACK: per @srh, use unlimited array size at compile time
-    ql::configured_limits_t limits = ql::configured_limits_t::unlimited;
-    switch (t->type()) {
-    case Term::DATUM:              return make_datum_term(t, limits,
-                                                          reql_version_t::LATEST);
+counted_t<const term_t> compile_on_current_stack(
+        compile_env_t *env,
+        const raw_term_t &t) {
+    switch (t.type()) {
+    case Term::DATUM:              return make_datum_term(t);
     case Term::MAKE_ARRAY:         return make_make_array_term(env, t);
     case Term::MAKE_OBJ:           return make_make_obj_term(env, t);
     case Term::BINARY:             return make_binary_term(env, t);
@@ -71,6 +63,7 @@ counted_t<const term_t> compile_term(compile_env_t *env, const protob_t<const Te
     case Term::GET_FIELD:          return make_get_field_term(env, t);
     case Term::OFFSETS_OF:         return make_offsets_of_term(env, t);
     case Term::KEYS:               return make_keys_term(env, t);
+    case Term::VALUES:             return make_values_term(env, t);
     case Term::OBJECT:             return make_object_term(env, t);
     case Term::HAS_FIELDS:         return make_has_fields_term(env, t);
     case Term::WITH_FIELDS:        return make_with_fields_term(env, t);
@@ -84,6 +77,7 @@ counted_t<const term_t> compile_term(compile_env_t *env, const protob_t<const Te
     case Term::CHANGES:            return make_changes_term(env, t);
     case Term::REDUCE:             return make_reduce_term(env, t);
     case Term::MAP:                return make_map_term(env, t);
+    case Term::FOLD:               return make_fold_term(env, t);
     case Term::FILTER:             return make_filter_term(env, t);
     case Term::CONCAT_MAP:         return make_concatmap_term(env, t);
     case Term::GROUP:              return make_group_term(env, t);
@@ -127,6 +121,9 @@ counted_t<const term_t> compile_term(compile_env_t *env, const protob_t<const Te
     case Term::RECONFIGURE:        return make_reconfigure_term(env, t);
     case Term::REBALANCE:          return make_rebalance_term(env, t);
     case Term::SYNC:               return make_sync_term(env, t);
+    case Term::GRANT:              return make_grant_term(env, t);
+    case Term::SET_WRITE_HOOK:     return make_set_write_hook_term(env, t);
+    case Term::GET_WRITE_HOOK:     return make_get_write_hook_term(env, t);
     case Term::INDEX_CREATE:       return make_sindex_create_term(env, t);
     case Term::INDEX_DROP:         return make_sindex_drop_term(env, t);
     case Term::INDEX_LIST:         return make_sindex_list_term(env, t);
@@ -217,85 +214,19 @@ counted_t<const term_t> compile_term(compile_env_t *env, const protob_t<const Te
     unreachable();
 }
 
-// If the query wants a reply, we can release the query id, which is
-// only used for tracking the ordering of noreply queries for the
-// purpose of noreply_wait.
-void maybe_release_query_id(query_id_t &&id,
-                            const protob_t<Query> &query) {
-    if (!is_noreply(query)) {
-        query_id_t destroyer(std::move(id));
-    }
+counted_t<const term_t> compile_term(compile_env_t *env, const raw_term_t &t) {
+    return call_with_enough_stack<counted_t<const term_t> >([&]() {
+            return compile_on_current_stack(env, std::move(t));
+        }, MIN_COMPILE_STACK_SPACE);
 }
 
-void run(query_id_t &&query_id,
-         protob_t<Query> q,
-         Response *res,
-         query_cache_t *query_cache,
-         signal_t *interruptor) {
-    try {
-        validate_pb(*q);
-    } catch (const base_exc_t &e) {
-        fill_error(res,
-                   Response::CLIENT_ERROR,
-                   e.get_error_type(),
-                   e.what(),
-                   backtrace_registry_t::EMPTY_BACKTRACE);
-        return;
-    }
-
-    try {
-        validate_optargs(*q);
-    } catch (const base_exc_t &e) {
-        fill_error(res,
-                   Response::COMPILE_ERROR,
-                   e.get_error_type(),
-                   e.what(),
-                   backtrace_registry_t::EMPTY_BACKTRACE);
-        return;
-    }
-#ifdef INSTRUMENT
-    debugf("Query: %s\n", q->DebugString().c_str());
-#endif // INSTRUMENT
-
-    int64_t token = q->token();
-    use_json_t use_json = q->accepts_r_json() ? use_json_t::YES : use_json_t::NO;
-
-    try {
-        switch (q->type()) {
-        case Query_QueryType_START: {
-            maybe_release_query_id(std::move(query_id), q);
-            scoped_ptr_t<query_cache_t::ref_t> query_ref =
-                query_cache->create(token, q, use_json, interruptor);
-            query_ref->fill_response(res);
-        } break;
-        case Query_QueryType_CONTINUE: {
-            maybe_release_query_id(std::move(query_id), q);
-            scoped_ptr_t<query_cache_t::ref_t> query_ref =
-                query_cache->get(token, use_json, interruptor);
-            query_ref->fill_response(res);
-        } break;
-        case Query_QueryType_STOP: {
-            query_cache->terminate_query(token);
-            res->set_type(Response::SUCCESS_SEQUENCE);
-        } break;
-        case Query_QueryType_NOREPLY_WAIT: {
-            query_cache->noreply_wait(query_id, token, interruptor);
-            res->set_type(Response::WAIT_COMPLETE);
-        } break;
-        default: unreachable();
-        }
-    } catch (const bt_exc_t &ex) {
-        fill_error(res, ex.response_type, ex.error_type, ex.message, ex.bt_datum);
-    }
-}
-
-runtime_term_t::runtime_term_t(backtrace_id_t bt)
-    : bt_rcheckable_t(bt) { }
+runtime_term_t::runtime_term_t(backtrace_id_t _bt)
+    : bt_rcheckable_t(_bt) { }
 
 runtime_term_t::~runtime_term_t() { }
 
-term_t::term_t(protob_t<const Term> _src)
-    : runtime_term_t(backtrace_id_t(_src.get())),
+term_t::term_t(const raw_term_t &_src)
+    : runtime_term_t(_src.bt()),
       src(_src) { }
 
 term_t::~term_t() { }
@@ -306,26 +237,31 @@ term_t::~term_t() { }
 
 #ifdef INSTRUMENT
 TLS_with_init(int, DBG_depth, 0);
-#define DBG(s, args...) do {                                            \
+#define DBG(s, ...) do {                                                \
         std::string DBG_s = "";                                         \
         for (int DBG_i = 0; DBG_i < TLS_get_DBG_depth(); ++DBG_i) DBG_s += " ";   \
-        debugf("%s" s, DBG_s.c_str(), ##args);                          \
+        debugf("%s" s, DBG_s.c_str(), ##__VA_ARGS__);                   \
     } while (0)
 #define INC_DEPTH do { TLS_set_DBG_depth(TLS_get_DBG_depth()+1); } while (0)
 #define DEC_DEPTH do { TLS_set_DBG_depth(TLS_get_DBG_depth()-1); } while (0)
 #else // INSTRUMENT
-#define DBG(s, args...)
+#define DBG(s, ...)
 #define INC_DEPTH
 #define DEC_DEPTH
 #endif // INSTRUMENT
 
-protob_t<const Term> term_t::get_src() const {
+const raw_term_t &term_t::get_src() const {
     return src;
 }
 
-scoped_ptr_t<val_t> runtime_term_t::eval(scope_env_t *env, eval_flags_t eval_flags) const {
+scoped_ptr_t<val_t> runtime_term_t::eval_on_current_stack(
+        scope_env_t *env,
+        eval_flags_t eval_flags) const {
+        PROFILE_STARTER_IF_ENABLED(
+        env->env->profile() == profile_bool_t::PROFILE,
+        strprintf("Evaluating %s.", name()),
+        env->env->trace);
     // This is basically a hook for unit tests to change things mid-query
-    profile::starter_t starter(strprintf("Evaluating %s.", name()), env->env->trace);
     env->env->do_eval_callback();
     DBG("EVALUATING %s (%d):\n", name(), is_deterministic());
     if (env->env->interruptor->is_pulsed()) {
@@ -337,15 +273,6 @@ scoped_ptr_t<val_t> runtime_term_t::eval(scope_env_t *env, eval_flags_t eval_fla
 #ifdef INSTRUMENT
     try {
 #endif // INSTRUMENT
-        // Check that we have enough stack space available to evaluate the term
-        rcheck(
-            has_n_bytes_free_stack_space(MIN_EVAL_STACK_SPACE),
-            base_exc_t::RESOURCE,
-            strprintf(
-                "Insufficient stack space available to evaluate `%s`.  This is usually "
-                "caused by running a very deeply-nested query.",
-                name()));
-
         try {
             scoped_ptr_t<val_t> ret = term_eval(env, eval_flags);
             DEC_DEPTH;
@@ -363,6 +290,14 @@ scoped_ptr_t<val_t> runtime_term_t::eval(scope_env_t *env, eval_flags_t eval_fla
         throw;
     }
 #endif // INSTRUMENT
+}
+
+scoped_ptr_t<val_t> runtime_term_t::eval(
+        scope_env_t *env,
+        eval_flags_t eval_flags) const {
+    return call_with_enough_stack<scoped_ptr_t<val_t> >([&]() {
+            return eval_on_current_stack(env, std::move(eval_flags));
+        }, MIN_EVAL_STACK_SPACE);
 }
 
 } // namespace ql

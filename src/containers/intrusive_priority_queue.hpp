@@ -7,8 +7,7 @@
 
 #include "errors.hpp"
 
-// TODO: Make this type generally not be awful: Make intrusive_priority_queue_node_t not have
-// virtual functions, make it not use an O(n) vector.
+// TODO: For some reason I wanted this to not use an O(n) vector.
 
 template <class node_t>
 class intrusive_priority_queue_t;
@@ -81,7 +80,7 @@ public:
 
     node_t *peek() {
         if (nodes.empty()) {
-            return NULL;
+            return nullptr;
         } else {
             return nodes.front();
         }
@@ -89,7 +88,7 @@ public:
 
     node_t *pop() {
         if (nodes.empty()) {
-            return NULL;
+            return nullptr;
         } else {
             node_t *x = nodes.front();
             rassert(node_queue(x) == this);

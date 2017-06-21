@@ -56,6 +56,11 @@ ql::datum_t convert_uuid_to_datum(
     return ql::datum_t(datum_string_t(uuid_to_str(value)));
 }
 
+ql::datum_t convert_server_id_to_datum(
+        const server_id_t &value) {
+    return ql::datum_t(datum_string_t(value.print()));
+}
+
 bool convert_uuid_from_datum(
         ql::datum_t datum,
         uuid_u *value_out,
@@ -75,6 +80,25 @@ bool convert_uuid_from_datum(
     return true;
 }
 
+bool convert_server_id_from_datum(
+        ql::datum_t datum,
+        server_id_t *value_out,
+        admin_err_t *error_out) {
+    if (datum.get_type() != ql::datum_t::R_STR) {
+        *error_out = admin_err_t{
+            "Expected a server ID; got " + datum.print(),
+            query_state_t::FAILED};
+        return false;
+    }
+    if (!str_to_server_id(datum.as_str().to_std(), value_out)) {
+        *error_out = admin_err_t{
+            "Expected a server ID; got " + datum.print(),
+            query_state_t::FAILED};
+        return false;
+    }
+    return true;
+}
+
 ql::datum_t convert_name_or_uuid_to_datum(
         const name_string_t &name,
         const uuid_u &uuid,
@@ -86,25 +110,46 @@ ql::datum_t convert_name_or_uuid_to_datum(
     }
 }
 
+ql::datum_t convert_name_or_server_id_to_datum(
+        const name_string_t &name,
+        const server_id_t &sid,
+        admin_identifier_format_t identifier_format) {
+    if (identifier_format == admin_identifier_format_t::name) {
+        return convert_name_to_datum(name);
+    } else {
+        return convert_server_id_to_datum(sid);
+    }
+}
+
 bool convert_connected_server_id_to_datum(
         const server_id_t &server_id,
         admin_identifier_format_t identifier_format,
         server_config_client_t *server_config_client,
         ql::datum_t *server_name_or_uuid_out,
         name_string_t *server_name_out) {
-    boost::optional<name_string_t> name;
-    server_config_client->get_server_config_map()->read_key(server_id,
-        [&](const server_config_versioned_t *config) {
-            if (config != nullptr) {
-                name = boost::make_optional(config->config.name);
-            }
-        });
-    if (!static_cast<bool>(name)) {
-        return false;
+    optional<name_string_t> name;
+    if (server_id.is_proxy()) {
+        // Fill in a temporary proxy server name.
+        // We assume that proxies only appear anywhere if they are currently
+        // connected, so we don't need a separate check for connectedness.
+        name.set(name_string_t::guarantee_valid(server_id.print().c_str()));
+    } else {
+        server_config_client->get_server_config_map()->read_key(server_id,
+            [&](const server_config_versioned_t *config) {
+                if (config != nullptr) {
+                    name = make_optional(config->config.name);
+                }
+            });
+        if (!static_cast<bool>(name)) {
+            // No entry in the server config map means that the server is not
+            // currently connected.
+            return false;
+        }
     }
+
     if (server_name_or_uuid_out != nullptr) {
-        *server_name_or_uuid_out =
-            convert_name_or_uuid_to_datum(*name, server_id, identifier_format);
+        *server_name_or_uuid_out = convert_name_or_uuid_to_datum(
+                *name, server_id.get_uuid(), identifier_format);
     }
     if (server_name_out != nullptr) *server_name_out = *name;
     return true;

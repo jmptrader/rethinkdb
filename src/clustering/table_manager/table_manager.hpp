@@ -29,6 +29,7 @@ public:
         const multi_table_manager_timestamp_t::epoch_t &_epoch,
         const raft_member_id_t &raft_member_id,
         raft_storage_interface_t<table_raft_state_t> *raft_storage,
+        const raft_start_election_immediately_t start_election_immediately,
         multistore_ptr_t *multistore_ptr,
         perfmon_collection_t *perfmon_collection_namespace);
 
@@ -77,10 +78,8 @@ private:
     private:
         void on_set_config(
             signal_t *interruptor,
-            const table_config_and_shards_t &new_config_and_shards,
-            const mailbox_t<void(
-                boost::optional<multi_table_manager_timestamp_t>
-                )>::address_t &reply_addr);
+            const table_config_and_shards_change_t &table_config_and_shards_change,
+            const mailbox_addr_t<optional<multi_table_manager_timestamp_t>, bool> &reply_addr);
 
         table_manager_t * const parent;
         minidir_read_manager_t<std::pair<server_id_t, contract_id_t>, contract_ack_t>
@@ -132,7 +131,7 @@ private:
         execution_bcard_minidir_directory;
     watchable_map_keyed_var_t<
             peer_id_t,
-            uuid_u,
+            uuid_u, // The leader UUID
             minidir_bcard_t<std::pair<server_id_t, contract_id_t>, contract_ack_t> >
         contract_ack_minidir_directory;
 
@@ -168,13 +167,13 @@ private:
     /* The `execution_bcard_write_manager` receives `contract_execution_bcard_t`s
     from the `contract_executor` on this server and passes them to the
     `contract_executor_t`s on other servers. */
-    minidir_write_manager_t<std::pair<server_id_t, branch_id_t>,
+    minidir_write_manager_t<server_id_t, std::pair<server_id_t, branch_id_t>,
         contract_execution_bcard_t> execution_bcard_write_manager;
 
     /* The `contract_ack_write_manager` receives `contract_ack_t`s from the
     `contract_executor` and passes them to the `contract_coordinator_t` on the Raft
     leader. */
-    minidir_write_manager_t<std::pair<server_id_t, contract_id_t>,
+    minidir_write_manager_t<uuid_u, std::pair<server_id_t, contract_id_t>,
         contract_ack_t> contract_ack_write_manager;
 
     /* The `sindex_manager` watches the `table_config_t` and changes the sindexes on

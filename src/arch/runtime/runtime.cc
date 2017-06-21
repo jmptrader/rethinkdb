@@ -9,6 +9,10 @@
 #include "arch/runtime/thread_pool.hpp"
 #include "do_on_thread.hpp"
 
+bool in_thread_pool() {
+    return linux_thread_pool_t::get_thread_pool() != nullptr;
+}
+
 threadnum_t get_thread_id() {
     if (i_am_in_blocker_pool_thread()) {
         return threadnum_t(-1);
@@ -22,9 +26,13 @@ int get_num_threads() {
 
 #ifndef NDEBUG
 void assert_good_thread_id(threadnum_t thread) {
-    rassert(thread.threadnum >= 0, "(thread = %" PRIi32 ")", thread.threadnum);
-    rassert(thread.threadnum < get_num_threads(), "(thread = %" PRIi32 ", n_threads = %d)",
-            thread.threadnum, get_num_threads());
+    if (linux_thread_pool_t::get_thread_pool() == nullptr) {
+        rassert(thread.threadnum == 0);
+    } else {
+        rassert(thread.threadnum >= 0, "(thread = %" PRIi32 ")", thread.threadnum);
+        rassert(thread.threadnum < get_num_threads(), "(thread = %" PRIi32 ", n_threads = %d)",
+                thread.threadnum, get_num_threads());
+    }
 }
 #endif
 
@@ -52,7 +60,7 @@ struct starter_t : public thread_message_t {
     starter_t(linux_thread_pool_t *_tp, const std::function<void()> &_fun)
       : tp(_tp), run(std::bind(&starter_t::run_wrapper, this, _fun)) { }
     void on_thread_switch() {
-        rassert(get_thread_id().threadnum == 0);
+        rassert(get_thread_id().threadnum == get_num_threads() - 1);
         coro_t::spawn_sometime(run);
     }
 private:

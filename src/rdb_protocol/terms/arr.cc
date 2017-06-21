@@ -1,7 +1,8 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/terms/arr.hpp"
 
 #include "math.hpp"
+#include "parsing/utf8.hpp"
 #include "rdb_protocol/error.hpp"
 #include "rdb_protocol/func.hpp"
 #include "rdb_protocol/op.hpp"
@@ -13,7 +14,7 @@ namespace ql {
 
 class pend_term_t : public op_term_t {
 public:
-    pend_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    pend_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 protected:
     enum which_pend_t { PRE, AP };
@@ -42,7 +43,7 @@ protected:
 
 class append_term_t : public pend_term_t {
 public:
-    append_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    append_term_t(compile_env_t *env, const raw_term_t &term)
         : pend_term_t(env, term) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env,
@@ -55,7 +56,7 @@ private:
 
 class prepend_term_t : public pend_term_t {
 public:
-    prepend_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    prepend_term_t(compile_env_t *env, const raw_term_t &term)
         : pend_term_t(env, term) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -66,7 +67,7 @@ private:
 
 // This gets the literal index of a (possibly negative) index relative to a
 // fixed size.
-uint64_t canonicalize(const term_t *t, int64_t index, size_t size, bool *oob_out = 0) {
+static uint64_t canonicalize(const term_t *t, int64_t index, size_t size, bool *oob_out = 0) {
     CT_ASSERT(sizeof(size_t) <= sizeof(uint64_t));
     if (index >= 0) return index;
     if (uint64_t(index * -1) > size) {
@@ -168,7 +169,7 @@ scoped_ptr_t<val_t> nth_term_impl(const term_t *term, scope_env_t *env,
 
 class nth_term_t : public op_term_t {
 public:
-    nth_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    nth_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     friend class bracket_t;
@@ -181,7 +182,7 @@ private:
 
 class is_empty_term_t : public op_term_t {
 public:
-    is_empty_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    is_empty_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -196,18 +197,17 @@ private:
 // TODO: this kinda sucks.
 class slice_term_t : public bounded_op_term_t {
 public:
-    slice_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    slice_term_t(compile_env_t *env, const raw_term_t &term)
         : bounded_op_term_t(env, term, argspec_t(2, 3)) { }
 private:
 
-    bool canon_helper(size_t size, bool index_open, int64_t fake_index,
+    void canon_helper(size_t size, bool index_open, int64_t fake_index,
                       bool is_left, uint64_t *real_index_out) const {
         bool index_oob = false;
         *real_index_out = canonicalize(this, fake_index, size, &index_oob);
-        if (index_open == is_left) {
+        if (index_open == is_left && !index_oob) {
             *real_index_out += 1; // This is safe because it was an int64_t before.
         }
-        return index_oob;
     }
 
     scoped_ptr_t<val_t> slice_array(datum_t arr,
@@ -215,12 +215,8 @@ private:
                                     bool left_open, int64_t fake_l,
                                     bool right_open, int64_t fake_r) const {
         uint64_t real_l, real_r;
-        if (canon_helper(arr.arr_size(), left_open, fake_l, true, &real_l)) {
-            real_l = 0;
-        }
-        if (canon_helper(arr.arr_size(), right_open, fake_r, false, &real_r)) {
-            return new_val(datum_t::empty_array());
-        }
+        canon_helper(arr.arr_size(), left_open, fake_l, true, &real_l);
+        canon_helper(arr.arr_size(), right_open, fake_r, false, &real_r);
 
         datum_array_builder_t out(limits);
         for (uint64_t i = real_l; i < real_r; ++i) {
@@ -237,12 +233,8 @@ private:
                                      bool right_open, int64_t fake_r) const {
         const datum_string_t &data = binary.as_binary();
         uint64_t real_l, real_r;
-        if (canon_helper(data.size(), left_open, fake_l, true, &real_l)) {
-            real_l = 0;
-        }
-        if (canon_helper(data.size(), right_open, fake_r, false, &real_r)) {
-            return new_val(datum_t::binary(datum_string_t()));
-        }
+        canon_helper(data.size(), left_open, fake_l, true, &real_l);
+        canon_helper(data.size(), right_open, fake_r, false, &real_r);
 
         real_r = clamp<uint64_t>(real_r, 0, data.size());
 
@@ -254,6 +246,29 @@ private:
         }
 
         return new_val(datum_t::binary(std::move(subdata)));
+    }
+
+    scoped_ptr_t<val_t> slice_string(datum_t str,
+                                     bool left_open, int64_t fake_l,
+                                     bool right_open, int64_t fake_r) const {
+        const datum_string_t &data = str.as_str();
+        size_t size = utf8::count_codepoints(data);
+        uint64_t real_l, real_r;
+        canon_helper(size, left_open, fake_l, true, &real_l);
+        canon_helper(size, right_open, fake_r, false, &real_r);
+
+        real_r = clamp<uint64_t>(real_r, 0, size);
+
+        datum_string_t subdata;
+        if (real_l <= real_r) {
+            size_t from = utf8::index_codepoints(data, real_l);
+            size_t to = utf8::index_codepoints(data, real_r);
+            subdata = datum_string_t(to - from, &data.data()[from]);
+        } else {
+            subdata = datum_string_t();
+        }
+
+        return new_val(datum_t(std::move(subdata)));
     }
 
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -270,9 +285,11 @@ private:
                                    right_open, fake_r);
             } else if (d.get_type() == datum_t::R_BINARY) {
                 return slice_binary(d, left_open, fake_l, right_open, fake_r);
+            } else if (d.get_type() == datum_t::R_STR) {
+                return slice_string(d, left_open, fake_l, right_open, fake_r);
             } else {
                 rfail_target(v, base_exc_t::LOGIC,
-                             "Expected ARRAY or BINARY, but found %s.",
+                             "Expected ARRAY, BINARY, or STRING, but found %s.",
                              d.get_type_name().c_str());
             }
         } else if (v->get_type().is_convertible(val_t::type_t::SEQUENCE)) {
@@ -317,7 +334,7 @@ private:
 
 class limit_term_t : public op_term_t {
 public:
-    limit_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    limit_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -345,7 +362,7 @@ private:
 
 class set_insert_term_t : public op_term_t {
 public:
-    set_insert_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    set_insert_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -374,7 +391,7 @@ private:
 
 class set_union_term_t : public op_term_t {
 public:
-    set_union_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    set_union_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -404,7 +421,7 @@ private:
 
 class set_intersection_term_t : public op_term_t {
 public:
-    set_intersection_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    set_intersection_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -433,7 +450,7 @@ private:
 
 class set_difference_term_t : public op_term_t {
 public:
-    set_difference_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    set_difference_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -469,7 +486,7 @@ public:
      * indexes so we need to make it here. */
     enum index_method_t { ELEMENTS, SPACES};
 
-    at_term_t(compile_env_t *env, const protob_t<const Term> term,
+    at_term_t(compile_env_t *env, const raw_term_t &term,
               argspec_t argspec, index_method_t index_method)
         : op_term_t(env, term, argspec), index_method_(index_method) { }
 
@@ -496,7 +513,7 @@ private:
 
 class insert_at_term_t : public at_term_t {
 public:
-    insert_at_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    insert_at_term_t(compile_env_t *env, const raw_term_t &term)
         : at_term_t(env, term, argspec_t(3), SPACES) { }
 private:
     void modify(scope_env_t *env, args_t *args, size_t index,
@@ -510,7 +527,7 @@ private:
 
 class splice_at_term_t : public at_term_t {
 public:
-    splice_at_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    splice_at_term_t(compile_env_t *env, const raw_term_t &term)
         : at_term_t(env, term, argspec_t(3), SPACES) { }
 private:
     void modify(scope_env_t *env, args_t *args, size_t index,
@@ -523,7 +540,7 @@ private:
 
 class delete_at_term_t : public at_term_t {
 public:
-    delete_at_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    delete_at_term_t(compile_env_t *env, const raw_term_t &term)
         : at_term_t(env, term, argspec_t(2, 3), ELEMENTS) { }
 private:
     void modify(scope_env_t *env, args_t *args, size_t index,
@@ -541,7 +558,7 @@ private:
 
 class change_at_term_t : public at_term_t {
 public:
-    change_at_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    change_at_term_t(compile_env_t *env, const raw_term_t &term)
         : at_term_t(env, term, argspec_t(3), ELEMENTS) { }
 private:
     void modify(scope_env_t *env, args_t *args, size_t index,
@@ -554,7 +571,7 @@ private:
 
 class offsets_of_term_t : public op_term_t {
 public:
-    offsets_of_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    offsets_of_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -572,7 +589,7 @@ private:
 
 class contains_term_t : public op_term_t {
 public:
-    contains_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    contains_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1, -1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -624,7 +641,7 @@ private:
 
 class args_term_t : public op_term_t {
 public:
-    args_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    args_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
     // This just evaluates its argument and returns it as an array.  The actual
     // logic to make `args` splice arguments is in op.cc.
@@ -641,87 +658,87 @@ private:
 };
 
 counted_t<term_t> make_args_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<args_term_t>(env, term);
 }
 
 counted_t<term_t> make_contains_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<contains_term_t>(env, term);
 }
 
 counted_t<term_t> make_append_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<append_term_t>(env, term);
 }
 
 counted_t<term_t> make_prepend_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<prepend_term_t>(env, term);
 }
 
 counted_t<term_t> make_nth_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<nth_term_t>(env, term);
 }
 
 counted_t<term_t> make_is_empty_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<is_empty_term_t>(env, term);
 }
 
 counted_t<term_t> make_slice_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<slice_term_t>(env, term);
 }
 
 counted_t<term_t> make_limit_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<limit_term_t>(env, term);
 }
 
 counted_t<term_t> make_set_insert_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<set_insert_term_t>(env, term);
 }
 
 counted_t<term_t> make_set_union_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<set_union_term_t>(env, term);
 }
 
 counted_t<term_t> make_set_intersection_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<set_intersection_term_t>(env, term);
 }
 
 counted_t<term_t> make_set_difference_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<set_difference_term_t>(env, term);
 }
 
 counted_t<term_t> make_insert_at_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<insert_at_term_t>(env, term);
 }
 
 counted_t<term_t> make_delete_at_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<delete_at_term_t>(env, term);
 }
 
 counted_t<term_t> make_change_at_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<change_at_term_t>(env, term);
 }
 
 counted_t<term_t> make_splice_at_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<splice_at_term_t>(env, term);
 }
 
 counted_t<term_t> make_offsets_of_term(
-    compile_env_t *env, const protob_t<const Term> &term) {
+    compile_env_t *env, const raw_term_t &term) {
     return make_counted<offsets_of_term_t>(env, term);
 }
 

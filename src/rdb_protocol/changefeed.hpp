@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef RDB_PROTOCOL_CHANGEFEED_HPP_
 #define RDB_PROTOCOL_CHANGEFEED_HPP_
 
@@ -14,19 +14,24 @@
 #include <boost/variant.hpp>
 
 #include "btree/keys.hpp"
+#include "clustering/administration/auth/user_context.hpp"
+#include "concurrency/new_mutex.hpp"
 #include "concurrency/promise.hpp"
 #include "concurrency/rwlock.hpp"
+#include "containers/archive/optional.hpp"
 #include "containers/counted.hpp"
+#include "containers/lifetime.hpp"
 #include "containers/scoped.hpp"
 #include "protocol_api.hpp"
-#include "rdb_protocol/counted_term.hpp"
 #include "rdb_protocol/datum.hpp"
+#include "rdb_protocol/datumspec.hpp"
 #include "rdb_protocol/shards.hpp"
 #include "region/region.hpp"
 #include "repli_timestamp.hpp"
 #include "rpc/connectivity/peer_id.hpp"
 #include "rpc/mailbox/typed.hpp"
 #include "rpc/serialize_macros.hpp"
+#include "containers/archive/boost_types.hpp"
 
 class artificial_table_backend_t;
 class auto_drainer_t;
@@ -34,12 +39,14 @@ class base_table_t;
 class btree_slice_t;
 class mailbox_manager_t;
 class namespace_interface_access_t;
+class name_resolver_t;
 class real_superblock_t;
 class sindex_superblock_t;
 struct rdb_modification_report_t;
 struct sindex_disk_info_t;
 
-typedef std::pair<ql::datum_t, boost::optional<uint64_t> > index_pair_t;
+// The string is the btree index key
+typedef std::pair<ql::datum_t, std::string> index_pair_t;
 typedef std::map<std::string, std::vector<index_pair_t> > index_vals_t;
 
 namespace ql {
@@ -59,9 +66,9 @@ typedef std::pair<std::string, std::pair<datum_t, datum_t> > item_t;
 typedef std::pair<const std::string, std::pair<datum_t, datum_t> > const_item_t;
 
 std::vector<item_t> mangle_sort_truncate_stream(
-    stream_t &&stream, is_primary_t is_primary, sorting_t sorting, size_t n);
+    raw_stream_t &&stream, is_primary_t is_primary, sorting_t sorting, size_t n);
 
-boost::optional<datum_t> apply_ops(
+optional<datum_t> apply_ops(
     const datum_t &val,
     const std::vector<scoped_ptr_t<op_t> > &ops,
     env_t *env,
@@ -78,8 +85,8 @@ struct msg_t {
     };
     struct limit_change_t {
         uuid_u sub;
-        boost::optional<std::string> old_key;
-        boost::optional<std::pair<std::string, std::pair<datum_t, datum_t> > > new_val;
+        optional<std::string> old_key;
+        optional<std::pair<std::string, std::pair<datum_t, datum_t> > > new_val;
         RDB_DECLARE_ME_SERIALIZABLE(limit_change_t);
     };
     struct limit_stop_t {
@@ -88,11 +95,13 @@ struct msg_t {
         RDB_DECLARE_ME_SERIALIZABLE(limit_stop_t);
     };
     struct change_t {
-        index_vals_t old_indexes, new_indexes;
+        index_vals_t old_indexes;
+        index_vals_t new_indexes;
         store_key_t pkey;
         /* For a newly-created row, `old_val` is an empty `datum_t`. For a deleted row,
         `new_val` is an empty `datum_t`. */
-        datum_t old_val, new_val;
+        datum_t old_val;
+        datum_t new_val;
         RDB_DECLARE_ME_SERIALIZABLE(change_t);
     };
     struct stop_t {
@@ -105,7 +114,12 @@ struct msg_t {
     msg_t &operator=(const msg_t &) = default;
 
     // Starts with STOP to avoid doing work for default initialization.
-    boost::variant<stop_t, change_t, limit_start_t, limit_change_t, limit_stop_t> op;
+    typedef boost::variant<stop_t,
+                           change_t,
+                           limit_start_t,
+                           limit_change_t,
+                           limit_stop_t> op_t;
+    op_t op;
 
     // Accursed reference collapsing!
     template<class T, class = typename std::enable_if<std::is_object<T>::value>::type>
@@ -117,15 +131,17 @@ RDB_DECLARE_SERIALIZABLE(msg_t);
 class real_feed_t;
 struct stamped_msg_t;
 
-typedef mailbox_addr_t<void(stamped_msg_t)> client_addr_t;
+typedef mailbox_addr_t<stamped_msg_t> client_addr_t;
 
 struct keyspec_t {
     struct range_t {
         std::vector<transform_variant_t> transforms;
-        boost::optional<std::string> sindex;
+        optional<std::string> sindex;
         sorting_t sorting;
-        datum_range_t range;
+        datumspec_t datumspec;
+        optional<datum_t> intersect_geometry;
     };
+    struct empty_t { };
     struct limit_t {
         range_t range;
         size_t limit;
@@ -134,7 +150,7 @@ struct keyspec_t {
         datum_t key;
     };
 
-    keyspec_t(keyspec_t &&other)
+    keyspec_t(keyspec_t &&other) noexcept
         : spec(std::move(other.spec)),
           table(std::move(other.table)),
           table_name(std::move(other.table_name)) { }
@@ -154,14 +170,34 @@ struct keyspec_t {
     keyspec_t(const keyspec_t &) = default;
     keyspec_t &operator=(const keyspec_t &) = default;
 
-    typedef boost::variant<range_t, limit_t, point_t> spec_t;
+    typedef boost::variant<range_t, empty_t, limit_t, point_t> spec_t;
     spec_t spec;
     counted_t<base_table_t> table;
     std::string table_name;
 };
 region_t keyspec_to_region(const keyspec_t &keyspec);
 
+struct streamspec_t {
+    counted_t<datum_stream_t> maybe_src; // Non-null iff `include_initial`.
+    std::string table_name;
+    bool include_offsets;
+    bool include_states;
+    bool include_types;
+    configured_limits_t limits;
+    datum_t squash;
+    keyspec_t::spec_t spec;
+    streamspec_t(counted_t<datum_stream_t> _maybe_src,
+                 std::string _table_name,
+                 bool _include_offsets,
+                 bool _include_states,
+                 bool _include_types,
+                 configured_limits_t _limits,
+                 datum_t _squash,
+                 keyspec_t::spec_t _spec);
+};
+
 RDB_DECLARE_SERIALIZABLE_FOR_CLUSTER(keyspec_t::range_t);
+RDB_DECLARE_SERIALIZABLE_FOR_CLUSTER(keyspec_t::empty_t);
 RDB_DECLARE_SERIALIZABLE_FOR_CLUSTER(keyspec_t::limit_t);
 RDB_DECLARE_SERIALIZABLE_FOR_CLUSTER(keyspec_t::point_t);
 
@@ -182,24 +218,20 @@ public:
             namespace_interface_access_t(
                 const namespace_id_t &,
                 signal_t *)
-            > &_namespace_source
-        );
+            > &_namespace_source,
+        lifetime_t<name_resolver_t const &> _name_resolver);
     ~client_t();
     // Throws QL exceptions.
     counted_t<datum_stream_t> new_stream(
         env_t *env,
-        counted_t<datum_stream_t> maybe_src,
-        configured_limits_t limits,
-        const datum_t &squash,
-        bool include_states,
-        const namespace_id_t &table,
-        backtrace_id_t bt,
-        const std::string &table_name,
-        const keyspec_t::spec_t &spec);
+        const streamspec_t &ss,
+        const namespace_id_t &table_id,
+        backtrace_id_t bt);
     void maybe_remove_feed(
         const auto_drainer_t::lock_t &lock, const namespace_id_t &uuid);
     scoped_ptr_t<real_feed_t> detach_feed(
-        const auto_drainer_t::lock_t &lock, const namespace_id_t &uuid);
+        const auto_drainer_t::lock_t &lock,
+        real_feed_t *expected_feed);
 private:
     friend class subscription_t;
     mailbox_manager_t *const manager;
@@ -208,6 +240,7 @@ private:
             const namespace_id_t &,
             signal_t *)
         > const namespace_source;
+    name_resolver_t const &name_resolver;
     std::map<namespace_id_t, scoped_ptr_t<real_feed_t> > feeds;
     // This lock manages access to the `feeds` map.  The `feeds` map needs to be
     // read whenever `new_stream` is called, and needs to be written to whenever
@@ -224,7 +257,7 @@ private:
     auto_drainer_t drainer;
 };
 
-typedef mailbox_addr_t<void(client_addr_t)> server_addr_t;
+typedef mailbox_addr_t<client_addr_t> server_addr_t;
 
 template<class Id, class Key, class Val, class Gt>
 class index_queue_t {
@@ -234,7 +267,9 @@ private:
     std::set<diterator,
              std::function<bool(const diterator &, const diterator &)> > index;
 
-    void erase(const diterator &it) {
+    // This can't be passed by reference because we sometimes erase the source
+    // of the reference in the body of this function.
+    void erase(diterator it) {
         guarantee(it != data.end());
         auto ft = index.find(it);
         guarantee(ft != index.end());
@@ -246,6 +281,10 @@ public:
     typedef typename
     std::set<diterator, std::function<bool(const diterator &,
                                            const diterator &)> >::iterator iterator;
+    typedef typename
+    std::set<diterator, std::function<bool(const diterator &,
+                                           const diterator &)> >::const_iterator
+    const_iterator;
 
     explicit index_queue_t(Gt gt) : index(gt) { }
 
@@ -264,7 +303,6 @@ public:
             guarantee(pair.second);
             it = pair.first;
         } else {
-            guarantee(k == p.first->second.first);
             it = index.find(p.first);
             guarantee(it != index.end());
         }
@@ -272,16 +310,22 @@ public:
         return std::make_pair(it, p.second);
     }
 
-    size_t size() {
+    size_t size() const {
         guarantee(data.size() == index.size());
         return data.size();
     }
 
     iterator begin() { return index.begin(); }
     iterator end() { return index.end(); }
+    const_iterator begin() const { return index.begin(); }
+    const_iterator end() const { return index.end(); }
+    // This is sometimes called after `**raw_it` has been invalidated, so we
+    // can't just dispatch to the `erase(diterator)` implementation above.
     void erase(const iterator &raw_it) {
         guarantee(raw_it != index.end());
-        erase(*raw_it);
+        data.erase(*raw_it);
+        index.erase(raw_it);
+        guarantee(data.size() == index.size());
     }
     void clear() {
         data.clear();
@@ -358,8 +402,10 @@ public:
         rwlock_in_line_t *clients_lock,
         region_t _region,
         std::string _table,
+        optional<uuid_u> _sindex_id,
         rdb_context_t *ctx,
-        std::map<std::string, wire_func_t> optargs,
+        global_optargs_t optargs,
+        auth::user_context_t user_context,
         uuid_u _uuid,
         server_t *_parent,
         client_t::addr_t _parent_client,
@@ -368,12 +414,12 @@ public:
         std::vector<item_t> &&item_vec);
 
     void add(rwlock_in_line_t *spot,
-             store_key_t sk,
+             const store_key_t &sk,
              is_primary_t is_primary,
              datum_t key,
              datum_t val) THROWS_NOTHING;
     void del(rwlock_in_line_t *spot,
-             store_key_t sk,
+             const store_key_t &sk,
              is_primary_t is_primary) THROWS_NOTHING;
     void commit(rwlock_in_line_t *spot,
                 const boost::variant<primary_ref_t, sindex_ref_t> &sindex_ref)
@@ -384,14 +430,13 @@ public:
 
     const region_t region;
     const std::string table;
+    const optional<uuid_u> sindex_id;
     const uuid_u uuid;
 private:
     // Can throw `exc_t` exceptions if an error occurs while reading from disk.
     std::vector<item_t> read_more(
         const boost::variant<primary_ref_t, sindex_ref_t> &ref,
-        sorting_t sorting,
-        const boost::optional<item_queue_t::iterator> &start,
-        size_t n);
+        const optional<item_t> &start);
     void send(msg_t &&msg);
 
     scoped_ptr_t<env_t> env;
@@ -405,8 +450,8 @@ private:
     limit_order_t gt;
     item_queue_t item_queue;
 
-    std::vector<std::pair<std::string, std::pair<datum_t, datum_t> > > added;
-    std::vector<std::string> deleted;
+    std::map<std::string, std::pair<datum_t, datum_t> > added;
+    std::set<std::string> deleted;
 
     bool aborted;
 public:
@@ -420,46 +465,65 @@ public:
 class server_t {
 public:
     typedef server_addr_t addr_t;
-    typedef mailbox_addr_t<void(client_t::addr_t, boost::optional<std::string>, uuid_u)>
+    typedef mailbox_addr_t<client_t::addr_t, optional<std::string>, uuid_u>
         limit_addr_t;
     explicit server_t(mailbox_manager_t *_manager, store_t *_parent);
     ~server_t();
-    void add_client(const client_t::addr_t &addr, region_t region);
+    void add_client(
+        const client_t::addr_t &addr,
+        region_t region,
+        const auto_drainer_t::lock_t &keepalive);
     void add_limit_client(
         const client_t::addr_t &addr,
         const region_t &region,
         const std::string &table,
+        const optional<uuid_u> &sindex_id,
         rdb_context_t *ctx,
-        std::map<std::string, wire_func_t> optargs,
+        global_optargs_t optargs,
+        auth::user_context_t user_context,
         const uuid_u &client_uuid,
         const keyspec_t::limit_t &spec,
         limit_order_t lt,
-        std::vector<item_t> &&start_data);
+        std::vector<item_t> &&start_data,
+        const auto_drainer_t::lock_t &keepalive);
     // `key` should be non-NULL if there is a key associated with the message.
-    void send_all(const msg_t &msg,
-                  const store_key_t &key,
-                  rwlock_in_line_t *stamp_spot);
+    void send_all(
+        const msg_t &msg,
+        const store_key_t &key,
+        rwlock_in_line_t *stamp_spot,
+        const auto_drainer_t::lock_t &keepalive);
     addr_t get_stop_addr();
     limit_addr_t get_limit_stop_addr();
-    boost::optional<uint64_t> get_stamp(const client_t::addr_t &addr);
+    optional<uint64_t> get_stamp(
+        const client_t::addr_t &addr,
+        const auto_drainer_t::lock_t &keepalive);
     uuid_u get_uuid();
     // `f` will be called with a read lock on `clients` and a write lock on the
     // limit manager.
-    void foreach_limit(const boost::optional<std::string> &s,
-                       const store_key_t *pkey, // NULL if none
-                       std::function<void(rwlock_in_line_t *,
-                                          rwlock_in_line_t *,
-                                          rwlock_in_line_t *,
-                                          limit_manager_t *)> f) THROWS_NOTHING;
-    bool has_limit(const boost::optional<std::string> &s);
+    void foreach_limit(
+        const optional<std::string> &sindex_name,
+        const optional<uuid_u> &sindex_id,
+        const store_key_t *pkey, // NULL if none
+        std::function<void(rwlock_in_line_t *,
+                           rwlock_in_line_t *,
+                           rwlock_in_line_t *,
+                           limit_manager_t *)> f,
+        const auto_drainer_t::lock_t &keepalive) THROWS_NOTHING;
+    bool has_limit(
+        const optional<std::string> &sindex_name,
+        const auto_drainer_t::lock_t &keepalive);
+    auto_drainer_t::lock_t get_keepalive();
 private:
     friend class limit_manager_t;
     void stop_mailbox_cb(signal_t *interruptor, client_t::addr_t addr);
     void limit_stop_mailbox_cb(signal_t *interruptor,
                                client_t::addr_t addr,
-                               boost::optional<std::string> sindex,
+                               optional<std::string> sindex,
                                uuid_u uuid);
-    void add_client_cb(signal_t *stopped, client_t::addr_t addr);
+    void add_client_cb(
+        signal_t *stopped,
+        client_t::addr_t addr,
+        auto_drainer_t::lock_t keepalive);
 
     // The UUID of the server, used so that `real_feed_t`s can enforce on ordering on
     // changefeed messages on a per-server basis (and drop changefeed messages
@@ -472,13 +536,8 @@ private:
         scoped_ptr_t<cond_t> cond;
         uint64_t stamp;
         std::vector<region_t> regions;
-        std::map<boost::optional<std::string>,
-                 std::vector<scoped_ptr_t<limit_manager_t> >,
-                 // Be careful not to remove this, since optionals are
-                 // convertible to bool.
-                 std::function<
-                     bool(const boost::optional<std::string> &,
-                          const boost::optional<std::string> &)> > limit_clients;
+        std::map<optional<std::string>,
+                 std::vector<scoped_ptr_t<limit_manager_t>>> limit_clients;
         scoped_ptr_t<rwlock_t> limit_clients_lock;
     };
     std::map<client_t::addr_t, client_info_t> clients;
@@ -487,12 +546,12 @@ private:
         auto_drainer_t::lock_t *stealable_lock,
         scoped_ptr_t<rwlock_in_line_t> *stealable_clients_read_lock,
         client_info_t *info,
-        boost::optional<std::string> sindex,
+        optional<std::string> sindex,
         size_t offset);
 
-    void send_one_with_lock(const auto_drainer_t::lock_t &lock,
-                            std::pair<const client_t::addr_t, client_info_t> *client,
-                            msg_t msg);
+    void send_one_with_lock(std::pair<const client_t::addr_t, client_info_t> *client,
+                            msg_t msg,
+                            const auto_drainer_t::lock_t &lock);
 
     // Controls access to `clients`.  A `server_t` needs to read `clients` when:
     // * `send_all` is called
@@ -512,17 +571,19 @@ private:
     // Clients send a message to this mailbox with their address when they want
     // to unsubscribe.  The callback of this mailbox acquires the drainer, so it
     // has to be destroyed first.
-    mailbox_t<void(client_t::addr_t)> stop_mailbox;
+    mailbox_t<client_t::addr_t> stop_mailbox;
     // Clients send a message to this mailbox to unsubscribe a particular limit
     // changefeed.
-    mailbox_t<void(client_t::addr_t, boost::optional<std::string>, uuid_u)>
+    mailbox_t<client_t::addr_t, optional<std::string>, uuid_u>
         limit_stop_mailbox;
 };
 
 class artificial_feed_t;
 class artificial_t : public home_thread_mixin_t {
 public:
-    artificial_t();
+    artificial_t(
+        namespace_id_t const &table_id,
+        lifetime_t<name_resolver_t const &> name_resolver);
     virtual ~artificial_t();
 
     /* Rules for synchronization between `subscribe()` and `send_all()`:
@@ -532,10 +593,7 @@ public:
 
     counted_t<datum_stream_t> subscribe(
         env_t *env,
-        bool include_initial_vals,
-        bool include_states,
-        configured_limits_t limits,
-        const keyspec_t::spec_t &spec,
+        const streamspec_t &ss,
         const std::string &primary_key_name,
         const std::vector<datum_t> &initial_values,
         backtrace_id_t bt);
@@ -550,6 +608,7 @@ public:
     virtual void maybe_remove() = 0;
 
 private:
+    new_mutex_t stamp_mutex;
     uint64_t stamp;
     const uuid_u uuid;
     const scoped_ptr_t<artificial_feed_t> feed;

@@ -1,7 +1,10 @@
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/configured_limits.hpp"
+
 #include <limits>
-#include "rdb_protocol/wire_func.hpp"
 #include "rdb_protocol/func.hpp"
+#include "rdb_protocol/pseudo_time.hpp"
+#include "rdb_protocol/wire_func.hpp"
 
 namespace ql {
 
@@ -20,11 +23,15 @@ configured_limits_t from_optargs(
         bool has_changefeed_queue_size = args->has_optarg("changefeed_queue_size");
         bool has_array_limit = args->has_optarg("array_limit");
         if (has_changefeed_queue_size || has_array_limit) {
-            env_t env(ctx,
-                      return_empty_normal_batches_t::NO,
-                      interruptor,
-                      std::map<std::string, wire_func_t>(),
-                      nullptr);
+            env_t env(
+                ctx,
+                return_empty_normal_batches_t::NO,
+                interruptor,
+                serializable_env_t{
+                    global_optargs_t(),
+                    auth::user_context_t(auth::permissions_t(tribool::False, tribool::False, tribool::False, tribool::False)),
+                    datum_t()},
+                nullptr);
             if (has_changefeed_queue_size) {
                 int64_t sz = args->get_optarg(&env, "changefeed_queue_size")->as_int();
                 changefeed_queue_size = check_limit("changefeed queue size", sz);

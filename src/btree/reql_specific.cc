@@ -8,20 +8,18 @@
 /* This is the actual structure stored on disk for the superblock of a table's primary or
 sindex B-tree. Both of them use the exact same format, but the sindex B-trees don't make
 use of the `sindex_block` or `metainfo_blob` fields. */
-struct reql_btree_superblock_t {
+ATTR_PACKED(struct reql_btree_superblock_t {
     block_magic_t magic;
     block_id_t root_block;
     block_id_t stat_block;
     block_id_t sindex_block;
 
     static const int METAINFO_BLOB_MAXREFLEN
-        = from_ser_block_size_t<DEVICE_BLOCK_SIZE>::cache_size - sizeof(magic)
-                                                               - sizeof(root_block)
-                                                               - sizeof(stat_block)
-                                                               - sizeof(sindex_block);
+        = from_ser_block_size_t<DEVICE_BLOCK_SIZE>::cache_size - sizeof(block_magic_t)
+                                                               - 3 * sizeof(block_id_t);
 
     char metainfo_blob[METAINFO_BLOB_MAXREFLEN];
-} __attribute__((__packed__));
+});
 
 static const uint32_t REQL_BTREE_SUPERBLOCK_SIZE = sizeof(reql_btree_superblock_t);
 
@@ -55,7 +53,7 @@ real_superblock_t::real_superblock_t(buf_lock_t &&sb_buf)
 
 real_superblock_t::real_superblock_t(
         buf_lock_t &&sb_buf,
-        new_semaphore_acq_t &&write_semaphore_acq)
+        new_semaphore_in_line_t &&write_semaphore_acq)
     : write_semaphore_acq_(std::move(write_semaphore_acq)),
       sb_buf_(std::move(sb_buf)) {}
 
@@ -63,12 +61,17 @@ void real_superblock_t::release() {
     sb_buf_.reset_buf_lock();
 }
 
+const reql_btree_superblock_t *get_reql_btree_superblock(buf_read_t *read) {
+    uint16_t sb_size;
+    const reql_btree_superblock_t *sb_data
+        = static_cast<const reql_btree_superblock_t *>(read->get_data_read(&sb_size));
+    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    return sb_data;
+}
+
 block_id_t real_superblock_t::get_root_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data
-        = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->root_block;
 }
 
@@ -81,19 +84,13 @@ void real_superblock_t::set_root_block_id(const block_id_t new_root_block) {
 
 block_id_t real_superblock_t::get_stat_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->stat_block;
 }
 
 block_id_t real_superblock_t::get_sindex_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->sindex_block;
 }
 
@@ -106,10 +103,7 @@ void sindex_superblock_t::release() {
 
 block_id_t sindex_superblock_t::get_root_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data
-        = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->root_block;
 }
 
@@ -122,19 +116,13 @@ void sindex_superblock_t::set_root_block_id(const block_id_t new_root_block) {
 
 block_id_t sindex_superblock_t::get_stat_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->stat_block;
 }
 
 block_id_t sindex_superblock_t::get_sindex_block_id() {
     buf_read_t read(&sb_buf_);
-    uint32_t sb_size;
-    const reql_btree_superblock_t *sb_data =
-        static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-    guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+    const reql_btree_superblock_t *sb_data = get_reql_btree_superblock(&read);
     return sb_data->sindex_block;
 }
 
@@ -229,7 +217,7 @@ void superblock_metainfo_iterator_t::advance(char * p) {
 check_failed:
     pos = next_pos = end;
     key_size = value_size = 0;
-    key_ptr = value_ptr = NULL;
+    key_ptr = value_ptr = nullptr;
 }
 
 void superblock_metainfo_iterator_t::operator++() {
@@ -245,10 +233,7 @@ void get_superblock_metainfo(
     std::vector<char> metainfo;
     {
         buf_read_t read(superblock->get());
-        uint32_t sb_size;
-        const reql_btree_superblock_t *data
-            = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-        guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+        const reql_btree_superblock_t *data = get_reql_btree_superblock(&read);
 
         if (data->magic == reql_btree_version_magic_t<cluster_version_t::v2_1>::value) {
             *version_out = cluster_version_t::v2_1;
@@ -366,7 +351,7 @@ void get_btree_superblock(
 void get_btree_superblock(
         txn_t *txn,
         UNUSED write_access_t access,
-        new_semaphore_acq_t &&write_sem_acq,
+        new_semaphore_in_line_t &&write_sem_acq,
         scoped_ptr_t<real_superblock_t> *got_superblock_out) {
     buf_lock_t tmp_buf(buf_parent_t(txn), SUPERBLOCK_ID, access_t::write);
     scoped_ptr_t<real_superblock_t> tmp_sb(
@@ -387,7 +372,7 @@ void get_btree_superblock_and_txn_for_writing(
     txn_out->init(txn);
 
     /* Acquire a ticket from the superblock_write_semaphore */
-    new_semaphore_acq_t sem_acq;
+    new_semaphore_in_line_t sem_acq;
     if(superblock_write_semaphore != nullptr) {
         sem_acq.init(superblock_write_semaphore, 1);
         sem_acq.acquisition_signal()->wait();

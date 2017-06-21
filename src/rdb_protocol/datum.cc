@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/datum.hpp"
 
 #include <float.h>
@@ -8,11 +8,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <iterator>
 
 #include "errors.hpp"
 #include <boost/detail/endian.hpp>
 
+#include "arch/runtime/coroutines.hpp"
 #include "cjson/json.hpp"
 #include "containers/archive/stl_types.hpp"
 #include "containers/scoped.hpp"
@@ -20,6 +22,7 @@
 #include "rapidjson/rapidjson.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
+#include "rdb_protocol/datum_stream/array.hpp"
 #include "rdb_protocol/env.hpp"
 #include "rdb_protocol/error.hpp"
 #include "rdb_protocol/pseudo_binary.hpp"
@@ -32,6 +35,10 @@
 #include "stl_utils.hpp"
 
 namespace ql {
+
+// The minimum amount of stack space we require to be available on a coroutine
+// before attempting to recurse into a nested datum.
+const size_t MIN_DATUM_RECURSION_STACK_SPACE = 16 * KILOBYTE;
 
 const size_t tag_size = 8;
 
@@ -149,7 +156,14 @@ datum_t::data_wrapper_t::data_wrapper_t(type_t type, shared_buf_ref_t<char> &&_b
 }
 
 datum_t::data_wrapper_t::~data_wrapper_t() {
-    destruct();
+    // An optimization similar to what we do in `call_with_enough_stack_datum`,
+    // except that we can also ignore recursion for BUF_R_ARRAY and BUF_R_OBJECT.
+    if (internal_type == internal_type_t::R_ARRAY ||
+        internal_type == internal_type_t::R_OBJECT) {
+        call_with_enough_stack([&] { destruct(); }, MIN_DATUM_RECURSION_STACK_SPACE);
+    } else {
+        destruct();
+    }
 }
 
 datum_t::type_t datum_t::data_wrapper_t::get_type() const {
@@ -210,6 +224,7 @@ void datum_t::data_wrapper_t::destruct() {
     } break;
     default: unreachable();
     }
+    internal_type = internal_type_t::UNINITIALIZED;
 }
 
 void datum_t::data_wrapper_t::assign_copy(const datum_t::data_wrapper_t &copyee) {
@@ -275,6 +290,10 @@ void datum_t::data_wrapper_t::assign_move(datum_t::data_wrapper_t &&movee) noexc
     } break;
     default: unreachable();
     }
+#ifndef NDEBUG
+    // De-initialize `movee` to make it easier to catch use-after-move bugs
+    movee.destruct();
+#endif
 }
 
 datum_t::datum_t() : data() { }
@@ -299,7 +318,10 @@ datum_t::datum_t(double _num) : data(_num) {
 }
 
 datum_t::datum_t(datum_string_t _str) : data(std::move(_str)) {
-    check_str_validity(data.r_str);
+}
+
+datum_t::datum_t(const std::string &string)
+    : data(datum_string_t(string)) {
 }
 
 datum_t::datum_t(const char *cstr) : data(cstr) { }
@@ -403,51 +425,35 @@ datum_t datum_t::binary(datum_string_t &&_data) {
 
 // two versions of these, because std::string is not necessarily null
 // terminated.
-inline void fail_if_invalid(reql_version_t reql_version, const std::string &string) {
-    switch (reql_version) {
-        case reql_version_t::v1_14: // v1_15 is the same as v1_14
-            break;
-        case reql_version_t::v1_16:
-        case reql_version_t::v2_0:
-        case reql_version_t::v2_1_is_latest:
-            utf8::reason_t reason;
-            if (!utf8::is_valid(string, &reason)) {
-                int truncation_length = std::min<size_t>(reason.position, 20);
-                rfail_datum(base_exc_t::LOGIC,
-                            "String `%.*s` (truncated) is not a UTF-8 string; "
-                            "%s at position %zu.",
-                            truncation_length, string.c_str(), reason.explanation,
-                            reason.position);
-            }
-            break;
-        default:
-            unreachable();
+inline void fail_if_invalid(const std::string &string) {
+    utf8::reason_t reason;
+    if (!utf8::is_valid(string, &reason)) {
+        int truncation_length = std::min<size_t>(reason.position, 20);
+        rfail_datum(base_exc_t::LOGIC,
+                    "String `%.*s` (truncated) is not a UTF-8 string; "
+                    "%s at position %zu.",
+                    truncation_length, string.c_str(), reason.explanation,
+                    reason.position);
     }
 }
 
 inline void fail_if_invalid(
-        reql_version_t reql_version,
         const char *string,
         size_t string_length) {
-    switch (reql_version) {
-        case reql_version_t::v1_14: // v1_15 is the same as v1_14
-            break;
-        case reql_version_t::v1_16:
-        case reql_version_t::v2_0:
-        case reql_version_t::v2_1_is_latest:
-            utf8::reason_t reason;
-            if (!utf8::is_valid(string, string + string_length, &reason)) {
-                int truncation_length = std::min<size_t>(reason.position, 20);
-                rfail_datum(base_exc_t::LOGIC,
-                            "String `%.*s` (truncated) is not a UTF-8 string; "
-                            "%s at position %zu.",
-                            truncation_length, string, reason.explanation,
-                            reason.position);
-            }
-            break;
-        default:
-            unreachable();
+    utf8::reason_t reason;
+    if (!utf8::is_valid(string, string + string_length, &reason)) {
+        int truncation_length = std::min<size_t>(reason.position, 20);
+        rfail_datum(base_exc_t::LOGIC,
+                    "String `%.*s` (truncated) is not a UTF-8 string; "
+                    "%s at position %zu.",
+                    truncation_length, string, reason.explanation,
+                    reason.position);
     }
+}
+
+datum_t datum_t::utf8(datum_string_t _data) {
+    ql::fail_if_invalid(_data.data(), _data.size());
+    return datum_t(std::move(_data));
 }
 
 datum_t to_datum(const rapidjson::Value &json, const configured_limits_t &limits,
@@ -463,35 +469,38 @@ datum_t to_datum(const rapidjson::Value &json, const configured_limits_t &limits
         return datum_t::boolean(true);
     } break;
     case rapidjson::kObjectType: {
-        datum_object_builder_t builder;
-        for (rapidjson::Value::ConstMemberIterator it = json.MemberBegin();
-             it != json.MemberEnd();
-             ++it) {
-            fail_if_invalid(reql_version,
-                            it->name.GetString(),
-                            it->name.GetStringLength());
-            bool dup = builder.add(datum_string_t(it->name.GetStringLength(),
-                                                  it->name.GetString()),
-                                   to_datum(it->value, limits, reql_version));
-            rcheck_datum(!dup, base_exc_t::LOGIC,
-                         strprintf("Duplicate key `%s` in JSON.",
-                                   it->name.GetString()));
-        }
-        const std::set<std::string> pts = { pseudo::literal_string };
-        return std::move(builder).to_datum(pts);
+        return call_with_enough_stack<datum_t>([&]() {
+            datum_object_builder_t builder;
+            for (rapidjson::Value::ConstMemberIterator it = json.MemberBegin();
+                 it != json.MemberEnd();
+                 ++it) {
+                fail_if_invalid(it->name.GetString(),
+                                it->name.GetStringLength());
+                datum_string_t key(it->name.GetStringLength(),
+                                   it->name.GetString());
+                bool dup = builder.add(key, to_datum(it->value, limits, reql_version));
+                rcheck_datum(!dup, base_exc_t::LOGIC,
+                             strprintf("Duplicate key %s in JSON.",
+                                       datum_t(key).print().c_str()));
+            }
+            const std::set<std::string> pts = { pseudo::literal_string };
+            return std::move(builder).to_datum(pts);
+        }, MIN_DATUM_RECURSION_STACK_SPACE);
     } break;
     case rapidjson::kArrayType: {
-        datum_array_builder_t builder(limits);
-        builder.reserve(json.Size());
-        for (rapidjson::Value::ConstValueIterator it = json.Begin();
-             it != json.End();
-             ++it) {
-            builder.add(to_datum(*it, limits, reql_version));
-        }
-        return std::move(builder).to_datum();
+        return call_with_enough_stack<datum_t>([&]() {
+            datum_array_builder_t builder(limits);
+            builder.reserve(json.Size());
+            for (rapidjson::Value::ConstValueIterator it = json.Begin();
+                 it != json.End();
+                 ++it) {
+                builder.add(to_datum(*it, limits, reql_version));
+            }
+            return std::move(builder).to_datum();
+        }, MIN_DATUM_RECURSION_STACK_SPACE);
     } break;
     case rapidjson::kStringType: {
-        fail_if_invalid(reql_version, json.GetString(), json.GetStringLength());
+        fail_if_invalid(json.GetString(), json.GetStringLength());
         return datum_t(datum_string_t(json.GetStringLength(), json.GetString()));
     } break;
     case rapidjson::kNumberType: {
@@ -499,22 +508,6 @@ datum_t to_datum(const rapidjson::Value &json, const configured_limits_t &limits
     } break;
     default: unreachable();
     }
-}
-
-
-void check_str_validity(const char *bytes, size_t count) {
-    const char *pos = static_cast<const char *>(memchr(bytes, 0, count));
-    rcheck_datum(
-        pos == NULL,
-        base_exc_t::LOGIC,
-        // We truncate because lots of other places can call `c_str` on the
-        // error message.
-        strprintf("String `%.20s` (truncated) contains NULL byte at offset %zu.",
-                  bytes, pos - bytes));
-}
-
-void datum_t::check_str_validity(const datum_string_t &str) {
-    ::ql::check_str_validity(str.data(), str.size());
 }
 
 const shared_buf_ref_t<char> *datum_t::get_buf_ref() const {
@@ -680,11 +673,50 @@ void datum_t::binary_to_str_key(std::string *str_out) const {
     }
 }
 
-void datum_t::str_to_str_key(std::string *str_out) const {
+void datum_t::str_to_str_key(escape_nulls_t escape_nulls, std::string *str_out) const {
     r_sanity_check(get_type() == R_STR);
     str_out->append("S");
-    size_t to_append = std::min(MAX_KEY_SIZE - str_out->size(), as_str().size());
-    str_out->append(as_str().data(), to_append);
+
+    const datum_string_t &key = as_str();
+    const char *key_data = key.data();
+
+    if (escape_nulls == escape_nulls_t::YES) {
+        // Escape byte values of \x00 and \x01 using a leading \x01 byte to avoid
+        // ambiguity when strings are placed in an array (which uses \x00 bytes
+        // as separators)
+
+        size_t to_append = std::min(MAX_KEY_SIZE - str_out->size(), key.size());
+        for (size_t i = 0; i < to_append; ++i) {
+            switch (key_data[i]) {
+            case '\x00':
+                str_out->append("\x01\x01");
+                break;
+            case '\x01':
+                str_out->append("\x01\x02");
+                break;
+            default:
+                str_out->append(1, key_data[i]);
+            }
+        }
+    } else {
+        // No byte values are escaped, null bytes are invalid.
+
+        const char *pos = static_cast<const char *>(memchr(key_data, 0, key.size()));
+        if (pos != NULL) {
+            printf_buffer_t msg;
+            msg.appendf("String ");
+            debug_print_quoted_string(&msg,
+                                      reinterpret_cast<const uint8_t *>(key_data),
+                                      key.size() > 20 ? 20 : key.size());
+            msg.appendf(" (truncated) contains NULL byte at offset %zu in index key.",
+                        pos - key_data);
+
+            rfail(base_exc_t::LOGIC, "%s", msg.c_str());
+        }
+
+        size_t to_append = std::min(MAX_KEY_SIZE - str_out->size(), as_str().size());
+        str_out->append(as_str().data(), to_append);
+    }
 }
 
 void datum_t::bool_to_str_key(std::string *str_out) const {
@@ -697,27 +729,60 @@ void datum_t::bool_to_str_key(std::string *str_out) const {
     }
 }
 
-void datum_t::extrema_to_str_key(std::string *str_out) const {
+void datum_t::extrema_to_str_key(
+        extrema_encoding_t extrema_encoding,
+        extrema_ok_t extrema_ok,
+        std::string *str_out) const {
+    rcheck_datum(extrema_ok == extrema_ok_t::OK, base_exc_t::LOGIC,
+                 "Cannot use `r.minval` or `r.maxval` in an index key.");
+
     if (get_type() == MINVAL) {
-        // This isn't exactly the minimum key, but tag_skey_version requires
-        // a non-zero length key
-        str_out->append(1, '\x00');
+        switch (extrema_encoding) {
+        case extrema_encoding_t::PRE_v2_3:
+            str_out->append(1, '\x00');
+            break;
+        case extrema_encoding_t::LATEST:
+            // We use a type prefix that's smaller than any "real" type prefix can be.
+            // The real prefixes will be letters.
+            // We also maintain the property that all of our prefixes start with 010 in
+            // their binary representations, which allows us to use these bits for
+            // flagging key formats in the future.
+            str_out->append(1, 'A' - 1);
+            break;
+        default: unreachable();
+        }
     } else {
         r_sanity_check(get_type() == MAXVAL);
-        // This is a hack to preserve the invariant that no keys have their top bit set
-        // which is used by another hack to solve some sindex version compatibilities.
-        // TODO: remove this hack post-2.0
-        std::string max_str = key_to_unescaped_str(store_key_t::max());
-        guarantee(max_str.size() > 0);
-        max_str[0] &= 0x7F;
-        str_out->append(max_str);
+        switch (extrema_encoding) {
+        case extrema_encoding_t::PRE_v2_3: {
+            // This is a hack to preserve the invariant that no keys have their top bit set
+            // which is used by another hack to solve some sindex version compatibilities.
+            // TODO: remove this hack post-2.0
+            std::string max_str = key_to_unescaped_str(store_key_t::max());
+            guarantee(max_str.size() > 0);
+            max_str[0] &= 0x7F;
+            str_out->append(max_str);
+        } break;
+        case extrema_encoding_t::LATEST:
+            // We use a type prefix that's larger than any "real" type prefix can be.
+            // The real prefixes will be letters.
+            // Also see the comment above for the MINVAL case regarding reserved bits in
+            // our prefixes.
+            str_out->append(1, 'Z' + 1);
+            break;
+        default: unreachable();
+        }
     }
 }
 
 // The key for an array is stored as a string of all its elements, each separated by a
 //  null character, with another null character at the end to signify the end of the
 //  array (this is necessary to prevent ambiguity when nested arrays are involved).
-void datum_t::array_to_str_key(std::string *str_out) const {
+void datum_t::array_to_str_key(
+        extrema_encoding_t extrema_encoding,
+        extrema_ok_t extrema_ok,
+        escape_nulls_t escape_nulls,
+        std::string *str_out) const {
     r_sanity_check(get_type() == R_ARRAY);
     str_out->append("A");
 
@@ -728,12 +793,23 @@ void datum_t::array_to_str_key(std::string *str_out) const {
 
         switch (item.get_type()) {
         case MINVAL: // fallthru
-        case MAXVAL: item.extrema_to_str_key(str_out); break;
+        case MAXVAL:
+            // Before version 2.3, `minval` and `maxval` were always allowed inside of
+            // an array.
+            item.extrema_to_str_key(
+                extrema_encoding,
+                extrema_encoding == extrema_encoding_t::PRE_v2_3
+                ? extrema_ok_t::OK
+                : extrema_ok,
+                str_out);
+            break;
         case R_NUM: item.num_to_str_key(str_out); break;
-        case R_STR: item.str_to_str_key(str_out); break;
+        case R_STR: item.str_to_str_key(escape_nulls, str_out); break;
         case R_BINARY: item.binary_to_str_key(str_out); break;
         case R_BOOL: item.bool_to_str_key(str_out); break;
-        case R_ARRAY: item.array_to_str_key(str_out); break;
+        case R_ARRAY:
+            item.array_to_str_key(extrema_encoding, extrema_ok, escape_nulls, str_out);
+            break;
         case R_OBJECT:
             if (item.is_ptype()) {
                 item.pt_to_str_key(str_out);
@@ -821,12 +897,12 @@ void datum_t::rcheck_is_ptype(const std::string s) const {
                         trunc_print().c_str())));
 }
 
-datum_t datum_t::drop_literals(bool *encountered_literal_out) const {
+datum_t datum_t::drop_literals_unchecked_stack(bool *encountered_literal_out) const {
     // drop_literals will never create arrays larger than those in the
     // existing datum; so checking (and thus threading the limits
     // parameter) is unnecessary here.
     const ql::configured_limits_t & limits = ql::configured_limits_t::unlimited;
-    rassert(encountered_literal_out != NULL);
+    rassert(encountered_literal_out != nullptr);
 
     const bool is_literal = is_ptype(pseudo::literal_string);
     if (is_literal) {
@@ -920,6 +996,13 @@ datum_t datum_t::drop_literals(bool *encountered_literal_out) const {
     }
 }
 
+datum_t datum_t::drop_literals(bool *encountered_literal_out) const {
+    return call_with_enough_stack_datum<datum_t>([&] {
+            return this->drop_literals_unchecked_stack(
+                encountered_literal_out);
+        });
+}
+
 void datum_t::rcheck_valid_replace(datum_t old_val,
                                    datum_t orig_key,
                                    const datum_string_t &pkey) const {
@@ -948,12 +1031,25 @@ std::string datum_t::print_primary_internal() const {
     std::string s;
     switch (get_type()) {
     case MINVAL: // fallthru
-    case MAXVAL: extrema_to_str_key(&s); break;
+    case MAXVAL:
+        // Extrema are always ok in a primary key, since primary keys that get stored
+        // into the tree can only be generated from a field stored in a document.
+        // And that's already disallowed elsewhere.
+        // The case where we will still get here is if we're generating a primary key
+        // for a traversal boundary, e.g. from `.between(r.minval, r.maxval)`, and
+        // that's fine. We can also always use the latest reql_version for the same
+        // reason.
+        extrema_to_str_key(extrema_encoding_t::LATEST, extrema_ok_t::OK, &s);
+        break;
     case R_NUM: num_to_str_key(&s); break;
-    case R_STR: str_to_str_key(&s); break;
+    case R_STR: str_to_str_key(escape_nulls_t::NO, &s); break;
     case R_BINARY: binary_to_str_key(&s); break;
     case R_BOOL: bool_to_str_key(&s); break;
-    case R_ARRAY: array_to_str_key(&s); break;
+    case R_ARRAY:
+        // Extrema are always ok here for the same reason as described above.
+        array_to_str_key(
+            extrema_encoding_t::LATEST, extrema_ok_t::OK, escape_nulls_t::NO, &s);
+        break;
     case R_OBJECT:
         if (is_ptype()) {
             pt_to_str_key(&s);
@@ -984,11 +1080,12 @@ std::string datum_t::print_primary() const {
 }
 
 // Returns `true` if it tagged the skey version.
+// Since we've removed support for pre 1.16 indexes, this function now always returns
+// `true`.
 bool tag_skey_version(skey_version_t skey_version, std::string *s) {
     guarantee(s->size() > 0);
     guarantee(!((*s)[0] & 0x80)); // None of our types have the top bit set
     switch (skey_version) {
-    case skey_version_t::pre_1_16: return false;
     case skey_version_t::post_1_16:
         (*s)[0] |= 0x80; // Flip the top bit to indicate 1.16+ skey_version.
         return true;
@@ -1022,7 +1119,9 @@ std::string datum_t::mangle_secondary(
 std::string datum_t::encode_tag_num(uint64_t tag_num) {
     static_assert(sizeof(tag_num) == tag_size,
             "tag_size constant is assumed to be the size of a uint64_t.");
-#ifndef BOOST_LITTLE_ENDIAN
+#if defined(__s390x__)
+    tag_num = __builtin_bswap64(tag_num);
+#elif !defined(BOOST_LITTLE_ENDIAN)
     static_assert(false, "This piece of code will break on big-endian systems.");
 #endif
     return std::string(reinterpret_cast<const char *>(&tag_num), tag_size);
@@ -1032,7 +1131,7 @@ std::string datum_t::compose_secondary(
     skey_version_t skey_version,
     const std::string &secondary_key,
     const store_key_t &primary_key,
-    boost::optional<uint64_t> tag_num) {
+    optional<uint64_t> tag_num) {
 
     std::string primary_key_string = key_to_unescaped_str(primary_key);
     rcheck_toplevel(primary_key_string.length() <= rdb_protocol::MAX_PRIMARY_KEY_SIZE,
@@ -1041,35 +1140,48 @@ std::string datum_t::compose_secondary(
                                        key_to_debug_str(primary_key).c_str()));
 
     std::string tag_string;
-    if (tag_num) {
+    if (tag_num.has_value()) {
         tag_string = encode_tag_num(tag_num.get());
     }
 
     const std::string truncated_secondary_key =
-        secondary_key.substr(0, trunc_size(skey_version, primary_key_string.length()));
+        secondary_key.substr(0, trunc_size(primary_key_string.length()));
 
     return mangle_secondary(
         skey_version, truncated_secondary_key, primary_key_string, tag_string);
 }
 
-std::string datum_t::print_secondary(skey_version_t skey_version,
+std::string datum_t::print_secondary(reql_version_t reql_version,
                                      const store_key_t &primary_key,
-                                     boost::optional<uint64_t> tag_num) const {
+                                     optional<uint64_t> tag_num) const {
     std::string secondary_key_string;
 
     // Reserve max key size to reduce reallocations
     secondary_key_string.reserve(MAX_KEY_SIZE);
 
+    escape_nulls_t escape_nulls = escape_nulls_from_reql_version_for_sindex(reql_version);
+    skey_version_t skey_version = skey_version_from_reql_version(reql_version);
+    extrema_encoding_t extrema_encoding =
+        extrema_encoding_from_reql_version_for_sindex(reql_version);
+
     if (get_type() == R_NUM) {
         num_to_str_key(&secondary_key_string);
     } else if (get_type() == R_STR) {
-        str_to_str_key(&secondary_key_string);
+        str_to_str_key(escape_nulls, &secondary_key_string);
     } else if (get_type() == R_BINARY) {
         binary_to_str_key(&secondary_key_string);
     } else if (get_type() == R_BOOL) {
         bool_to_str_key(&secondary_key_string);
     } else if (get_type() == R_ARRAY) {
-        array_to_str_key(&secondary_key_string);
+        // Before version 2.3, `minval` and `maxval` were always allowed inside of
+        // an array. Now they are no longer allowed in this context.
+        array_to_str_key(
+            extrema_encoding,
+            extrema_encoding == extrema_encoding_t::PRE_v2_3
+            ? extrema_ok_t::OK
+            : extrema_ok_t::NOT_OK,
+            escape_nulls,
+            &secondary_key_string);
     } else if (get_type() == R_OBJECT && is_ptype()) {
         pt_to_str_key(&secondary_key_string);
     } else {
@@ -1080,7 +1192,6 @@ std::string datum_t::print_secondary(skey_version_t skey_version,
     }
 
     switch (skey_version) {
-    case skey_version_t::pre_1_16: break;
     case skey_version_t::post_1_16:
         secondary_key_string.append(1, '\x00');
         break;
@@ -1090,15 +1201,25 @@ std::string datum_t::print_secondary(skey_version_t skey_version,
     return compose_secondary(skey_version, secondary_key_string, primary_key, tag_num);
 }
 
-skey_version_t skey_version_from_reql_version(reql_version_t rv) {
-    switch (rv) {
-    case reql_version_t::v1_14: // v1_15 == v1_14
-        return skey_version_t::pre_1_16;
-    case reql_version_t::v1_16:
-    case reql_version_t::v2_0:
-    case reql_version_t::v2_1_is_latest:
-        return skey_version_t::post_1_16;
-    default: unreachable();
+skey_version_t skey_version_from_reql_version(reql_version_t) {
+    // We only have one value at the moment, since we've dropped support for pre-1.16
+    // indexes.
+    return skey_version_t::post_1_16;
+}
+
+escape_nulls_t escape_nulls_from_reql_version_for_sindex(reql_version_t rv) {
+    if (rv < reql_version_t::v2_2) {
+        return escape_nulls_t::NO;
+    } else {
+        return escape_nulls_t::YES;
+    }
+}
+
+extrema_encoding_t extrema_encoding_from_reql_version_for_sindex(reql_version_t rv) {
+    if (rv < reql_version_t::v2_3) {
+        return extrema_encoding_t::PRE_v2_3;
+    } else {
+        return extrema_encoding_t::LATEST;
     }
 }
 
@@ -1107,30 +1228,32 @@ components_t parse_secondary(const std::string &key) THROWS_NOTHING {
     uint8_t start_of_tag = key[key.size() - 1];
     uint8_t end_of_primary = start_of_tag;
 
-    // TODO: this parses the NULL byte into secondary (and did before as well).
-    // This is currently OK for the same reason the sindex portion of the query
-    // compares correctly lexicographically (since that's about the only useful
-    // thing we can do with the secondary portion).  It's still fragile, though,
-    // so we should consider changing this in the future when we have more time
-    // to test the change.  Tracked in #3630.
-    skey_version_t skey_version = skey_version_t::pre_1_16;
+    // This parses the NULL byte into secondary. We rely on this in
+    // `rget_cb_t::handle_pair()`.
+    skey_version_t skey_version = skey_version_t::post_1_16;
     std::string secondary = key.substr(0, start_of_primary);
     if (secondary[0] & 0x80) {
         skey_version = skey_version_t::post_1_16;
         // To account for extra NULL byte in 1.16+.
         end_of_primary -= 1;
+    } else {
+        // pre 1.16 versions are no longer supported
+        unreachable();
     }
     guarantee(start_of_primary < end_of_primary);
     std::string primary =
         key.substr(start_of_primary, end_of_primary - start_of_primary);
 
     std::string tag_str = key.substr(start_of_tag, key.size() - (start_of_tag + 2));
-    boost::optional<uint64_t> tag_num;
+    optional<uint64_t> tag_num;
     if (tag_str.size() != 0) {
-#ifndef BOOST_LITTLE_ENDIAN
-        static_assert(false, "This piece of code will break on little endian systems.");
+        uint64_t t = *reinterpret_cast<const uint64_t *>(tag_str.data());
+#if defined(__s390x__)
+        t = __builtin_bswap64(t);
+#elif !defined(BOOST_LITTLE_ENDIAN)
+        static_assert(false, "This piece of code will break on big endian systems.");
 #endif
-        tag_num = *reinterpret_cast<const uint64_t *>(tag_str.data());
+        tag_num.set(t);
     }
     return components_t{
         skey_version,
@@ -1161,19 +1284,19 @@ std::string datum_t::extract_truncated_secondary(
     const std::string &secondary_and_primary) {
     components_t components = parse_secondary(secondary_and_primary);
     std::string skey = std::move(components.secondary);
-    size_t mts = max_trunc_size(components.skey_version);
+    size_t mts = max_trunc_size();
     if (skey.length() >= mts) {
         skey.erase(mts);
     }
     return skey;
 }
 
-boost::optional<uint64_t> datum_t::extract_tag(const std::string &secondary) {
+optional<uint64_t> datum_t::extract_tag(const std::string &secondary) {
     components_t components = parse_secondary(secondary);
     return components.tag_num;
 }
 
-boost::optional<uint64_t> datum_t::extract_tag(const store_key_t &key) {
+optional<uint64_t> datum_t::extract_tag(const store_key_t &key) {
     return extract_tag(key_to_unescaped_str(key));
 }
 
@@ -1182,24 +1305,30 @@ boost::optional<uint64_t> datum_t::extract_tag(const store_key_t &key) {
 // but the amount truncated depends on the length of the primary key.  Since we
 // do not know how much was truncated, we have to truncate the maximum amount,
 // then return all matches and filter them out later.
-store_key_t datum_t::truncated_secondary(skey_version_t skey_version, extrema_ok_t extrema_ok) const {
+store_key_t datum_t::truncated_secondary(
+    reql_version_t reql_version,
+    extrema_ok_t extrema_ok) const {
+
+    escape_nulls_t escape_nulls =
+        escape_nulls_from_reql_version_for_sindex(reql_version);
+    extrema_encoding_t extrema_encoding =
+        extrema_encoding_from_reql_version_for_sindex(reql_version);
+
     std::string s;
     if (get_type() == R_NUM) {
         num_to_str_key(&s);
     } else if (get_type() == R_STR) {
-        str_to_str_key(&s);
+        str_to_str_key(escape_nulls, &s);
     } else if (get_type() == R_BINARY) {
         binary_to_str_key(&s);
     } else if (get_type() == R_BOOL) {
         bool_to_str_key(&s);
     } else if (get_type() == R_ARRAY) {
-        array_to_str_key(&s);
+        array_to_str_key(extrema_encoding, extrema_ok, escape_nulls, &s);
     } else if (get_type() == R_OBJECT && is_ptype()) {
         pt_to_str_key(&s);
     } else if (get_type() == MINVAL || get_type() == MAXVAL) {
-        rcheck_datum(extrema_ok == extrema_ok_t::OK, base_exc_t::LOGIC,
-                     "Cannot use `r.minval` or `r.maxval` in a secondary index key.");
-        extrema_to_str_key(&s);
+        extrema_to_str_key(extrema_encoding, extrema_ok, &s);
     } else {
         type_error(strprintf(
             "Secondary keys must be a number, string, bool, pseudotype, "
@@ -1207,8 +1336,14 @@ store_key_t datum_t::truncated_secondary(skey_version_t skey_version, extrema_ok
             print().c_str(), get_type_name().c_str()));
     }
 
+    skey_version_t skey_version = skey_version_from_reql_version(reql_version);
+
+    // Since 1.16, we add a null byte to the end of the secondary index key.
+    guarantee(skey_version == skey_version_t::post_1_16);
+    s.push_back('\0');
+
     // Truncate the key if necessary
-    size_t mts = max_trunc_size(skey_version);
+    size_t mts = max_trunc_size();
     if (s.length() >= mts) {
         s.erase(mts);
     }
@@ -1359,11 +1494,11 @@ datum_t datum_t::get_field(const datum_string_t &key, throw_bool_t throw_bool) c
     while (range_beg < range_end) {
         const size_t center = range_beg + ((range_end - range_beg) / 2);
         auto center_pair = unchecked_get_pair(center);
-        const int cmp = key.compare(center_pair.first);
-        if (cmp == 0) {
+        const int cmp_res = key.compare(center_pair.first);
+        if (cmp_res == 0) {
             // Found it
             return center_pair.second;
-        } else if (cmp < 0) {
+        } else if (cmp_res < 0) {
             range_end = center;
         } else {
             range_beg = center + 1;
@@ -1384,7 +1519,7 @@ datum_t datum_t::get_field(const char *key, throw_bool_t throw_bool) const {
 }
 
 template <class json_writer_t>
-void datum_t::write_json(json_writer_t *writer) const {
+void datum_t::write_json_unchecked_stack(json_writer_t *writer) const {
     switch (get_type()) {
     case MINVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.minval` to JSON.");
     case MAXVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.maxval` to JSON.");
@@ -1427,11 +1562,55 @@ void datum_t::write_json(json_writer_t *writer) const {
     }
 }
 
+template <class json_writer_t>
+void datum_t::write_json(json_writer_t *writer) const {
+    call_with_enough_stack_datum([&] {
+            return this->write_json_unchecked_stack<json_writer_t>(writer);
+        });
+}
+
 // Explicit instantiation
 template void datum_t::write_json(
     rapidjson::Writer<rapidjson::StringBuffer> *writer) const;
 template void datum_t::write_json(
     rapidjson::PrettyWriter<rapidjson::StringBuffer> *writer) const;
+
+rapidjson::Value datum_t::as_json(rapidjson::Value::AllocatorType *allocator) const {
+    switch (get_type()) {
+    case MINVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.minval` to JSON.");
+    case MAXVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.maxval` to JSON.");
+    case R_NULL: return rapidjson::Value(rapidjson::kNullType);
+    case R_BINARY: return pseudo::encode_base64_ptype(as_binary(), allocator);
+    case R_BOOL: return rapidjson::Value(as_bool());
+    case R_NUM: return rapidjson::Value(as_num());
+    case R_STR: return rapidjson::Value(as_str().data(), as_str().size(), *allocator);
+    case R_ARRAY: {
+        rapidjson::Value res(rapidjson::kArrayType);
+        for (size_t i = 0; i < arr_size(); ++i) {
+            const datum_t el = unchecked_get(i);
+            el.call_with_enough_stack_datum([&]() {
+                    res.PushBack(el.as_json(allocator), *allocator);
+                });
+        }
+        return res;
+    } break;
+    case R_OBJECT: {
+        rapidjson::Value res(rapidjson::kObjectType);
+        for (size_t i = 0; i < obj_size(); ++i) {
+            auto pair = get_pair(i);
+            pair.second.call_with_enough_stack_datum([&]() {
+                    res.AddMember(rapidjson::Value(pair.first.data(),
+                                                   pair.first.size(), *allocator),
+                                  pair.second.as_json(allocator), *allocator);
+                });
+        }
+        return res;
+    } break;
+    case UNINITIALIZED: // fallthru
+    default: unreachable();
+    }
+    unreachable();
+}
 
 cJSON *datum_t::as_json_raw() const {
     switch (get_type()) {
@@ -1512,9 +1691,10 @@ void datum_t::replace_field(const datum_string_t &key, datum_t val) {
     it->second = val;
 }
 
-datum_t datum_t::merge(const datum_t &rhs) const {
+datum_t datum_t::default_merge_unchecked_stack(const datum_t &rhs) const {
     if (get_type() != R_OBJECT || rhs.get_type() != R_OBJECT) {
-        return rhs;
+        bool encountered_literal;
+        return rhs.drop_literals(&encountered_literal);
     }
 
     datum_object_builder_t d(*this);
@@ -1549,7 +1729,13 @@ datum_t datum_t::merge(const datum_t &rhs) const {
     return std::move(d).to_datum();
 }
 
-datum_t datum_t::merge(const datum_t &rhs,
+datum_t datum_t::merge(const datum_t &rhs) const {
+    return call_with_enough_stack_datum<datum_t>([&] {
+            return this->default_merge_unchecked_stack(rhs);
+        });
+}
+
+datum_t datum_t::custom_merge_unchecked_stack(const datum_t &rhs,
                        merge_resoluter_t f,
                        const configured_limits_t &limits,
                        std::set<std::string> *conditions_out) const {
@@ -1568,13 +1754,23 @@ datum_t datum_t::merge(const datum_t &rhs,
     return std::move(d).to_datum();
 }
 
+datum_t datum_t::merge(const datum_t &rhs,
+                       merge_resoluter_t f,
+                       const configured_limits_t &limits,
+                       std::set<std::string> *conditions_out) const {
+    return call_with_enough_stack_datum<datum_t>([&] {
+            return this->custom_merge_unchecked_stack(
+                rhs, std::move(f), limits, conditions_out);
+        });
+}
+
 template<class T>
 int derived_cmp(T a, T b) {
     if (a == b) return 0;
     return a < b ? -1 : 1;
 }
 
-int datum_t::cmp(const datum_t &rhs) const {
+int datum_t::cmp_unchecked_stack(const datum_t &rhs) const {
     bool lhs_ptype = is_ptype() && !pseudo_compares_as_obj();
     bool rhs_ptype = rhs.is_ptype() && !rhs.pseudo_compares_as_obj();
     if (lhs_ptype && rhs_ptype) {
@@ -1638,6 +1834,12 @@ int datum_t::cmp(const datum_t &rhs) const {
     }
 }
 
+int datum_t::cmp(const datum_t &rhs) const {
+    return call_with_enough_stack_datum<int>([&] {
+            return this->cmp_unchecked_stack(rhs);
+        });
+}
+
 bool datum_t::operator==(const datum_t &rhs) const { return cmp(rhs) == 0; }
 bool datum_t::operator!=(const datum_t &rhs) const { return cmp(rhs) != 0; }
 bool datum_t::operator<(const datum_t &rhs) const { return cmp(rhs) < 0; }
@@ -1664,11 +1866,11 @@ datum_t to_datum(const Datum *d, const configured_limits_t &limits,
         return datum_t(d->r_num());
     } break;
     case Datum::R_STR: {
-        fail_if_invalid(reql_version, d->r_str());
+        fail_if_invalid(d->r_str());
         return datum_t(datum_string_t(d->r_str()));
     } break;
     case Datum::R_JSON: {
-        fail_if_invalid(reql_version, d->r_str());
+        fail_if_invalid(d->r_str());
         if (reql_version < reql_version_t::v2_1) {
             scoped_cJSON_t cjson(cJSON_Parse(d->r_str().c_str()));
             return to_datum(cjson.get(), limits, reql_version);
@@ -1692,13 +1894,13 @@ datum_t to_datum(const Datum *d, const configured_limits_t &limits,
         for (int i = 0; i < count; ++i) {
             const Datum_AssocPair *ap = &d->r_object(i);
             datum_string_t key(ap->key());
-            datum_t::check_str_validity(key);
-            fail_if_invalid(reql_version, ap->key());
+            fail_if_invalid(ap->key());
             auto res = map.insert(std::make_pair(key,
                                                  to_datum(&ap->val(), limits,
                                                           reql_version)));
             rcheck_datum(res.second, base_exc_t::LOGIC,
-                         strprintf("Duplicate key %s in object.", key.to_std().c_str()));
+                         strprintf("Duplicate key %s in object.",
+                                   datum_t(key).print().c_str()));
         }
         const std::set<std::string> pts = { pseudo::literal_string };
         return datum_t(std::move(map), pts);
@@ -1723,7 +1925,7 @@ datum_t to_datum(cJSON *json, const configured_limits_t &limits,
         return datum_t(json->valuedouble);
     } break;
     case cJSON_String: {
-        fail_if_invalid(reql_version, json->valuestring);
+        fail_if_invalid(json->valuestring);
         return datum_t(json->valuestring);
     } break;
     case cJSON_Array: {
@@ -1738,7 +1940,7 @@ datum_t to_datum(cJSON *json, const configured_limits_t &limits,
         datum_object_builder_t builder;
         json_object_iterator_t it(json);
         while (cJSON *item = it.next()) {
-            fail_if_invalid(reql_version, item->string);
+            fail_if_invalid(item->string);
             bool dup = builder.add(item->string, to_datum(item, limits, reql_version));
             rcheck_datum(!dup, base_exc_t::LOGIC,
                          strprintf("Duplicate key `%s` in JSON.", item->string));
@@ -1750,91 +1952,48 @@ datum_t to_datum(cJSON *json, const configured_limits_t &limits,
     }
 }
 
-size_t datum_t::max_trunc_size(skey_version_t skey_version) {
-    return trunc_size(skey_version, rdb_protocol::MAX_PRIMARY_KEY_SIZE);
+size_t datum_t::max_trunc_size() {
+    return trunc_size(rdb_protocol::MAX_PRIMARY_KEY_SIZE);
 }
 
-size_t datum_t::trunc_size(skey_version_t skey_version, size_t primary_key_size) {
+size_t datum_t::trunc_size(size_t primary_key_size) {
     // We subtract three bytes because of the NULL byte we pad on the end of the
     // primary key and the two 1-byte offsets at the end of the key (which are
     // used to extract the primary key and tag num).
     size_t terminated_primary_key_size = primary_key_size;
-    switch (skey_version) {
-    case skey_version_t::pre_1_16: break;
-    case skey_version_t::post_1_16:
-        terminated_primary_key_size += 1;
-        break;
-    default: unreachable();
-    }
+
+    // Since 1.16, we're adding a null byte to the end of the secondary index key.
+    terminated_primary_key_size += 1;
+
     return MAX_KEY_SIZE - terminated_primary_key_size - tag_size - 2;
 }
 
 bool datum_t::key_is_truncated(const store_key_t &key) {
     std::string key_str = key_to_unescaped_str(key);
-    if (extract_tag(key_str)) {
+    if (extract_tag(key_str).has_value()) {
         return key.size() == MAX_KEY_SIZE;
     } else {
         return key.size() == MAX_KEY_SIZE - tag_size;
     }
 }
 
-void datum_t::write_to_protobuf(Datum *d, use_json_t use_json) const {
-    switch (use_json) {
-    case use_json_t::NO: {
-        switch (get_type()) {
-        case MINVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.minval` to a protobuf.");
-        case MAXVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.maxval` to a protobuf.");
-        case R_NULL: {
-            d->set_type(Datum::R_NULL);
-        } break;
-        case R_BINARY: {
-            pseudo::write_binary_to_protobuf(d, data.r_str);
-        } break;
-        case R_BOOL: {
-            d->set_type(Datum::R_BOOL);
-            d->set_r_bool(data.r_bool);
-        } break;
-        case R_NUM: {
-            d->set_type(Datum::R_NUM);
-            // so we can use `isfinite` in a GCC 4.4.3-compatible way
-            using namespace std;  // NOLINT(build/namespaces)
-            r_sanity_check(isfinite(data.r_num));
-            d->set_r_num(data.r_num);
-        } break;
-        case R_STR: {
-            d->set_type(Datum::R_STR);
-            d->set_r_str(data.r_str.data(), data.r_str.size());
-        } break;
-        case R_ARRAY: {
-            d->set_type(Datum::R_ARRAY);
-            const size_t sz = arr_size();
-            for (size_t i = 0; i < sz; ++i) {
-                get(i).write_to_protobuf(d->add_r_array(), use_json);
-            }
-        } break;
-        case R_OBJECT: {
-            d->set_type(Datum::R_OBJECT);
-            // We use the opposite order so that things print the way we expect.
-            for (size_t i = obj_size(); i > 0; --i) {
-                Datum_AssocPair *ap = d->add_r_object();
-                auto pair = get_pair(i-1);
-                ap->set_key(pair.first.data(), pair.first.size());
-                pair.second.write_to_protobuf(ap->mutable_val(), use_json);
-            }
-        } break;
-        case UNINITIALIZED: // fallthru
-        default: unreachable();
-        }
-    } break;
-    case use_json_t::YES: {
-        d->set_type(Datum::R_JSON);
-        rapidjson::StringBuffer buffer;
-        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-        write_json(&writer);
-        d->set_r_str(buffer.GetString(), buffer.GetSize());
-    } break;
-    default: unreachable();
+template<class result_t, class callable_t>
+result_t datum_t::call_with_enough_stack_datum(callable_t &&fun) const {
+    // Only use `call_with_enough_stack` if we might recurse further for efficiency
+    // reasons.
+    const type_t t = get_type();
+    if (t == type_t::R_ARRAY || t == type_t::R_OBJECT) {
+        return call_with_enough_stack<result_t>(fun, MIN_DATUM_RECURSION_STACK_SPACE);
+    } else {
+        return fun();
     }
+}
+template<class callable_t>
+inline void datum_t::call_with_enough_stack_datum(callable_t &&fun) const {
+    call_with_enough_stack_datum<int>([&]() -> int {
+        fun();
+        return 0;
+    });
 }
 
 // `key` is unused because this is passed to `datum_t::merge`, which takes a
@@ -1892,7 +2051,6 @@ datum_object_builder_t::datum_object_builder_t(const datum_t &copy_from) {
 }
 
 bool datum_object_builder_t::add(const datum_string_t &key, datum_t val) {
-    datum_t::check_str_validity(key);
     r_sanity_check(val.has());
     auto res = map.insert(std::make_pair(key, std::move(val)));
     // Return _false_ if the insertion actually happened.  Because we are being
@@ -1906,7 +2064,6 @@ bool datum_object_builder_t::add(const char *key, datum_t val) {
 
 void datum_object_builder_t::overwrite(const datum_string_t &key,
                                        datum_t val) {
-    datum_t::check_str_validity(key);
     r_sanity_check(val.has());
     map[key] = std::move(val);
 }
@@ -2101,89 +2258,6 @@ datum_t datum_array_builder_t::to_datum() RVALUE_THIS {
     return datum_t(std::move(vector), datum_t::no_array_size_limit_check_t());
 }
 
-datum_range_t::datum_range_t()
-    : left_bound_type(key_range_t::none), right_bound_type(key_range_t::none) { }
-
-datum_range_t::datum_range_t(
-    datum_t _left_bound, key_range_t::bound_t _left_bound_type,
-    datum_t _right_bound, key_range_t::bound_t _right_bound_type)
-    : left_bound(_left_bound), right_bound(_right_bound),
-      left_bound_type(_left_bound_type), right_bound_type(_right_bound_type) {
-    r_sanity_check(left_bound.has() && right_bound.has());
-}
-
-datum_range_t::datum_range_t(datum_t val)
-    : left_bound(val), right_bound(val),
-      left_bound_type(key_range_t::closed), right_bound_type(key_range_t::closed) {
-    r_sanity_check(val.has());
-}
-
-datum_range_t datum_range_t::universe() {
-    return datum_range_t(datum_t::minval(), key_range_t::open,
-                         datum_t::maxval(), key_range_t::open);
-}
-
-bool datum_range_t::contains(datum_t val) const {
-    r_sanity_check(left_bound.has() && right_bound.has());
-
-    int left_cmp = left_bound.cmp(val);
-    int right_cmp = right_bound.cmp(val);
-    return (left_cmp < 0 || (left_cmp == 0 && left_bound_type == key_range_t::closed)) &&
-           (right_cmp > 0 || (right_cmp == 0 && right_bound_type == key_range_t::closed));
-}
-
-bool datum_range_t::is_empty() const {
-    r_sanity_check(left_bound.has() && right_bound.has());
-
-    int cmp = left_bound.cmp(right_bound);
-    return (cmp > 0 ||
-            ((left_bound_type == key_range_t::open ||
-              right_bound_type == key_range_t::open) && cmp == 0));
-}
-
-bool datum_range_t::is_universe() const {
-    r_sanity_check(left_bound.has() && right_bound.has());
-    return left_bound.get_type() == datum_t::type_t::MINVAL &&
-           left_bound_type == key_range_t::open &&
-           right_bound.get_type() == datum_t::type_t::MAXVAL &&
-           right_bound_type == key_range_t::open;
-}
-
-key_range_t datum_range_t::to_primary_keyrange() const {
-    r_sanity_check(left_bound.has() && right_bound.has());
-
-    std::string lb_str = left_bound.print_primary_internal();
-    if (lb_str.size() > MAX_KEY_SIZE) {
-        lb_str.erase(MAX_KEY_SIZE);
-    }
-
-    std::string rb_str = right_bound.print_primary_internal();
-    if (rb_str.size() > MAX_KEY_SIZE) {
-        rb_str.erase(MAX_KEY_SIZE);
-    }
-
-    return key_range_t(left_bound_type, store_key_t(lb_str),
-                       right_bound_type, store_key_t(rb_str));
-}
-
-key_range_t datum_range_t::to_sindex_keyrange(skey_version_t skey_version) const {
-    r_sanity_check(left_bound.has() && right_bound.has());
-    object_buffer_t<store_key_t> lb, rb;
-    return rdb_protocol::sindex_key_range(
-        store_key_t(left_bound.truncated_secondary(skey_version, extrema_ok_t::OK)),
-        store_key_t(right_bound.truncated_secondary(skey_version, extrema_ok_t::OK)));
-}
-
-datum_range_t datum_range_t::with_left_bound(datum_t d, key_range_t::bound_t type) {
-    r_sanity_check(d.has() && right_bound.has());
-    return datum_range_t(d, type, right_bound, right_bound_type);
-}
-
-datum_range_t datum_range_t::with_right_bound(datum_t d, key_range_t::bound_t type) {
-    r_sanity_check(left_bound.has() && d.has());
-    return datum_range_t(left_bound, left_bound_type, d, type);
-}
-
 void debug_print(printf_buffer_t *buf, const datum_t &d) {
     switch (d.data.get_internal_type()) {
     case datum_t::internal_type_t::UNINITIALIZED:
@@ -2237,11 +2311,5 @@ void debug_print(printf_buffer_t *buf, const datum_t &d) {
         break;
     }
 }
-
-ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(key_range_t::bound_t, int8_t,
-                                      key_range_t::open, key_range_t::none);
-RDB_IMPL_SERIALIZABLE_4(
-        datum_range_t, left_bound, right_bound, left_bound_type, right_bound_type);
-INSTANTIATE_SERIALIZABLE_FOR_CLUSTER(datum_range_t);
 
 } // namespace ql

@@ -7,7 +7,7 @@
 #include "concurrency/auto_drainer.hpp"
 #include "concurrency/pmap.hpp"
 #include "containers/scoped.hpp"
-#include "serializer/config.hpp"
+#include "serializer/log/log_serializer.hpp"
 #include "unittest/gtest.hpp"
 #include "unittest/mock_file.hpp"
 #include "unittest/unittest_utils.hpp"
@@ -23,14 +23,14 @@ namespace unittest {
 
 struct mock_ser_t {
     mock_file_opener_t opener;
-    scoped_ptr_t<standard_serializer_t> ser;
+    scoped_ptr_t<log_serializer_t> ser;
     scoped_ptr_t<alt_txn_throttler_t> throttler;
 
     mock_ser_t()
         : opener() {
-        standard_serializer_t::create(&opener,
-                                      standard_serializer_t::static_config_t());
-        ser = make_scoped<standard_serializer_t>(log_serializer_t::dynamic_config_t(),
+        log_serializer_t::create(&opener,
+                                      log_serializer_t::static_config_t());
+        ser = make_scoped<log_serializer_t>(log_serializer_t::dynamic_config_t(),
                                                  &opener,
                                                  &get_global_perfmon_collection());
         // We pass a high minimum unwritten changes limit so that the memory-limited
@@ -50,10 +50,10 @@ class test_txn_t;
 
 class test_cache_t : public page_cache_t {
 public:
-    test_cache_t(serializer_t *serializer,
+    test_cache_t(serializer_t *_serializer,
                  cache_balancer_t *balancer,
                  alt_txn_throttler_t *throttler)
-        : page_cache_t(serializer, balancer, throttler),
+        : page_cache_t(_serializer, balancer, throttler),
           throttler_(throttler) { }
 
     void flush(scoped_ptr_t<test_txn_t> txn) {
@@ -78,17 +78,19 @@ public:
 class current_test_acq_t : public current_page_acq_t {
 public:
     current_test_acq_t(page_txn_t *txn,
-                       block_id_t block_id,
-                       access_t access,
+                       block_id_t _block_id,
+                       access_t _access,
                        page_create_t create = page_create_t::no)
-        : current_page_acq_t(txn, block_id, access, create) { }
+        : current_page_acq_t(txn, _block_id, _access, create) { }
+
     current_test_acq_t(page_txn_t *txn,
                        alt_create_t create)
-        : current_page_acq_t(txn, create) { }
+        : current_page_acq_t(txn, create, block_type_t::normal) { }
+
     current_test_acq_t(page_cache_t *cache,
-                       block_id_t block_id,
+                       block_id_t _block_id,
                        read_access_t read)
-        : current_page_acq_t(cache, block_id, read) { }
+        : current_page_acq_t(cache, _block_id, read) { }
 
     page_t *current_page_for_write() {
         return current_page_acq_t::current_page_for_write(
@@ -104,8 +106,8 @@ public:
 class test_acq_t : public page_acq_t {
 public:
     test_acq_t() : page_acq_t() { }
-    void init(page_t *page, page_cache_t *page_cache) {
-        page_acq_t::init(page, page_cache, page_cache->default_reads_account());
+    void init(page_t *page, page_cache_t *_page_cache) {
+        page_acq_t::init(page, _page_cache, _page_cache->default_reads_account());
     }
 
     void *get_buf_write() {
@@ -117,7 +119,7 @@ public:
 test_txn_t::test_txn_t(test_cache_t *cache)
     : page_txn_t(cache,
                  cache->make_throttler_acq(),
-                 NULL) { }
+                 nullptr) { }
 
 
 TPTEST(PageTest, Control, 4) {
@@ -211,7 +213,7 @@ TPTEST(PageTest, OneWriteAcqWait, 4) {
         page_acq.init(page, &page_cache);
         ASSERT_TRUE(page_acq.buf_ready_signal()->is_pulsed());
         void *buf = page_acq.get_buf_write();
-        ASSERT_TRUE(buf != NULL);
+        ASSERT_TRUE(buf != nullptr);
     }
     page_cache.flush(std::move(txn));
 }
@@ -367,7 +369,7 @@ public:
             condZ5.wait();
             t678cond.pulse();
         }
-        c = NULL;
+        c = nullptr;
 
         {
             dummy_cache_balancer_t balancer(memory_limit);
@@ -379,7 +381,7 @@ public:
             coro_t::spawn_later_ordered(std::bind(&bigger_test_t::run_txn15,
                                                   this, drain.lock()));
         }
-        c = NULL;
+        c = nullptr;
 
         {
             dummy_cache_balancer_t balancer(memory_limit);
@@ -407,7 +409,7 @@ public:
 
             cache.flush(std::move(txn));
         }
-        c = NULL;
+        c = nullptr;
     }
 
 private:
@@ -433,14 +435,14 @@ private:
 
             condCR1.pulse();
             condC.wait();
-            txn1_ptr = NULL;
+            txn1_ptr = nullptr;
         }
         c->flush(std::move(txn1));
     }
 
     void run_txn2(auto_drainer_t::lock_t) {
         condA.wait();
-        ASSERT_TRUE(txn1_ptr != NULL);
+        ASSERT_TRUE(txn1_ptr != nullptr);
         auto txn2 = make_scoped<test_txn_t>(c);
         {
             txn2_ptr = txn2.get();
@@ -500,7 +502,7 @@ private:
 
             condCR2.pulse();
 
-            txn2_ptr = NULL;
+            txn2_ptr = nullptr;
         }
         c->flush(std::move(txn2));
     }
@@ -1081,13 +1083,13 @@ private:
     void make_empty(const scoped_ptr_t<current_test_acq_t> &acq) {
         test_acq_t page_acq;
         page_acq.init(acq->current_page_for_write(), c);
-        const uint32_t n = page_acq.get_buf_size().value();
+        const uint16_t n = page_acq.get_buf_size().value();
         ASSERT_EQ(4088u, n);
         memset(page_acq.get_buf_write(), 0, n);
     }
 
     void check_page_acq(page_acq_t *page_acq, const std::string &expected) {
-        const uint32_t n = page_acq->get_buf_size().value();
+        const uint16_t n = page_acq->get_buf_size().value();
         ASSERT_EQ(4088u, n);
         const char *const p = static_cast<const char *>(page_acq->get_buf_read());
 

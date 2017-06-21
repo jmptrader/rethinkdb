@@ -2,12 +2,16 @@
 #include "arch/io/disk.hpp"
 
 #include <fcntl.h>
+
+#ifndef _WIN32
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/file.h>
-#include <unistd.h>
 #include <libgen.h>
+#endif
+
+#include <unistd.h>
 #include <limits.h>
 
 #include <algorithm>
@@ -108,13 +112,13 @@ public:
                                a));
     }
 
-    void submit_resize(fd_t fd, int64_t new_size,
+    void submit_resize(fd_t fd, int64_t old_size, int64_t new_size,
                       void *account, linux_iocallback_t *cb,
                       bool wrap_in_datasyncs) {
         threadnum_t calling_thread = get_thread_id();
 
         action_t *a = new action_t(calling_thread, cb);
-        a->make_resize(fd, new_size, wrap_in_datasyncs);
+        a->make_resize(fd, old_size, new_size, wrap_in_datasyncs);
         a->account = static_cast<accounting_diskmgr_t::account_t *>(account);
 
         do_on_thread(home_thread(),
@@ -226,9 +230,7 @@ int64_t linux_file_t::get_file_size() {
     return file_size;
 }
 
-/* If you want to use this for downsizing a file, please check the WARNING about
-`set_file_size()` in disk.hpp. */
-void linux_file_t::set_file_size(int64_t size) {
+void linux_file_t::set_file_size(int64_t new_size) {
     assert_thread();
     rassert(diskmgr, "No diskmgr has been constructed (are we running without an event queue?)");
 
@@ -246,24 +248,31 @@ void linux_file_t::set_file_size(int64_t size) {
     };
     rs_callback_t *rs_callback = new rs_callback_t();
     rs_callback->lock = file_size_ops_drainer.lock();
-    diskmgr->submit_resize(fd.get(), size, default_account->get_account(),
+    diskmgr->submit_resize(fd.get(), file_size, new_size,
+                           default_account->get_account(),
                            rs_callback, true);
 
-    file_size = size;
+    file_size = new_size;
 }
 
 // For growing in large chunks at a time.
-int64_t chunk_factor(int64_t size) {
-    // x is at most 6.25% of size.
-    int64_t x = (size / (DEFAULT_EXTENT_SIZE * 16)) * DEFAULT_EXTENT_SIZE;
-    return clamp<int64_t>(x, DEVICE_BLOCK_SIZE * 128, DEFAULT_EXTENT_SIZE * 64);
+int64_t chunk_factor(int64_t size, int64_t extent_size) {
+    // x is at most 12.5% of size. Overall we align to chunks no larger than 64 extents.
+    // This ratio was increased from 6.25% for performance reasons.  Resizing a file
+    // (with ftruncate) doesn't actually use disk space, so it's OK if we pick a value
+    // that's too big.
+
+    // We round off at an extent_size because it would be silly to allocate a partial
+    // extent.
+    int64_t x = (size / (extent_size * 8)) * extent_size;
+    return clamp<int64_t>(x, extent_size, extent_size * 64);
 }
 
-void linux_file_t::set_file_size_at_least(int64_t size) {
+void linux_file_t::set_file_size_at_least(int64_t size, int64_t extent_size) {
     assert_thread();
     if (file_size < size) {
-        /* Grow in large chunks at a time */
-        set_file_size(ceil_aligned(size, chunk_factor(size)));
+        /* Grow in large chunks at a time. */
+        set_file_size(ceil_aligned(size, chunk_factor(size, extent_size)));
     }
 }
 
@@ -289,7 +298,7 @@ void linux_file_t::write_async(int64_t offset, size_t length, const void *buf,
 void linux_file_t::writev_async(int64_t offset, size_t length,
                                 scoped_array_t<iovec> &&bufs,
                                 file_account_t *account, linux_iocallback_t *callback) {
-    rassert(diskmgr != NULL,
+    rassert(diskmgr != nullptr,
             "No diskmgr has been constructed (are we running without an event queue?)");
     verify_aligned_file_access(file_size, offset, length, bufs);
 
@@ -346,11 +355,16 @@ void linux_file_t::writev_async(int64_t offset, size_t length,
 }
 
 bool linux_file_t::coop_lock_and_check() {
+#ifdef _WIN32
+    // TODO WINDOWS
+    return true;
+#else
     if (flock(fd.get(), LOCK_EX | LOCK_NB) != 0) {
         rassert(get_errno() == EWOULDBLOCK);
         return false;
     }
     return true;
+#endif
 }
 
 void *linux_file_t::create_account(int priority, int outstanding_requests_limit) {
@@ -398,6 +412,56 @@ void verify_aligned_file_access(DEBUG_VAR int64_t file_size, DEBUG_VAR int64_t o
 
 file_open_result_t open_file(const char *path, const int mode, io_backender_t *backender,
                              scoped_ptr_t<file_t> *out) {
+    scoped_fd_t fd;
+
+#ifdef _WIN32
+    DWORD create_mode;
+    if (mode & linux_file_t::mode_truncate) {
+        create_mode = CREATE_ALWAYS;
+    } else if (mode & linux_file_t::mode_create) {
+        create_mode = OPEN_ALWAYS;
+    } else {
+        create_mode = OPEN_EXISTING;
+    }
+
+    DWORD access_mode = 0;
+    if (mode & linux_file_t::mode_write) {
+        access_mode |= GENERIC_WRITE;
+    }
+    if (mode & linux_file_t::mode_read) {
+        access_mode |= GENERIC_READ;
+    }
+    if (access_mode == 0) {
+        crash("Bad file access mode.");
+    }
+
+    // TODO WINDOWS: is all this sharing necessary?
+    DWORD share_mode = FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+    DWORD attributes = FILE_ATTRIBUTE_NORMAL;
+
+    // Supporting fully unbuffered file i/o on Windows would require
+    // aligning all reads and writes to the sector size of the volume
+    // (See docs for FILE_FLAG_NO_BUFFERING).
+    //
+    // Instead we only use FILE_FLAG_WRITE_THROUGH
+    DWORD flags =
+        backender->get_direct_io_mode() == file_direct_io_mode_t::direct_desired
+        ? FILE_FLAG_WRITE_THROUGH
+        : 0;
+
+    fd.reset(CreateFile(path, access_mode, share_mode, nullptr, create_mode, flags | attributes, nullptr));
+    if (fd.get() == INVALID_FD) {
+        logERR("CreateFile failed: %s: %s", path, winerr_string(GetLastError()).c_str());
+        return file_open_result_t(file_open_result_t::ERROR, EIO);
+    }
+
+    file_open_result_t open_res = file_open_result_t(flags & FILE_FLAG_WRITE_THROUGH
+                                                     ? file_open_result_t::DIRECT
+                                                     : file_open_result_t::BUFFERED,
+                                                     0);
+
+#else
     // Construct file flags
 
     // Let's have a sanity check for our attempt to check whether O_DIRECT and O_NOATIME are
@@ -420,7 +484,7 @@ file_open_result_t open_file(const char *path, const int mode, io_backender_t *b
 
     // For now, we have a whitelist of kernels that don't support O_LARGEFILE.  Linux is
     // the only known kernel that has (or may need) the O_LARGEFILE flag.
-#ifndef __MACH__
+#ifdef __linux__
     flags |= O_LARGEFILE;
 #endif
 
@@ -441,7 +505,6 @@ file_open_result_t open_file(const char *path, const int mode, io_backender_t *b
 
     // Open the file.
 
-    scoped_fd_t fd;
     {
         int res_open;
         do {
@@ -471,6 +534,9 @@ file_open_result_t open_file(const char *path, const int mode, io_backender_t *b
                                     static_cast<long>(flags | O_DIRECT));  // NOLINT(runtime/int)
 #elif defined(__APPLE__)
         const int fcntl_res = fcntl(fd.get(), F_NOCACHE, 1);
+#elif defined(_WIN32)
+        // TODO WINDOWS
+        const int fcntl_res = -1;
 #else
 #error "Figure out how to do direct I/O and fsync correctly (despite your operating system's lies) on your platform."
 #endif  // __linux__, defined(__APPLE__)
@@ -497,6 +563,8 @@ file_open_result_t open_file(const char *path, const int mode, io_backender_t *b
         disable_readahead_res = fcntl_res == -1
                                 ? get_errno()
                                 : 0;
+#elif defined(_WIN32)
+        // TODO WINDOWS
 #endif
         if (disable_readahead_res != 0) {
             // Non-critical error. Just print a warning and keep going.
@@ -509,6 +577,7 @@ file_open_result_t open_file(const char *path, const int mode, io_backender_t *b
     default:
         unreachable();
     }
+#endif
 
     const int64_t file_size = get_file_size(fd.get());
 
@@ -527,34 +596,9 @@ void crash_due_to_inaccessible_database_file(const char *path, file_open_result_
         "Inaccessible database file: \"%s\": %s"
         "\nSome possible reasons:"
         "\n- the database file couldn't be created or opened for reading and writing"
-#ifdef O_NOATIME
         "\n- the user which was used to start the database is not an owner of the file"
-#endif
         , path, errno_string(open_res.errsv).c_str());
 }
-
-linux_semantic_checking_file_t::linux_semantic_checking_file_t(int fd) : fd_(fd) { }
-
-size_t linux_semantic_checking_file_t::semantic_blocking_read(void *buf,
-                                                              size_t length) {
-    ssize_t res;
-    do {
-        res = ::read(fd_.get(), buf, length);
-    } while (res == -1 && get_errno() == EINTR);
-    guarantee_err(res != -1, "Could not read from the semantic checker file");
-    return res;
-}
-
-size_t linux_semantic_checking_file_t::semantic_blocking_write(const void *buf,
-                                                               size_t length) {
-    ssize_t res;
-    do {
-        res = ::write(fd_.get(), buf, length);
-    } while (res == -1 && get_errno() == EINTR);
-    guarantee_err(res != -1, "Could not write to the semantic checker file");
-    return res;
-}
-
 
 // Upon error, returns the errno value.
 int perform_datasync(fd_t fd) {
@@ -570,19 +614,35 @@ int perform_datasync(fd_t fd) {
 
     return fcntl_res == -1 ? get_errno() : 0;
 
-#else  // __MACH__
+#elif defined(_WIN32)
+
+    BOOL res = FlushFileBuffers(fd);
+    if (!res) {
+        logWRN("FlushFileBuffers failed: %s", winerr_string(GetLastError()).c_str());
+        return EIO;
+    }
+    return 0;
+
+#elif defined(__linux__)
 
     int res = fdatasync(fd);
     return res == -1 ? get_errno() : 0;
 
+#else
+#error "perform_datasync not implemented"
 #endif  // __MACH__
 }
 
 MUST_USE int fsync_parent_directory(const char *path) {
     // Locate the parent directory
+#ifdef _WIN32
+    // TODO WINDOWS
+    (void) path;
+    return 0;
+#else
     char absolute_path[PATH_MAX];
     char *abs_res = realpath(path, absolute_path);
-    guarantee_err(abs_res != NULL, "Failed to determine absolute path for '%s'", path);
+    guarantee_err(abs_res != nullptr, "Failed to determine absolute path for '%s'", path);
     char *parent_path = dirname(absolute_path); // Note: modifies absolute_path
 
     // Get a file descriptor on the parent directory
@@ -603,6 +663,7 @@ MUST_USE int fsync_parent_directory(const char *path) {
     }
 
     return 0;
+#endif
 }
 
 void warn_fsync_parent_directory(const char *path) {

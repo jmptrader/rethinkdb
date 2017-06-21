@@ -1,13 +1,13 @@
 # Copyright 2010-2014 RethinkDB, all rights reserved.
 
 __all__ = [
-    'js', 'http', 'json', 'args', 'error', 'random', 'do', 'row', 'branch', 'union',
-    'map', 'object', 'binary', 'uuid', 'type_of', 'info', 'range', 'literal',
-    'asc', 'desc',
+    'js', 'http', 'json', 'args', 'error', 'random', 'do', 'row', 'branch',
+    'union', 'map', 'object', 'binary', 'uuid', 'type_of', 'info', 'range',
+    'literal', 'asc', 'desc',
     'db', 'db_create', 'db_drop', 'db_list',
-    'table', 'table_create', 'table_drop', 'table_list',
-    'wait', 'reconfigure', 'rebalance',
-    'eq', 'ne', 'le', 'ge', 'lt', 'gt', 'and_', 'or_', 'not_',
+    'table', 'table_create', 'table_drop', 'table_list', 'grant',
+    'group', 'reduce', 'count', 'sum', 'avg', 'min', 'max', 'distinct',
+    'contains', 'eq', 'ne', 'le', 'ge', 'lt', 'gt', 'and_', 'or_', 'not_',
     'add', 'sub', 'mul', 'div', 'mod', 'floor', 'ceil', 'round',
     'time', 'iso8601', 'epoch_time', 'now', 'make_timezone',
     'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
@@ -18,11 +18,7 @@ __all__ = [
     'geojson', 'point', 'line', 'polygon', 'distance', 'intersects', 'circle'
 ]
 
-from . import ast
-from . import ql2_pb2 as p
-
-pTerm = p.Term.TermType
-
+from . import ast, ql2_pb2
 
 #
 # All top level functions defined here are the starting points for RQL queries
@@ -95,16 +91,8 @@ def table_list(*args):
     return ast.TableListTL(*args)
 
 
-def wait(*args, **kwargs):
-    return ast.WaitTL(*args, **kwargs)
-
-
-def reconfigure(*args, **kwargs):
-    return ast.ReconfigureTL(*args, **kwargs)
-
-
-def rebalance(*args, **kwargs):
-    return ast.RebalanceTL(*args, **kwargs)
+def grant(*args, **kwargs):
+    return ast.GrantTL(*args, **kwargs)
 
 
 def branch(*args):
@@ -121,6 +109,42 @@ def map(*args):
         return ast.Map(*(args[:-1] + (ast.func_wrap(args[-1]), )))
     else:
         return ast.Map()
+
+# aggregation
+def group(*args):
+    return ast.Group(*[ast.func_wrap(arg) for arg in args])
+
+
+def reduce(*args):
+    return ast.Reduce(*[ast.func_wrap(arg) for arg in args])
+
+
+def count(*args):
+    return ast.Count(*[ast.func_wrap(arg) for arg in args])
+
+
+def sum(*args):
+    return ast.Sum(*[ast.func_wrap(arg) for arg in args])
+
+
+def avg(*args):
+    return ast.Avg(*[ast.func_wrap(arg) for arg in args])
+
+
+def min(*args):
+    return ast.Min(*[ast.func_wrap(arg) for arg in args])
+
+
+def max(*args):
+    return ast.Max(*[ast.func_wrap(arg) for arg in args])
+
+
+def distinct(*args):
+    return ast.Distinct(*[ast.func_wrap(arg) for arg in args])
+
+
+def contains(*args):
+    return ast.Contains(*[ast.func_wrap(arg) for arg in args])
 
 
 # orderBy orders
@@ -234,33 +258,38 @@ def now(*args):
 
 
 class RqlConstant(ast.RqlQuery):
+    def __init__(self, st, tt):
+        self.st = st
+        self.tt = tt
+        super(RqlConstant, self).__init__()
+    
     def compose(self, args, optargs):
         return 'r.'+self.st
 
 # Time enum values
-monday      = type('', (RqlConstant,), {'tt':pTerm.MONDAY, 'st': 'monday'})()
-tuesday     = type('', (RqlConstant,), {'tt':pTerm.TUESDAY, 'st': 'tuesday'})()
-wednesday   = type('', (RqlConstant,), {'tt':pTerm.WEDNESDAY, 'st': 'wednesday'})()
-thursday    = type('', (RqlConstant,), {'tt':pTerm.THURSDAY, 'st': 'thursday'})()
-friday      = type('', (RqlConstant,), {'tt':pTerm.FRIDAY, 'st': 'friday'})()
-saturday    = type('', (RqlConstant,), {'tt':pTerm.SATURDAY, 'st': 'saturday'})()
-sunday      = type('', (RqlConstant,), {'tt':pTerm.SUNDAY, 'st': 'sunday'})()
+monday      = RqlConstant('monday',    ql2_pb2.Term.TermType.MONDAY)
+tuesday     = RqlConstant('tuesday',   ql2_pb2.Term.TermType.TUESDAY)
+wednesday   = RqlConstant('wednesday', ql2_pb2.Term.TermType.WEDNESDAY)
+thursday    = RqlConstant('thursday',  ql2_pb2.Term.TermType.THURSDAY)
+friday      = RqlConstant('friday',    ql2_pb2.Term.TermType.FRIDAY)
+saturday    = RqlConstant('saturday',  ql2_pb2.Term.TermType.SATURDAY)
+sunday      = RqlConstant('sunday',    ql2_pb2.Term.TermType.SUNDAY)
 
-january     = type('', (RqlConstant,), {'tt':pTerm.JANUARY, 'st': 'january'})()
-february    = type('', (RqlConstant,), {'tt':pTerm.FEBRUARY, 'st': 'february'})()
-march       = type('', (RqlConstant,), {'tt': pTerm.MARCH, 'st': 'march'})()
-april       = type('', (RqlConstant,), {'tt': pTerm.APRIL, 'st': 'april'})()
-may         = type('', (RqlConstant,), {'tt': pTerm.MAY, 'st': 'may'})()
-june        = type('', (RqlConstant,), {'tt': pTerm.JUNE, 'st': 'june'})()
-july        = type('', (RqlConstant,), {'tt': pTerm.JULY, 'st': 'july'})()
-august      = type('', (RqlConstant,), {'tt': pTerm.AUGUST, 'st': 'august'})()
-september   = type('', (RqlConstant,), {'tt': pTerm.SEPTEMBER, 'st': 'september'})()
-october     = type('', (RqlConstant,), {'tt': pTerm.OCTOBER, 'st': 'october'})()
-november    = type('', (RqlConstant,), {'tt': pTerm.NOVEMBER, 'st': 'november'})()
-december    = type('', (RqlConstant,), {'tt': pTerm.DECEMBER, 'st': 'december'})()
+january     = RqlConstant('january',   ql2_pb2.Term.TermType.JANUARY)
+february    = RqlConstant('february',  ql2_pb2.Term.TermType.FEBRUARY)
+march       = RqlConstant('march',     ql2_pb2.Term.TermType.MARCH)
+april       = RqlConstant('april',     ql2_pb2.Term.TermType.APRIL)
+may         = RqlConstant('may',       ql2_pb2.Term.TermType.MAY)
+june        = RqlConstant('june',      ql2_pb2.Term.TermType.JUNE)
+july        = RqlConstant('july',      ql2_pb2.Term.TermType.JULY)
+august      = RqlConstant('august',    ql2_pb2.Term.TermType.AUGUST)
+september   = RqlConstant('september', ql2_pb2.Term.TermType.SEPTEMBER)
+october     = RqlConstant('october',   ql2_pb2.Term.TermType.OCTOBER)
+november    = RqlConstant('november',  ql2_pb2.Term.TermType.NOVEMBER)
+december    = RqlConstant('december',  ql2_pb2.Term.TermType.DECEMBER)
 
-minval      = type('', (RqlConstant,), {'tt': pTerm.MINVAL, 'st': 'minval'})()
-maxval      = type('', (RqlConstant,), {'tt': pTerm.MAXVAL, 'st': 'maxval'})()
+minval      = RqlConstant('minval',    ql2_pb2.Term.TermType.MINVAL)
+maxval      = RqlConstant('maxval',    ql2_pb2.Term.TermType.MAXVAL)
 
 
 def make_timezone(*args):

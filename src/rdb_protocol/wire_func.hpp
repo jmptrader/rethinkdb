@@ -1,24 +1,18 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef RDB_PROTOCOL_WIRE_FUNC_HPP_
 #define RDB_PROTOCOL_WIRE_FUNC_HPP_
 
-#include <functional>
-#include <map>
-#include <string>
 #include <vector>
 
-#include "containers/uuid.hpp"
-#include "rdb_protocol/counted_term.hpp"
-#include "rdb_protocol/pb_utils.hpp"
+#include "containers/counted.hpp"
+#include "containers/optional.hpp"
 #include "rdb_protocol/sym.hpp"
-#include "rdb_protocol/var_types.hpp"
+#include "rdb_protocol/error.hpp"
 #include "rpc/serialize_macros.hpp"
-
-template <class> class counted_t;
-class Datum;
-class Term;
+#include "version.hpp"
 
 namespace ql {
+class raw_term_t;
 class func_t;
 class env_t;
 
@@ -30,10 +24,9 @@ public:
     wire_func_t(const wire_func_t &copyee);
     wire_func_t &operator=(const wire_func_t &assignee);
 
-    // Constructs a wire_func_t with a body and arglist and backtrace, but no scope.  I
-    // hope you remembered to propagate the backtrace to body!
-    wire_func_t(protob_t<const Term> body, std::vector<sym_t> arg_names,
-                backtrace_id_t backtrace);
+    // Constructs a wire_func_t with a body and arglist, but no scope.
+    wire_func_t(const raw_term_t &body,
+                std::vector<sym_t> arg_names);
 
     counted_t<const func_t> compile_wire_func() const;
     backtrace_id_t get_bt() const;
@@ -41,11 +34,16 @@ public:
     template <cluster_version_t W>
     friend void serialize(write_message_t *wm, const wire_func_t &);
     template <cluster_version_t W>
-    friend archive_result_t deserialize(read_stream_t *s, wire_func_t *);
+    friend archive_result_t deserialize(read_stream_t *s, wire_func_t *wf);
+    template <cluster_version_t W>
+    friend archive_result_t deserialize_wire_func(read_stream_t *s, wire_func_t *wf);
+
+    bool is_simple_selector() const;
+    std::string print_source() const;
 
 private:
-    friend class maybe_wire_func_t;  // for has().
     bool has() const { return func.has(); }
+    friend class maybe_wire_func_t;  // for has().
 
     counted_t<const func_t> func;
 };
@@ -78,16 +76,16 @@ class filter_wire_func_t {
 public:
     filter_wire_func_t() { }
     filter_wire_func_t(const ql::wire_func_t &_filter_func,
-                       const boost::optional<ql::wire_func_t> &_default_filter_val)
+                       const optional<ql::wire_func_t> &_default_filter_val)
         : filter_func(_filter_func),
           default_filter_val(_default_filter_val) { }
     filter_wire_func_t(const counted_t<const func_t> &_filter_func,
-                       const boost::optional<ql::wire_func_t> &_default_filter_val)
+                       const optional<ql::wire_func_t> &_default_filter_val)
         : filter_func(_filter_func),
           default_filter_val(_default_filter_val) { }
 
     ql::wire_func_t filter_func;
-    boost::optional<ql::wire_func_t> default_filter_val;
+    optional<ql::wire_func_t> default_filter_val;
 };
 RDB_DECLARE_SERIALIZABLE(filter_wire_func_t);
 

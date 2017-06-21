@@ -2,6 +2,41 @@
 #ifndef ARCH_RUNTIME_CONTEXT_SWITCHING_HPP_
 #define ARCH_RUNTIME_CONTEXT_SWITCHING_HPP_
 
+#ifdef _WIN32
+
+struct fiber_context_ref_t {
+	void* fiber = nullptr;
+	bool is_nil() { return fiber == nullptr; }
+	~fiber_context_ref_t();
+};
+
+void coro_initialize_for_thread();
+
+class fiber_stack_t {
+public:
+    fiber_stack_t(void(*initial_fun)(void), size_t stack_size);
+    ~fiber_stack_t();
+    fiber_context_ref_t context;
+    bool has_stack_info;
+    char *stack_base;
+    char *stack_limit;
+    bool address_in_stack(const void *addr) const;
+    bool address_is_stack_overflow(const void *addr) const;
+    size_t free_space_below(const void *addr) const;
+
+    /* These two are currently not implemented for fiber stacks.
+    I think fibers always have some overflow protection though? */
+    void enable_overflow_protection() {}
+    void disable_overflow_protection() {}
+};
+
+void context_switch(fiber_context_ref_t *current_context_out, fiber_context_ref_t *dest_context_in);
+
+typedef fiber_stack_t coro_stack_t;
+typedef fiber_context_ref_t coro_context_ref_t;
+
+#else
+
 #include <pthread.h>
 
 #include "errors.hpp"
@@ -60,17 +95,23 @@ public:
     bool address_is_stack_overflow(const void *addr) const;
 
     /* Returns the base of the stack */
-    void *get_stack_base() const { return static_cast<char*>(stack) + stack_size; }
+    void *get_stack_base() const { return stack.get() + stack_size; }
 
     /* Returns the end of the stack */
-    void *get_stack_bound() const { return stack; }
+    void *get_stack_bound() const { return stack.get(); }
 
     /* Returns how many more bytes below the given address can be used */
     size_t free_space_below(const void *addr) const;
 
+    /* Enables stack-smashing protection for this stack, if not already enabled */
+    void enable_overflow_protection();
+    /* Disables stack-smashing protection for this stack, if currently enabled */
+    void disable_overflow_protection();
+
 private:
-    void *stack;
+    scoped_page_aligned_ptr_t<char> stack;
     size_t stack_size;
+    bool overflow_protection_enabled;
 #ifdef VALGRIND
     int valgrind_stack_id;
 #endif
@@ -183,6 +224,10 @@ public:
     /* Returns how many more bytes below the given address can be used */
     size_t free_space_below(const void *addr) const;
 
+    /* These two are currently not implemented for threaded stacks. */
+    void enable_overflow_protection() {}
+    void disable_overflow_protection() {}
+
 private:
     static void *internal_run(void *p);
     void get_stack_addr_size(void **stackaddr_out, size_t *stacksize_out) const;
@@ -210,5 +255,5 @@ typedef artificial_stack_t coro_stack_t;
 typedef artificial_stack_context_ref_t coro_context_ref_t;
 #endif
 
-
+#endif /* !defined(_WIN32) */
 #endif /* ARCH_RUNTIME_CONTEXT_SWITCHING_HPP_ */

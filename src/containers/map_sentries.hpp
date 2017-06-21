@@ -66,7 +66,7 @@ public:
         map = m;
         std::pair<typename std::map<key_t, value_t>::iterator, bool> iterator_and_is_new =
             map->insert(std::make_pair(key, value));
-        rassert(iterator_and_is_new.second, "value to be inserted already "
+        guarantee(iterator_and_is_new.second, "value to be inserted already "
             "exists. don't do that.");
         it = iterator_and_is_new.first;
     }
@@ -135,7 +135,7 @@ template<class obj_t>
 class set_insertion_sentry_t {
 public:
     set_insertion_sentry_t() : set(NULL) { }
-    set_insertion_sentry_t(std::set<obj_t> *s, const obj_t &obj) : set(NULL) {
+    set_insertion_sentry_t(std::set<obj_t> *s, const obj_t &obj) : set(nullptr) {
         reset(s, obj);
     }
     ~set_insertion_sentry_t() {
@@ -146,7 +146,7 @@ public:
     void reset() {
         if (set) {
             set->erase(it);
-            set = NULL;
+            set = nullptr;
         }
     }
     void reset(std::set<obj_t> *s, const obj_t &obj) {

@@ -65,6 +65,8 @@ class Driver
                 else
                     @state = 'ok'
                     query.private_run connection, (err, result) =>
+                        if result?.value? and result?.profile?
+                            result = result.value
                         if typeof result?.toArray is 'function'
                             result.toArray (err, result) ->
                                 callback(err, result)
@@ -89,6 +91,7 @@ class Driver
                         if @state is 'ok'
                             is_disconnected.display_fail()
                     else
+                        body = require('./body.coffee')
                         is_disconnected = new body.IsDisconnected
                     @state = 'fail'
                 else
@@ -102,6 +105,11 @@ class Driver
                             (fn = =>
                                 try
                                     query.private_run connection, (err, result) =>
+                                        # All http connections have an
+                                        # implicit profile now, so we
+                                        # have to pull it out
+                                        if result?.value? and result?.profile?
+                                            result = result.value
                                         if typeof result?.toArray is 'function'
                                             result.toArray (err, result) =>
                                                 # This happens if people load the page with the back button
@@ -224,6 +232,20 @@ class Driver
                             server: server
                             server_id: server_id
                     )
+                memory_error =
+                    servers: issue('info')('servers').map(
+                        issue_id('info')('servers'),
+                        (server, server_id) ->
+                            server: server
+                            server_id: server_id
+                    )
+                non_transitive_error =
+                    servers: issue('info')('servers').map(
+                        issue_id('info')('servers'),
+                        (server, server_id) ->
+                            server: server
+                            server_id: server_id
+                    )
                 outdated_index =
                     tables: issue('info')('tables').map(
                         issue_id('info')('tables'),
@@ -244,6 +266,8 @@ class Driver
                 )
                 info: driver.helpers.match(issue('type'),
                     ['log_write_error', log_write_error],
+                    ['memory_error', memory_error],
+                    ['non_transitive_error', non_transitive_error],
                     ['outdated_index', outdated_index],
                     ['table_availability', table_avail],
                     [issue('type'), issue('info')], # default

@@ -1,7 +1,10 @@
 // Copyright 2010-2014 RethinkDB, all rights reserved.
 #include "btree/keys.hpp"
 
+#include <algorithm>
+
 #include "debug.hpp"
+#include "math.hpp"
 #include "utils.hpp"
 
 std::string key_range_t::print() const {
@@ -110,10 +113,11 @@ void key_range_t::init(bound_t lm, const btree_key_t *l, bound_t rm, const btree
     }
 
     rassert(right.unbounded || left <= right.key(),
-            "left_key(%d)=%.*s, right_key(%d)=%.*s",
-            left.size(), left.size(), left.contents(),
-            right.internal_key.size(), right.internal_key.size(),
-            right.internal_key.contents());
+            "left_key(%d)=%s, right_key(%d)=%s",
+            left.size(),
+            key_to_debug_str(left).c_str(),
+            right.internal_key.size(),
+            key_to_debug_str(right.internal_key).c_str());
 }
 
 bool key_range_t::is_superset(const key_range_t &other) const {
@@ -149,7 +153,11 @@ void debug_print(printf_buffer_t *buf, const btree_key_t *k) {
 }
 
 void debug_print(printf_buffer_t *buf, const store_key_t &k) {
-    debug_print(buf, k.btree_key());
+    if (k == store_key_max) {
+        buf->appendf("MAX_KEY");
+    } else {
+        debug_print(buf, k.btree_key());
+    }
 }
 
 void debug_print(printf_buffer_t *buf, const key_range_t::right_bound_t &rb) {

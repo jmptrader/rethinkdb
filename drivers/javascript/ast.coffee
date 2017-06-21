@@ -52,9 +52,12 @@ hasImplicit = (args) ->
 class TermBase
     showRunWarning: true
     constructor: ->
-        self = (ar (field) -> self.bracket(field))
-        self.__proto__ = @.__proto__
-        return self
+        if {}.__proto__ != undefined
+            self = (ar (field) -> self.bracket(field))
+            self.__proto__ = @.__proto__
+            return self
+        else
+            return @
 
     run: (connection, options, callback) ->
         # Valid syntaxes are
@@ -75,7 +78,7 @@ class TermBase
                     options = {}
                 else
                     #options is a function here
-                    return Promise.reject(new err.RqlDriverError("Second argument to `run` cannot be a function if a third argument is provided.")).nodeify options
+                    return Promise.reject(new err.ReqlDriverError("Second argument to `run` cannot be a function if a third argument is provided.")).nodeify options
             # else we suppose that we have run(connection[, options][, callback])
         else if connection?.constructor is Object
             if @showRunWarning is true
@@ -90,10 +93,10 @@ class TermBase
         options = {} if not options?
 
         if callback? and typeof callback isnt 'function'
-            return Promise.reject(new err.RqlDriverError("If provided, the callback must be a function. Please use `run(connection[, options][, callback])"))
+            return Promise.reject(new err.ReqlDriverError("If provided, the callback must be a function. Please use `run(connection[, options][, callback])"))
 
         if net.isConnection(connection) is false
-            return Promise.reject(new err.RqlDriverError("First argument to `run` must be an open connection.")).nodeify callback
+            return Promise.reject(new err.ReqlDriverError("First argument to `run` must be an open connection.")).nodeify callback
 
         # if `noreply` is `true`, the callback will be immediately called without error
         # so we do not have to worry about bluebird complaining about errors not being
@@ -168,6 +171,7 @@ class RDBVal extends TermBase
     hasFields: (args...) -> new HasFields {}, @, args...
     withFields: (args...) -> new WithFields {}, @, args...
     keys: (args...) -> new Keys {}, @, args...
+    values: (args...) -> new Values {}, @, args...
     changes: aropt (opts) -> new Changes opts, @
 
     # pluck and without on zero fields are allowed
@@ -178,11 +182,31 @@ class RDBVal extends TermBase
     between: aropt (left, right, opts) -> new Between opts, @, left, right
     reduce: (args...) -> new Reduce {}, @, args.map(funcWrap)...
     map: varar 1, null, (args..., funcArg) -> new Map {}, @, args..., funcWrap(funcArg)
+    fold: aropt (baseArg, accFuncArg, opts) -> new Fold opts, @, baseArg, funcWrap(accFuncArg)
     filter: aropt (predicate, opts) -> new Filter opts, @, funcWrap(predicate)
     concatMap: (args...) -> new ConcatMap {}, @, args.map(funcWrap)...
     distinct: aropt (opts) -> new Distinct opts, @
     count: (args...) -> new Count {}, @, args.map(funcWrap)...
-    union: (args...) -> new Union {}, @, args...
+    union: (attrsAndOpts...) ->
+        opts = {}
+        attrs = attrsAndOpts
+
+        perhapsOptDict = attrsAndOpts[attrsAndOpts.length - 1]
+        if perhapsOptDict and
+                (Object::toString.call(perhapsOptDict) is '[object Object]') and
+                not (perhapsOptDict instanceof TermBase)
+            opts = perhapsOptDict
+            attrs = attrsAndOpts[0...(attrsAndOpts.length - 1)]
+
+        attrs = (for attr in attrs
+            if attr instanceof Asc or attr instanceof Desc
+                attr
+            else
+                funcWrap(attr)
+        )
+
+        new Union opts, @, attrs...
+
     nth: (args...) -> new Nth {}, @, args...
     bracket: (args...) -> new Bracket {}, @, args...
     toJSON: (args...) -> new ToJsonString {}, @, args...
@@ -323,6 +347,10 @@ class RDBVal extends TermBase
         new Max opts, @, keys.map(funcWrap)...
 
     insert: aropt (doc, opts) -> new Insert opts, @, rethinkdb.expr(doc)
+
+    setWriteHook: (args...) -> new SetWriteHook {}, @, args...
+    getWriteHook: () -> new GetWriteHook {}, @
+
     indexCreate: varar(1, 3, (name, defun_or_opts, opts) ->
         if opts?
             new IndexCreate opts, @, name, funcWrap(defun_or_opts)
@@ -346,6 +374,8 @@ class RDBVal extends TermBase
     rebalance: () -> new Rebalance {}, @
 
     sync: (args...) -> new Sync {}, @, args...
+
+    grant: (args...) -> new Grant {}, @, args...
 
     toISO8601: (args...) -> new ToISO8601 {}, @, args...
     toEpochTime: (args...) -> new ToEpochTime {}, @, args...
@@ -413,7 +443,7 @@ class RDBOp extends RDBVal
                 if arg isnt undefined
                     rethinkdb.expr arg
                 else
-                    throw new err.RqlDriverError "Argument #{i} to #{@st || @mt} may not be `undefined`."
+                    throw new err.ReqlDriverCompileError "Argument #{i} to #{@st || @mt} may not be `undefined`."
         self.optargs = translateOptargs(optargs)
         return self
 
@@ -456,7 +486,7 @@ intsp = (seq) ->
     return res
 
 kved = (optargs) ->
-    ['{', intsp([k, ': ', v] for own k,v of optargs), '}']
+    ['{', intsp([JSON.stringify(k), ': ', v] for own k,v of optargs), '}']
 
 intspallargs = (args, optargs) ->
     argrepr = []
@@ -478,7 +508,7 @@ class MakeArray extends RDBOp
     compose: (args) -> ['[', intsp(args), ']']
 
 class MakeObject extends RDBOp
-    tt: protoTermType.MAKE_OBJECT
+    tt: protoTermType.MAKE_OBJ
     st: '{...}' # This is only used by the `undefined` argument checker
 
     constructor: (obj, nestingDepth=20) ->
@@ -486,7 +516,7 @@ class MakeObject extends RDBOp
         self.optargs = {}
         for own key,val of obj
             if typeof val is 'undefined'
-                throw new err.RqlDriverError "Object field '#{key}' may not be undefined"
+                throw new err.ReqlDriverCompileError "Object field '#{key}' may not be undefined"
             self.optargs[key] = rethinkdb.expr val, nestingDepth-1
         return self
 
@@ -721,6 +751,10 @@ class Keys extends RDBOp
     tt: protoTermType.KEYS
     mt: 'keys'
 
+class Values extends RDBOp
+    tt: protoTermType.VALUES
+    mt: 'values'
+
 class Changes extends RDBOp
     tt: protoTermType.CHANGES
     mt: 'changes'
@@ -756,6 +790,10 @@ class Reduce extends RDBOp
 class Map extends RDBOp
     tt: protoTermType.MAP
     mt: 'map'
+
+class Fold extends RDBOp
+    tt: protoTermType.FOLD
+    mt: 'fold'
 
 class Filter extends RDBOp
     tt: protoTermType.FILTER
@@ -909,6 +947,14 @@ class TableList extends RDBOp
     tt: protoTermType.TABLE_LIST
     mt: 'tableList'
 
+class SetWriteHook extends RDBOp
+    tt: protoTermType.SET_WRITE_HOOK
+    mt: 'setWriteHook'
+
+class GetWriteHook extends RDBOp
+    tt: protoTermType.GET_WRITE_HOOK
+    mt: 'getWriteHook'
+
 class IndexCreate extends RDBOp
     tt: protoTermType.INDEX_CREATE
     mt: 'indexCreate'
@@ -956,6 +1002,10 @@ class Rebalance extends RDBOp
 class Sync extends RDBOp
     tt: protoTermType.SYNC
     mt: 'sync'
+
+class Grant extends RDBOp
+    tt: protoTermType.GRANT
+    mt: 'grant'
 
 class FunCall extends RDBOp
     tt: protoTermType.FUNCALL
@@ -1005,7 +1055,7 @@ class Func extends RDBOp
 
         body = func(args...)
         if body is undefined
-            throw new err.RqlDriverError "Anonymous function returned `undefined`. Did you forget a `return`?"
+            throw new err.ReqlDriverCompileError "Anonymous function returned `undefined`. Did you forget a `return`?"
 
         argsArr = new MakeArray({}, argNums...)
         return super(optargs, argsArr, body)
@@ -1172,13 +1222,13 @@ class UUID extends RDBOp
 # Wrap a native JS value in an ReQL datum
 rethinkdb.expr = varar 1, 2, (val, nestingDepth=20) ->
     if val is undefined
-        throw new err.RqlDriverError "Cannot wrap undefined with r.expr()."
+        throw new err.ReqlDriverCompileError "Cannot wrap undefined with r.expr()."
 
     if nestingDepth <= 0
-        throw new err.RqlDriverError "Nesting depth limit exceeded"
+        throw new err.ReqlDriverCompileError "Nesting depth limit exceeded."
 
     if typeof nestingDepth isnt "number" or isNaN(nestingDepth)
-        throw new err.RqlDriverError "Second argument to `r.expr` must be a number or undefined."
+        throw new err.ReqlDriverCompileError "Second argument to `r.expr` must be a number or undefined."
 
     else if val instanceof TermBase
         val
@@ -1236,15 +1286,23 @@ rethinkdb.tableCreate = aropt (tblName, opts) -> new TableCreate opts, tblName
 rethinkdb.tableDrop = (args...) -> new TableDrop {}, args...
 rethinkdb.tableList = (args...) -> new TableList {}, args...
 
-rethinkdb.wait = aropt (opts) -> new Wait opts
-rethinkdb.reconfigure = (opts) -> new Reconfigure opts
-rethinkdb.rebalance = () -> new Rebalance {}
+rethinkdb.grant = (args...) -> new Grant {}, args...
 
 rethinkdb.do = varar 1, null, (args...) ->
     new FunCall {}, funcWrap(args[-1..][0]), args[...-1]...
 
 rethinkdb.branch = (args...) -> new Branch {}, args...
 rethinkdb.map = varar 1, null, (args..., funcArg) -> new Map {}, args..., funcWrap(funcArg)
+
+rethinkdb.group = (args...) -> new Group {}, args.map(funcWrap)...
+rethinkdb.reduce = (args...) -> new Reduce {}, args.map(funcWrap)...
+rethinkdb.count = (args...) -> new Count {}, args.map(funcWrap)...
+rethinkdb.sum = (args...) -> new Sum {}, args.map(funcWrap)...
+rethinkdb.avg = (args...) -> new Avg {}, args.map(funcWrap)...
+rethinkdb.min = (args...) -> new Min {}, args.map(funcWrap)...
+rethinkdb.max = (args...) -> new Max {}, args.map(funcWrap)...
+rethinkdb.distinct = (args...) -> new Distinct {}, args...
+rethinkdb.contains = (args...) -> new Contains {}, args.map(funcWrap)...
 
 rethinkdb.asc = (args...) -> new Asc {}, args.map(funcWrap)...
 rethinkdb.desc = (args...) -> new Desc {}, args.map(funcWrap)...

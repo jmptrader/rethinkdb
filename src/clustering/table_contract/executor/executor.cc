@@ -20,10 +20,7 @@ public:
             parent->multistore->get_cpu_sharded_store(
                 get_cpu_shard_number(key.region)),
             key.region),
-        perfmon_membership(
-            parent->perfmons,
-            &perfmon_collection,
-            strprintf("%s-%d", key.role_name().c_str(), ++parent->perfmon_counter))
+        perfmon_name(strprintf("%s-%d", key.role_name().c_str(), ++parent->perfmon_counter))
     {
         switch (key.role) {
         case execution_key_t::role_t::primary:
@@ -69,11 +66,15 @@ public:
 
     /* If the execution has called its `enable_gc()` callback, this will contain the
     value that was provided. Otherwise, this will be empty. */
-    boost::optional<branch_id_t> enable_gc_branch;
+    optional<branch_id_t> enable_gc_branch;
 
 private:
-    perfmon_collection_t *get_perfmon_collection() {
-        return &perfmon_collection;
+    perfmon_collection_t *get_parent_perfmon_collection() const {
+        return parent->perfmons;
+    }
+
+    const std::string &get_perfmon_name() const {
+        return perfmon_name;
     }
 
     store_view_t *get_store() {
@@ -92,7 +93,7 @@ private:
     void enable_gc(const branch_id_t &new_enable_gc_branch) {
         parent->assert_thread();
         guarantee(!static_cast<bool>(enable_gc_branch));
-        enable_gc_branch = boost::make_optional(new_enable_gc_branch);
+        enable_gc_branch = make_optional(new_enable_gc_branch);
         parent->gc_branch_history_pumper.notify();
     }
 
@@ -107,9 +108,9 @@ private:
     store_subview_t store_subview;
 
     /* We create a new perfmon category for each execution. This way the executions
-    themselves don't have to think about perfmon key collisions. */
-    perfmon_collection_t perfmon_collection;
-    perfmon_membership_t perfmon_membership;
+    themselves don't have to think about perfmon key collisions. This does not construct
+    the perfmons itself, but provides the name so they may be added later */
+    std::string perfmon_name;
 
     /* The execution itself */
     scoped_ptr_t<execution_t> execution;
@@ -234,19 +235,19 @@ contract_executor_t::execution_key_t contract_executor_t::get_contract_key(
     if (static_cast<bool>(pair.second.primary) &&
             pair.second.primary->server == server_id) {
         key.role = execution_key_t::role_t::primary;
-        key.primary = nil_uuid();
+        key.primary = server_id_t::from_server_uuid(nil_uuid());
         key.branch = nil_uuid();
     } else if (pair.second.replicas.count(server_id) == 1) {
         key.role = execution_key_t::role_t::secondary;
         if (static_cast<bool>(pair.second.primary)) {
             key.primary = pair.second.primary->server;
         } else {
-            key.primary = nil_uuid();
+            key.primary = server_id_t::from_server_uuid(nil_uuid());
         }
         key.branch = branch;
     } else {
         key.role = execution_key_t::role_t::erase;
-        key.primary = nil_uuid();
+        key.primary = server_id_t::from_server_uuid(nil_uuid());
         key.branch = nil_uuid();
     }
     return key;
@@ -352,8 +353,7 @@ void contract_executor_t::gc_branch_history(signal_t *interruptor) {
         }
     });
     if (ok) {
-        execution_context.branch_history_manager->perform_gc(
-            remove_branches, interruptor);
+        execution_context.branch_history_manager->perform_gc(remove_branches);
     }
 }
 

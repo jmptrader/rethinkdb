@@ -1,12 +1,10 @@
 // Copyright 2010-2015 RethinkDB, all rights reserved.
 #include <deque>
 
-#include "errors.hpp"
-#include <boost/optional.hpp>
-
 #include "unittest/gtest.hpp"
-
+#include "containers/optional.hpp"
 #include "containers/range_map.hpp"
+#include "random.hpp"
 #include "utils.hpp"
 
 namespace unittest {
@@ -18,7 +16,7 @@ public:
         validate();
     }
     test_range_map_t(int l, int r, char v) :
-        inner(l, r, static_cast<char>(v)), ref_offset(l), ref(r - l, v)
+        inner(l, r, clone(v)), ref_offset(l), ref(r - l, v)
     {
         validate();
     }
@@ -46,14 +44,14 @@ public:
     template<class callable_t>
     void visit(int l, int r, const callable_t &cb) const {
         int cursor = l;
-        boost::optional<char> prev;
+        optional<char> prev;
         inner.visit(l, r, [&](int l2, int r2, char v) {
             EXPECT_EQ(cursor, l2);
             cursor = r2;
             if (static_cast<bool>(prev)) {
                 EXPECT_NE(*prev, v);
             }
-            prev = boost::make_optional(v);
+            prev = make_optional(v);
             for (int i = l2; i < r2; ++i) {
                 EXPECT_EQ(ref.at(i - ref_offset), v);
             }
@@ -105,7 +103,7 @@ public:
         validate();
     }
     void extend_right(int l, int r, char v) {
-        inner.extend_right(l, r, static_cast<char>(v));
+        inner.extend_right(l, r, clone(v));
         while (l++ < r) {
             ref.push_back(v);
         }
@@ -118,7 +116,7 @@ public:
         validate();
     }
     void extend_left(int l, int r, char v) {
-        inner.extend_left(l, r, static_cast<char>(v));
+        inner.extend_left(l, r, clone(v));
         while (r-- > l) {
             ref.push_front(v);
         }
@@ -135,7 +133,7 @@ public:
         validate();
     }
     void update(int l, int r, char v) {
-        inner.update(l, r, static_cast<char>(v));
+        inner.update(l, r, clone(v));
         for (int i = l; i < r; ++i) {
             ref.at(i - ref_offset) = v;
         }
@@ -144,14 +142,14 @@ public:
     template<class callable_t>
     void visit_mutable(int l, int r, const callable_t &cb) {
         int cursor = l;
-        boost::optional<char> prev;
+        optional<char> prev;
         inner.visit_mutable(l, r, [&](int l2, int r2, char *v) {
             EXPECT_EQ(cursor, l2) << "visit_mutable() ranges should be adjacent";
             cursor = r2;
             if (static_cast<bool>(prev)) {
                 EXPECT_NE(*prev, *v) << "adjacent ranges should be coalesced";
             }
-            prev = boost::make_optional(*v);
+            prev = make_optional(*v);
             for (int i = l2; i < r2; ++i) {
                 EXPECT_EQ(ref.at(i - ref_offset), *v);
             }
@@ -223,7 +221,7 @@ TEST(RangeMap, RangeMap) {
             test = test.map(l, r, [&](char v) -> char { return v + 1; });
         } else if (opcode == 3) {
             test = test.map_multi(l, r, [&](int l2, int r2, char v) {
-                range_map_t<int, char> chunk(l2, r2, static_cast<char>(v));
+                range_map_t<int, char> chunk(l2, r2, clone(v));
                 chunk.update(l2, l2 + 1, v + 1);
                 return chunk;
             });

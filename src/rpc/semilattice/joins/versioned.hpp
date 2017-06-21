@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "arch/runtime/runtime_utils.hpp"
+#include "containers/archive/optional.hpp"
 #include "containers/uuid.hpp"
 #include "rpc/serialize_macros.hpp"
 
@@ -92,7 +93,7 @@ private:
         also important in the case where servers' clocks aren't sane; if one server sets
         `timestamp` to a time far in the future, this logic will still allow the other
         servers to change the stored value. */
-        timestamp = std::max(timestamp+1, time(NULL));
+        timestamp = std::max(timestamp+1, time(nullptr));
         tiebreaker = generate_uuid();
     }
 

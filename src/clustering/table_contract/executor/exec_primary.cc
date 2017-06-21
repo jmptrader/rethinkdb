@@ -25,13 +25,13 @@ primary_execution_t::primary_execution_t(
         contract_id, contract, raft_state.config.config.durability,
         raft_state.config.config.write_ack_config);
     latest_contract_store_thread = latest_contract_home_thread;
-    begin_write_mutex.rethread(store->home_thread());
+    begin_write_mutex_assertion.rethread(store->home_thread());
     coro_t::spawn_sometime(std::bind(&primary_execution_t::run, this, drainer.lock()));
 }
 
 primary_execution_t::~primary_execution_t() {
     drainer.drain();
-    begin_write_mutex.rethread(home_thread());
+    begin_write_mutex_assertion.rethread(home_thread());
 }
 
 void primary_execution_t::update_contract_or_raft_state(
@@ -45,7 +45,7 @@ void primary_execution_t::update_contract_or_raft_state(
         bool branch_matches = true;
         raft_state.current_branches.visit(region,
         [&](const region_t &, const branch_id_t &b) {
-            if (boost::make_optional(b) != our_branch_id) {
+            if (make_optional(b) != our_branch_id) {
                 branch_matches = false;
             }
         });
@@ -55,7 +55,7 @@ void primary_execution_t::update_contract_or_raft_state(
             branch_registered.pulse();
             /* Change `latest_ack` immediately so we don't keep sending the branch
             registration request */
-            latest_ack = boost::make_optional(contract_ack_t(
+            latest_ack = make_optional(contract_ack_t(
                 contract_ack_t::state_t::primary_in_progress));
             params->send_ack(contract_id, *latest_ack);
         }
@@ -86,7 +86,7 @@ void primary_execution_t::update_contract_or_raft_state(
     we sync with the replicas according to the new contract. */
     if (static_cast<bool>(latest_ack) &&
             latest_ack->state == contract_ack_t::state_t::primary_ready) {
-        latest_ack = boost::make_optional(contract_ack_t(
+        latest_ack = make_optional(contract_ack_t(
             contract_ack_t::state_t::primary_in_progress));
     }
 
@@ -120,8 +120,12 @@ void primary_execution_t::run(auto_drainer_t::lock_t keepalive) {
             order_source.check_in("primary_t").with_read_mode(),
             &token, region, &interruptor_store_thread));
 
-        primary_dispatcher_t primary_dispatcher(
-            params->get_perfmon_collection(), initial_version);
+        perfmon_collection_t perfmon_collection;
+        perfmon_membership_t perfmon_membership(params->get_parent_perfmon_collection(),
+                                                &perfmon_collection,
+                                                params->get_perfmon_name());
+
+        primary_dispatcher_t primary_dispatcher(&perfmon_collection, initial_version);
 
         direct_query_server_t direct_query_server(
             context->mailbox_manager,
@@ -133,23 +137,23 @@ void primary_execution_t::run(auto_drainer_t::lock_t keepalive) {
         */
         table_query_bcard_t tq_bcard_direct;
         tq_bcard_direct.region = region;
-        tq_bcard_direct.primary = boost::none;
-        tq_bcard_direct.direct = boost::make_optional(direct_query_server.get_bcard());
+        tq_bcard_direct.primary = r_nullopt;
+        tq_bcard_direct.direct = make_optional(direct_query_server.get_bcard());
         watchable_map_var_t<uuid_u, table_query_bcard_t>::entry_t directory_entry_direct(
             context->local_table_query_bcards, generate_uuid(), tq_bcard_direct);
 
         /* Send a request for the coordinator to register our branch */
         {
-            our_branch_id = boost::make_optional(primary_dispatcher.get_branch_id());
+            our_branch_id = make_optional(primary_dispatcher.get_branch_id());
             contract_ack_t ack(contract_ack_t::state_t::primary_need_branch);
-            ack.branch = boost::make_optional(*our_branch_id);
+            ack.branch.set(*our_branch_id);
             context->branch_history_manager->export_branch_history(
                 primary_dispatcher.get_branch_birth_certificate().origin,
                 &ack.branch_history);
             ack.branch_history.branches.insert(std::make_pair(
                 *our_branch_id,
                 primary_dispatcher.get_branch_birth_certificate()));
-            latest_ack = boost::make_optional(ack);
+            latest_ack = make_optional(ack);
             params->send_ack(latest_contract_home_thread->contract_id, ack);
         }
 
@@ -229,8 +233,8 @@ void primary_execution_t::run(auto_drainer_t::lock_t keepalive) {
         table_query_bcard_t tq_bcard_primary;
         tq_bcard_primary.region = region;
         tq_bcard_primary.primary =
-            boost::make_optional(primary_query_server.get_bcard());
-        tq_bcard_primary.direct = boost::none;
+            make_optional(primary_query_server.get_bcard());
+        tq_bcard_primary.direct = r_nullopt;
         watchable_map_var_t<uuid_u, table_query_bcard_t>::entry_t
             directory_entry_primary(
                 context->local_table_query_bcards, generate_uuid(), tq_bcard_primary);
@@ -299,12 +303,17 @@ bool primary_execution_t::on_write(
     store->assert_thread();
     guarantee(our_dispatcher != nullptr);
 
-    /* `acq` ensures that `update_contract_on_store_thread()` doesn't run between when we
+    /* `acq` asserts that `update_contract_on_store_thread()` doesn't run between when we
     take `contract_snapshot` and when we call `spawn_write()`. This is important because
     `update_contract_on_store_thread()` needs to be able to make sure that all writes
     that see the old contract are spawned before it calls
     `sync_contract_with_replicas()`. */
-    mutex_assertion_t::acq_t begin_write_mutex_acq(&begin_write_mutex);
+    mutex_assertion_t::acq_t begin_write_mutex_acq(&begin_write_mutex_assertion);
+
+    /* The reason that the `begin_write_mutex_acq` holds, is because we don't block in
+    here nor anywhere else where we acquire the mutex assertion. */
+    DEBUG_ONLY(scoped_ptr_t<assert_finite_coro_waiting_t> finite_coro_waiting(
+                   make_scoped<assert_finite_coro_waiting_t>(__FILE__, __LINE__)));
 
     counted_t<contract_info_t> contract_snapshot = latest_contract_store_thread;
 
@@ -338,6 +347,7 @@ bool primary_execution_t::on_write(
     /* Now that we've called `spawn_write()`, our write is in the queue. So it's safe to
     release the `begin_write_mutex`; any calls to `update_contract_on_store_thread()`
     will enter the queue after us. */
+    DEBUG_ONLY(finite_coro_waiting.reset());
     begin_write_mutex_acq.reset();
 
     /* This will allow other calls to `on_write()` to happen. */
@@ -363,8 +373,21 @@ bool primary_execution_t::sync_committed_read(const read_t &read_request,
     write_t request = write_t::make_sync(read_request.get_region(),
                                          read_request.profile);
 
-    mutex_assertion_t::acq_t begin_write_mutex_acq(&begin_write_mutex);
+    /* See the comments in `on_write` for an explanation about why we're acquiring
+    `begin_write_mutex_assertion` here. */
+    mutex_assertion_t::acq_t begin_write_mutex_acq(&begin_write_mutex_assertion);
+    DEBUG_ONLY(scoped_ptr_t<assert_finite_coro_waiting_t> finite_coro_waiting(
+                   make_scoped<assert_finite_coro_waiting_t>(__FILE__, __LINE__)));
     counted_t<contract_info_t> contract_snapshot = latest_contract_store_thread;
+
+    if (static_cast<bool>(contract_snapshot->contract.primary->hand_over)) {
+        *error_out = admin_err_t{
+            "The primary replica is currently changing from one replica to "
+            "another. The read could not be guaranteed as committed. This error "
+            "should go away in a couple of seconds.",
+            query_state_t::FAILED};
+        return false;
+    }
 
     write_callback_t write_callback(&response,
                                     write_durability_t::HARD,
@@ -372,6 +395,7 @@ bool primary_execution_t::sync_committed_read(const read_t &read_request,
                                     &contract_snapshot->contract);
     our_dispatcher->spawn_write(request, order_token, &write_callback);
 
+    DEBUG_ONLY(finite_coro_waiting.reset());
     begin_write_mutex_acq.reset();
 
     wait_interruptible(write_callback.result.get_ready_signal(), interruptor);
@@ -381,7 +405,7 @@ bool primary_execution_t::sync_committed_read(const read_t &read_request,
         *error_out = admin_err_t{
             "The primary replica lost contact with the secondary "
             "replicas. The read could not be guaranteed as committed.",
-            query_state_t::INDETERMINATE};
+            query_state_t::FAILED};
     }
     return res;
 }
@@ -473,11 +497,13 @@ void primary_execution_t::update_contract_on_store_thread(
 
             /* Deliver the latest contract */
             {
-                /* We acquire `begin_write_mutex` to make sure we're not interleaving
-                with a call to `on_write()`. This way, we can be sure that any writes
-                that saw the old contract will enter the primary dispatcher's queue
-                before we call `sync_contract_with_replicas()`. */
-                mutex_assertion_t::acq_t begin_write_mutex_acq(&begin_write_mutex);
+                /* We acquire `begin_write_mutex_assertion` to assert that we're not
+                interleaving with a call to `on_write()`. This way, we can be sure that
+                any writes that saw the old contract will enter the primary dispatcher's
+                queue before we call `sync_contract_with_replicas()`. */
+                mutex_assertion_t::acq_t begin_write_mutex_acq(
+                    &begin_write_mutex_assertion);
+                ASSERT_FINITE_CORO_WAITING;
                 latest_contract_store_thread = contract;
             }
 
@@ -500,7 +526,7 @@ void primary_execution_t::update_contract_on_store_thread(
 
         if (should_ack) {
             /* OK, time to ack the contract */
-            latest_ack = boost::make_optional(
+            latest_ack = make_optional(
                 contract_ack_t(contract_ack_t::state_t::primary_ready));
             params->send_ack(contract->contract_id, *latest_ack);
         }
@@ -516,7 +542,11 @@ void primary_execution_t::sync_contract_with_replicas(
         signal_t *interruptor) {
     store->assert_thread();
     guarantee(our_dispatcher != nullptr);
-    while (!interruptor->is_pulsed()) {
+    while (true) {
+        if (interruptor->is_pulsed()) {
+            throw interrupted_exc_t();
+        }
+
         /* Wait until it looks like the write could go through */
         our_dispatcher->get_ready_dispatchees()->run_until_satisfied(
             [&](const std::set<server_id_t> &servers) {
@@ -556,17 +586,31 @@ void primary_execution_t::sync_contract_with_replicas(
 bool primary_execution_t::is_contract_ackable(
         counted_t<contract_info_t> contract_info, const std::set<server_id_t> &servers) {
     /* If it's a regular contract, we can ack it as soon as we send a sync to a quorum of
-    replicas. If it's a hand-over contract, we can ack it as soon as we send a sync to
-    the new primary. */
-    if (!static_cast<bool>(contract_info->contract.primary->hand_over)) {
-        ack_counter_t ack_counter(contract_info->contract);
-        for (const server_id_t &s : servers) {
-            ack_counter.note_ack(s);
-        }
-        return ack_counter.is_safe();
-    } else {
-        return servers.count(*contract_info->contract.primary->hand_over) == 1;
+    replicas. If it's a hand-over contract, we also need to ensure that we performed a
+    sync with the new primary.
+
+    If we return `true` from this function, we are going to send a `primary_ready` ack
+    to the coordinator. The coordinator relies on this status for two things:
+    * if the we are in a configuration with `temp_voters`, the coordinator is going to
+     use the `primary_ready` ack as a confirmation that a majority of `voters` as well as
+     a majority of `temp_voters` have up-to-date data. Thus it will be able to safely
+     turn `temp_voters` into `voters` (this is critical for correctness).
+    * if we currently have a `hand_over` primary set, the coordinator will wait for the
+     `primary_ready` ack before it shuts down the current primary (us).
+     Our stricter criteria for `hand_over` configurations is to make sure that when the
+     time comes to start up a new primary, the `hand_over` primary is up to date and
+     actually eligible to become a primary.
+     (the additional criteria is not critical for correctness, but makes sure that the
+     transition to the new primary goes through smoothly) */
+    if (static_cast<bool>(contract_info->contract.primary->hand_over) &&
+        servers.count(*contract_info->contract.primary->hand_over) != 1) {
+        return false;
     }
+    ack_counter_t ack_counter(contract_info->contract);
+    for (const server_id_t &s : servers) {
+        ack_counter.note_ack(s);
+    }
+    return ack_counter.is_safe();
 }
 
 bool primary_execution_t::is_majority_available(

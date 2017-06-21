@@ -11,11 +11,11 @@
 #include "perfmon/core.hpp"
 
 // The maximum concurrent IO requests per event queue.. the default value.
-#define DEFAULT_MAX_CONCURRENT_IO_REQUESTS 64
+const int DEFAULT_MAX_CONCURRENT_IO_REQUESTS = 64;
 
 // The maximum user-specifiable value how many concurrent I/O requests may be done per event
 // queue.  (A million is a ridiculously high value, but also safely nowhere near INT_MAX.)
-#define MAXIMUM_MAX_CONCURRENT_IO_REQUESTS MILLION
+const int MAXIMUM_MAX_CONCURRENT_IO_REQUESTS = MILLION;
 
 struct iovec;
 
@@ -70,14 +70,8 @@ public:
     };
 
     int64_t get_file_size();
-    /* WARNING: resize operations do not wait for other operations to finish (with
-    the exception of other resize operations).
-    They do block other operations, but are not blocked themselves.
-    Only issue a `set_file_size()` with a size smaller than the current one if you can
-    make absolutely sure that no ongoing I/O operation wants to access the space
-    that gets truncated anymore. */
     void set_file_size(int64_t size);
-    void set_file_size_at_least(int64_t size);
+    void set_file_size_at_least(int64_t size, int64_t extent_size);
 
     void read_async(int64_t offset, size_t length, void *buf, file_account_t *account, linux_iocallback_t *cb);
     void write_async(int64_t offset, size_t length, const void *buf, file_account_t *account, linux_iocallback_t *cb,
@@ -114,22 +108,11 @@ private:
     DISABLE_COPYING(linux_file_t);
 };
 
-class linux_semantic_checking_file_t : public semantic_checking_file_t {
-public:
-    explicit linux_semantic_checking_file_t(int fd);
-
-    virtual size_t semantic_blocking_read(void *buf, size_t length);
-    virtual size_t semantic_blocking_write(const void *buf, size_t length);
-
-private:
-    scoped_fd_t fd_;
-};
-
 file_open_result_t open_file(const char *path, int mode,
                              io_backender_t *backender,
                              scoped_ptr_t<file_t> *out);
 
-void crash_due_to_inaccessible_database_file(const char *path, file_open_result_t open_res) NORETURN;
+NORETURN void crash_due_to_inaccessible_database_file(const char *path, file_open_result_t open_res);
 
 // Runs some assertios to make sure that we're aligned to DEVICE_BLOCK_SIZE, not overrunning the
 // file size, and that buf is not null.

@@ -5,7 +5,7 @@
 #include "btree/operations.hpp"
 #include "rdb_protocol/blob_wrapper.hpp"
 #include "rdb_protocol/btree.hpp"
-#include "rdb_protocol/lazy_json.hpp"
+#include "rdb_protocol/lazy_btree_val.hpp"
 
 /* After every `MAX_BACKFILL_ITEMS_PER_TXN` backfill items or backfill pre-items, we'll
 release the superblock and start a new transaction. */
@@ -67,18 +67,20 @@ continue_bool_t store_t::send_backfill_pre(
     std::vector<std::pair<key_range_t, repli_timestamp_t> > reference_timestamps;
     start_point.visit(
         start_point.get_domain(),
-            [&](const region_t &region, const state_timestamp_t &tstamp) {
-            guarantee(region.beg == get_region().beg && region.end == get_region().end,
+            [&](const region_t &sp_region, const state_timestamp_t &tstamp) {
+            guarantee(sp_region.beg == get_region().beg && sp_region.end == get_region().end,
                 "start_point should be homogeneous with respect to hash shard because "
                 "this implementation ignores hashes");
             reference_timestamps.push_back(std::make_pair(
-                region.inner, tstamp.to_repli_timestamp()));
+                sp_region.inner, tstamp.to_repli_timestamp()));
         });
     /* Sort the sub-regions so we can apply them from left to right */
     std::sort(reference_timestamps.begin(), reference_timestamps.end(),
         [](const std::pair<key_range_t, repli_timestamp_t> &p1,
                 const std::pair<key_range_t, repli_timestamp_t> &p2) -> bool {
-            guarantee(!p1.first.overlaps(p2.first));
+            /* Note that the OS X std::sort implementation sometimes calls the
+            comparison operator on an element itself. */
+            guarantee(&p1 == &p2 || !p1.first.overlaps(p2.first));
             return p1.first.left < p2.first.left;
         });
     for (const auto &pair : reference_timestamps) {
@@ -230,17 +232,19 @@ continue_bool_t store_t::send_backfill(
     std::vector<std::pair<key_range_t, repli_timestamp_t> > reference_timestamps;
     start_point.visit(
         start_point.get_domain(),
-        [&](const region_t &region, const state_timestamp_t &tstamp) {
-            guarantee(region.beg == get_region().beg && region.end == get_region().end,
+        [&](const region_t &sp_region, const state_timestamp_t &tstamp) {
+            guarantee(sp_region.beg == get_region().beg && sp_region.end == get_region().end,
                 "start_point should be homogeneous with respect to hash shard because "
                 "this implementation ignores hashes");
             reference_timestamps.push_back(std::make_pair(
-                region.inner, tstamp.to_repli_timestamp()));
+                sp_region.inner, tstamp.to_repli_timestamp()));
         });
     std::sort(reference_timestamps.begin(), reference_timestamps.end(),
         [](const std::pair<key_range_t, repli_timestamp_t> &p1,
                 const std::pair<key_range_t, repli_timestamp_t> &p2) -> bool {
-            guarantee(!p1.first.overlaps(p2.first));
+            /* Note that the OS X std::sort implementation sometimes calls the
+            comparison operator on an element itself. */
+            guarantee(&p1 == &p2 || !p1.first.overlaps(p2.first));
             return p1.first.left < p2.first.left;
         });
     for (const auto &pair : reference_timestamps) {

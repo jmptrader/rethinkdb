@@ -6,7 +6,7 @@
 #include "buffer_cache/blob.hpp"
 #include "buffer_cache/cache_balancer.hpp"
 #include "buffer_cache/serialize_onto_blob.hpp"
-#include "serializer/config.hpp"
+#include "serializer/log/log_serializer.hpp"
 
 
 #define DBQ_MAX_REF_SIZE 251
@@ -20,10 +20,10 @@ internal_disk_backed_queue_t::internal_disk_backed_queue_t(io_backender_t *io_ba
       head_block_id(NULL_BLOCK_ID),
       tail_block_id(NULL_BLOCK_ID),
       file_opener(new filepath_file_opener_t(filename, io_backender)) {
-    standard_serializer_t::create(file_opener.get(),
-                                  standard_serializer_t::static_config_t());
+    log_serializer_t::create(file_opener.get(),
+                                  log_serializer_t::static_config_t());
 
-    serializer.init(new standard_serializer_t(standard_serializer_t::dynamic_config_t(),
+    serializer.init(new log_serializer_t(log_serializer_t::dynamic_config_t(),
                                               file_opener.get(),
                                               &perfmon_collection));
 
@@ -32,11 +32,14 @@ internal_disk_backed_queue_t::internal_disk_backed_queue_t(io_backender_t *io_ba
     cache_conn.init(new cache_conn_t(cache.get()));
     // Emulate cache_t::create behavior by zeroing the block with id SUPERBLOCK_ID.
     txn_t txn(cache_conn.get(), write_durability_t::HARD, 1);
-    buf_lock_t block(&txn, SUPERBLOCK_ID, alt_create_t::create);
-    buf_write_t write(&block);
-    const block_size_t block_size = cache->max_block_size();
-    void *buf = write.get_data_write(block_size.value());
-    memset(buf, 0, block_size.value());
+    {
+        buf_lock_t block(&txn, SUPERBLOCK_ID, alt_create_t::create);
+        buf_write_t write(&block);
+        const block_size_t block_size = cache->max_block_size();
+        void *buf = write.get_data_write(block_size.value());
+        memset(buf, 0, block_size.value());
+    }
+    txn.commit();
 }
 
 internal_disk_backed_queue_t::~internal_disk_backed_queue_t() {
@@ -58,6 +61,8 @@ void internal_disk_backed_queue_t::push(const write_message_t &wm) {
     txn_t txn(cache_conn.get(), write_durability_t::SOFT, 2);
 
     push_single(&txn, wm);
+
+    txn.commit();
 }
 
 void internal_disk_backed_queue_t::push(const scoped_array_t<write_message_t> &wms) {
@@ -69,6 +74,8 @@ void internal_disk_backed_queue_t::push(const scoped_array_t<write_message_t> &w
     for (size_t i = 0; i < wms.size(); ++i) {
         push_single(&txn, wms[i]);
     }
+
+    txn.commit();
 }
 
 void internal_disk_backed_queue_t::push_single(txn_t *txn, const write_message_t &wm) {
@@ -90,7 +97,7 @@ void internal_disk_backed_queue_t::push_single(txn_t *txn, const write_message_t
 
     if (static_cast<size_t>((head->data + head->data_size) - reinterpret_cast<char *>(head)) + blob.refsize(cache->max_block_size()) > cache->max_block_size().value()) {
         // The data won't fit in our current head block, so it's time to make a new one.
-        head = NULL;
+        head = nullptr;
         write.reset();
         _head.reset();
         add_block_to_head(txn);
@@ -164,6 +171,8 @@ void internal_disk_backed_queue_t::pop(buffer_group_viewer_t *viewer) {
     if (live_data_offset == data_size) {
         remove_block_from_tail(&txn);
     }
+
+    txn.commit();
 }
 
 bool internal_disk_backed_queue_t::empty() {

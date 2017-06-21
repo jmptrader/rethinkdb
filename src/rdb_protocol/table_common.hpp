@@ -4,6 +4,7 @@
 
 #include <string>
 
+#include "containers/optional.hpp"
 #include "rdb_protocol/protocol.hpp"
 
 /* This file is for logic that is shared between `real_table_t` and `artificial_table_t`.
@@ -53,6 +54,7 @@ an exception, you should pass the error message to `make_row_replacement_error_s
 */
 ql::datum_t make_row_replacement_error_stats(
         ql::datum_t old_row,
+        ql::datum_t new_row,
         return_changes_t return_changes,
         const char *error_message);
 
@@ -60,10 +62,12 @@ ql::datum_t make_row_replacement_error_stats(
 performing an insert operation with the given conflict behavior. It may throw a QL
 exception. */
 ql::datum_t resolve_insert_conflict(
+        ql::env_t *env,
         const std::string &primary_key,
         ql::datum_t old_row,
         ql::datum_t insert_row,
-        conflict_behavior_t conflict_behavior);
+        conflict_behavior_t conflict_behavior,
+        optional<counted_t<const ql::func_t> > conflict_func);
 
 #endif /* RDB_PROTOCOL_TABLE_COMMON_HPP_ */
 

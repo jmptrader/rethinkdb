@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/terms/terms.hpp"
 
 #include <algorithm>
@@ -153,7 +153,7 @@ static int merge_types(int supertype, int subtype) {
 
 class coerce_term_t : public op_term_t {
 public:
-    coerce_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    coerce_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -178,13 +178,21 @@ private:
             return val;
         }
 
+        // * -> BOOL
+        if (end_type == R_BOOL_TYPE) {
+            if (start_type == R_NULL_TYPE) {
+                return new_val(datum_t::boolean(false));
+            }
+            return new_val(datum_t::boolean(true));
+        }
+
         // DATUM -> *
         if (opaque_start_type.is_convertible(val_t::type_t::DATUM)) {
             datum_t d = val->as_datum();
             // DATUM -> DATUM
             if (supertype(end_type) == val_t::type_t::DATUM) {
                 if (start_type == R_BINARY_TYPE && end_type == R_STR_TYPE) {
-                    return new_val(datum_t(d.as_binary()));
+                    return new_val(datum_t::utf8(d.as_binary()));
                 }
                 if (start_type == R_STR_TYPE && end_type == R_BINARY_TYPE) {
                     return new_val(datum_t::binary(d.as_str()));
@@ -253,7 +261,7 @@ private:
             }
 
             // SEQUENCE -> OBJECT
-            if (start_type == R_ARRAY_TYPE && end_type == R_OBJECT_TYPE) {
+            if (end_type == R_OBJECT_TYPE) {
                 datum_object_builder_t obj;
                 batchspec_t batchspec
                     = batchspec_t::user(batch_type_t::TERMINAL, env->env);
@@ -261,13 +269,17 @@ private:
                     profile::sampler_t sampler("Coercing to object.", env->env->trace);
                     datum_t pair;
                     while (pair = ds->next(env->env, batchspec), pair.has()) {
+                        rcheck(pair.arr_size() == 2,
+                               base_exc_t::LOGIC,
+                               strprintf("Expected array of size 2, but got size %zu.",
+                                         pair.arr_size()));
                         datum_string_t key = pair.get(0).as_str();
                         datum_t keyval = pair.get(1);
                         bool b = obj.add(key, keyval);
                         rcheck(!b, base_exc_t::LOGIC,
-                               strprintf("Duplicate key `%s` in coerced object.  "
-                                         "(got `%s` and `%s` as values)",
-                                         key.to_std().c_str(),
+                               strprintf("Duplicate key %s in coerced object.  "
+                                         "(got %s and %s as values)",
+                                         datum_t(key).print().c_str(),
                                          obj.at(key).trunc_print().c_str(),
                                          keyval.trunc_print().c_str()));
                         sampler.new_sample();
@@ -285,7 +297,7 @@ private:
 
 class ungroup_term_t : public op_term_t {
 public:
-    ungroup_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    ungroup_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -334,7 +346,7 @@ datum_t typename_of(const scoped_ptr_t<val_t> &v, scope_env_t *env) {
 
 class typeof_term_t : public op_term_t {
 public:
-    typeof_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    typeof_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -346,7 +358,7 @@ private:
 
 class info_term_t : public op_term_t {
 public:
-    info_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    info_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -361,26 +373,37 @@ private:
 
         switch (type) {
         case DB_TYPE: {
-            b |= info.add("name", datum_t(datum_string_t(v->as_db()->name.str())));
-            b |= info.add("id",
-                          v->as_db()->id.is_nil() ?
-                              datum_t::null() :
-                              datum_t(datum_string_t(uuid_to_str(v->as_db()->id))));
+            counted_t<const db_t> database = v->as_db();
+            r_sanity_check(!database->id.is_nil());
+
+            b |= info.add("name", datum_t(database->name.str()));
+            b |= info.add("id", datum_t(uuid_to_str(database->id)));
         } break;
         case TABLE_TYPE: {
             counted_t<table_t> table = v->as_table();
-            b |= info.add("name", datum_t(datum_string_t(table->name)));
-            b |= info.add("primary_key",
-                          datum_t(datum_string_t(table->get_pkey())));
+            r_sanity_check(!table->get_id().is_nil());
+
+            b |= info.add("name", datum_t(table->name));
+            b |= info.add("primary_key", datum_t(table->get_pkey()));
             b |= info.add("db", val_info(env, new_val(table->db)));
-            b |= info.add("id", table->get_id());
-            name_string_t name = name_string_t::guarantee_valid(table->name.c_str());
+            b |= info.add("id", datum_t(uuid_to_str(table->get_id())));
+            name_string_t table_name =
+                name_string_t::guarantee_valid(table->name.c_str());
             {
-                admin_err_t error;
                 std::vector<int64_t> doc_counts;
-                if (!env->env->reql_cluster_interface()->table_estimate_doc_counts(
-                        table->db, name, env->env, &doc_counts, &error)) {
-                    REQL_RETHROW(error);
+                try {
+                    admin_err_t error;
+                    if (!env->env->reql_cluster_interface()->table_estimate_doc_counts(
+                            env->env->get_user_context(),
+                            table->db,
+                            table_name,
+                            env->env,
+                            &doc_counts,
+                            &error)) {
+                        REQL_RETHROW(error);
+                    }
+                } catch (auth::permission_error_t const &permission_error) {
+                    rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
                 }
                 datum_array_builder_t arr(configured_limits_t::unlimited);
                 for (int64_t i : doc_counts) {
@@ -393,7 +416,7 @@ private:
                 std::map<std::string, std::pair<sindex_config_t, sindex_status_t> >
                     configs_and_statuses;
                 if (!env->env->reql_cluster_interface()->sindex_list(
-                        table->db, name, env->env->interruptor,
+                        table->db, table_name, env->env->interruptor,
                         &error, &configs_and_statuses)) {
                     REQL_RETHROW(error);
                 }
@@ -498,19 +521,19 @@ private:
 };
 
 counted_t<term_t> make_coerce_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<coerce_term_t>(env, term);
 }
 counted_t<term_t> make_ungroup_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<ungroup_term_t>(env, term);
 }
 counted_t<term_t> make_typeof_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<typeof_term_t>(env, term);
 }
 counted_t<term_t> make_info_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<info_term_t>(env, term);
 }
 

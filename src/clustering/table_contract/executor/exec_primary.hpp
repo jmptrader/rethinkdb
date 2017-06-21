@@ -147,7 +147,7 @@ private:
         counted_t<contract_info_t> contract,
         primary_dispatcher_t *dispatcher);
 
-    boost::optional<branch_id_t> our_branch_id;
+    optional<branch_id_t> our_branch_id;
 
     /* `latest_contract_*` stores the latest contract we've received, along with its ack
     callback. The `home_thread` version should only be accessed on `this->home_thread()`,
@@ -155,7 +155,7 @@ private:
     counted_t<contract_info_t> latest_contract_home_thread, latest_contract_store_thread;
 
     /* `latest_ack` stores the latest contract ack we've sent. */
-    boost::optional<contract_ack_t> latest_ack;
+    optional<contract_ack_t> latest_ack;
 
     /* `update_contract_mutex` is used to order calls to
     `update_contract_on_store_thread()`, so that we don't overwrite a newer contract with
@@ -177,9 +177,9 @@ private:
     `our_dispatcher_drainer` will always both be null or both be non-null. */
     auto_drainer_t *our_dispatcher_drainer;
 
-    /* `begin_write_mutex` is used to ensure that we don't ack a contract until all past
-    and ongoing writes are safe under the contract's conditions. */
-    mutex_assertion_t begin_write_mutex;
+    /* `begin_write_mutex_assertion` is used to ensure that we don't ack a contract until
+    all past and ongoing writes are safe under the contract's conditions. */
+    mutex_assertion_t begin_write_mutex_assertion;
 
     /* `drainer` ensures that `run()` and `update_contract_on_store_thread()` are
     stopped before the other member variables are destroyed. */

@@ -21,9 +21,9 @@ cache_conn_t::~cache_conn_t() {
     // that the inner page_txn_t's lifetime would exceed the cache_conn_t's.  So we
     // need to tell the page_txn_t that we don't exist -- we do so by nullating its
     // cache_conn_ pointer (which it's capable of handling).
-    if (newest_txn_ != NULL) {
-        newest_txn_->cache_conn_ = NULL;
-        newest_txn_ = NULL;
+    if (newest_txn_ != nullptr) {
+        newest_txn_->cache_conn_ = nullptr;
+        newest_txn_ = nullptr;
     }
 }
 
@@ -62,17 +62,17 @@ page_read_ahead_cb_t::~page_read_ahead_cb_t() { }
 void page_read_ahead_cb_t::offer_read_ahead_buf(
         block_id_t block_id,
         buf_ptr_t *buf,
-        const counted_t<standard_block_token_t> &token) {
+        const counted_t<block_token_t> &token) {
     assert_thread();
     buf_ptr_t local_buf = std::move(*buf);
 
     block_size_t block_size = block_size_t::undefined();
-    scoped_malloc_t<ser_buffer_t> ptr;
+    scoped_device_block_aligned_ptr_t<ser_buffer_t> ptr;
     local_buf.release(&block_size, &ptr);
 
     // We're going to reconstruct the buf_ptr_t on the other side of this do_on_thread
     // call, so we'd better make sure the block size is right.
-    guarantee(block_size.value() == token->block_size().value());
+    guarantee(block_size == token->block_size());
 
     // Notably, this code relies on do_on_thread to preserve callback order (which it
     // does do).
@@ -80,16 +80,16 @@ void page_read_ahead_cb_t::offer_read_ahead_buf(
                  std::bind(&page_cache_t::add_read_ahead_buf,
                            page_cache_,
                            block_id,
-                           ptr.release(),
+                           copyable_unique_t<scoped_device_block_aligned_ptr_t<ser_buffer_t> >(std::move(ptr)),
                            token));
 }
 
 void page_read_ahead_cb_t::destroy_self() {
     serializer_->unregister_read_ahead_cb(this);
-    serializer_ = NULL;
+    serializer_ = nullptr;
 
     page_cache_t *page_cache = page_cache_;
-    page_cache_ = NULL;
+    page_cache_ = nullptr;
 
     do_on_thread(page_cache->home_thread(),
                  std::bind(&page_cache_t::read_ahead_cb_is_destroyed, page_cache));
@@ -103,53 +103,45 @@ void page_cache_t::consider_evicting_current_page(block_id_t block_id) {
     // We can't do anything until read-ahead is done, because it uses the existence
     // of a current_page_t entry to figure out whether the read-ahead page could be
     // out of date.
-    if (read_ahead_cb_ != NULL) {
+    if (read_ahead_cb_ != nullptr) {
         return;
     }
 
-    current_page_t *current_page = current_pages_.get_sparsely(block_id);
-    if (current_page == NULL) {
+    auto page_it = current_pages_.find(block_id);
+    if (page_it == current_pages_.end()) {
         return;
     }
 
-    if (current_page->should_be_evicted()) {
-        current_pages_[block_id] = NULL;
-        current_page->reset(this);
-        delete current_page;
-    }
-}
-
-void page_cache_t::resize_current_pages_to_id(block_id_t block_id) {
-    if (current_pages_.size() <= block_id) {
-        current_pages_.resize_with_zeros(block_id + 1);
+    current_page_t *page_ptr = page_it->second;
+    if (page_ptr->should_be_evicted()) {
+        current_pages_.erase(block_id);
+        page_ptr->reset(this);
+        delete page_ptr;
     }
 }
 
 void page_cache_t::add_read_ahead_buf(block_id_t block_id,
-                                      ser_buffer_t *ser_buffer,
-                                      const counted_t<standard_block_token_t> &token) {
+                                      scoped_device_block_aligned_ptr_t<ser_buffer_t> ptr,
+                                      const counted_t<block_token_t> &token) {
     assert_thread();
-
-    scoped_malloc_t<ser_buffer_t> ptr(ser_buffer);
 
     // We MUST stop if read_ahead_cb_ is NULL because that means current_page_t's
     // could start being destroyed.
-    if (read_ahead_cb_ == NULL) {
+    if (read_ahead_cb_ == nullptr) {
         return;
     }
 
-    resize_current_pages_to_id(block_id);
     // We MUST stop if current_pages_[block_id] already exists, because that means
     // the read-ahead page might be out of date.
-    if (current_pages_[block_id] != NULL) {
+    if (current_pages_.count(block_id) > 0) {
         return;
     }
 
-    // We know the read-ahead page is not out of date if current_pages_[block_id] is
-    // NULL and if read_ahead_cb_ still exists -- that means a current_page_t for the
-    // block id was never created, and thus the page could not have been modified
-    // (not to mention that we've already got the page in memory, so there is no
-    // useful work to be done).
+    // We know the read-ahead page is not out of date if current_pages_[block_id]
+    // doesn't exist and if read_ahead_cb_ still exists -- that means a current_page_t
+    // for the block id was never created, and thus the page could not have been
+    // modified (not to mention that we've already got the page in memory, so there is
+    // no useful work to be done).
 
     buf_ptr_t buf(token->block_size(), std::move(ptr));
     current_pages_[block_id] = new current_page_t(block_id, std::move(buf), token, this);
@@ -158,11 +150,11 @@ void page_cache_t::add_read_ahead_buf(block_id_t block_id,
 void page_cache_t::have_read_ahead_cb_destroyed() {
     assert_thread();
 
-    if (read_ahead_cb_ != NULL) {
-        // By setting read_ahead_cb_ to NULL, we make sure we only tell the read
+    if (read_ahead_cb_ != nullptr) {
+        // By setting read_ahead_cb_ to nullptr, we make sure we only tell the read
         // ahead cb to destroy itself exactly once.
         page_read_ahead_cb_t *cb = read_ahead_cb_;
-        read_ahead_cb_ = NULL;
+        read_ahead_cb_ = nullptr;
 
         do_on_thread(cb->home_thread(),
                      std::bind(&page_read_ahead_cb_t::destroy_self, cb));
@@ -173,14 +165,25 @@ void page_cache_t::have_read_ahead_cb_destroyed() {
 
 void page_cache_t::consider_evicting_all_current_pages(page_cache_t *page_cache,
                                                        auto_drainer_t::lock_t lock) {
-    for (block_id_t id = 0; id < page_cache->current_pages_.size(); ++id) {
+    // Atomically grab a list of block IDs that currently exist in current_pages.
+    std::vector<block_id_t> current_block_ids;
+    current_block_ids.reserve(page_cache->current_pages_.size());
+    for (const auto &current_page : page_cache->current_pages_) {
+        current_block_ids.push_back(current_page.first);
+    }
+
+    // In a separate step, evict current pages that should be evicted.
+    // We do this separately so that we can yield between evictions.
+    size_t i = 0;
+    for (block_id_t id : current_block_ids) {
         page_cache->consider_evicting_current_page(id);
-        if (id % 16 == 15) {
+        if (i % 16 == 15) {
             coro_t::yield();
             if (lock.get_drain_signal()->is_pulsed()) {
                 return;
             }
         }
+        ++i;
     }
 }
 
@@ -198,14 +201,14 @@ public:
     new_mutex_t mutex;
 };
 
-page_cache_t::page_cache_t(serializer_t *serializer,
+page_cache_t::page_cache_t(serializer_t *_serializer,
                            cache_balancer_t *balancer,
                            alt_txn_throttler_t *throttler)
-    : max_block_size_(serializer->max_block_size()),
-      serializer_(serializer),
-      free_list_(serializer),
+    : max_block_size_(_serializer->max_block_size()),
+      serializer_(_serializer),
+      free_list_(_serializer),
       evicter_(),
-      read_ahead_cb_(NULL),
+      read_ahead_cb_(nullptr),
       drainer_(make_scoped<auto_drainer_t>()) {
 
     const bool start_read_ahead = balancer->read_ahead_ok_at_start();
@@ -213,16 +216,16 @@ page_cache_t::page_cache_t(serializer_t *serializer,
         read_ahead_cb_existence_ = drainer_->lock();
     }
 
-    page_read_ahead_cb_t *local_read_ahead_cb = NULL;
+    page_read_ahead_cb_t *local_read_ahead_cb = nullptr;
     {
-        on_thread_t thread_switcher(serializer->home_thread());
+        on_thread_t thread_switcher(_serializer->home_thread());
         if (start_read_ahead) {
-            local_read_ahead_cb = new page_read_ahead_cb_t(serializer, this);
+            local_read_ahead_cb = new page_read_ahead_cb_t(_serializer, this);
         }
-        default_reads_account_.init(serializer->home_thread(),
-                                    serializer->make_io_account(CACHE_READS_IO_PRIORITY));
+        default_reads_account_.init(_serializer->home_thread(),
+                                    _serializer->make_io_account(CACHE_READS_IO_PRIORITY));
         index_write_sink_.init(new page_cache_index_write_sink_t);
-        recencies_ = serializer->get_all_recencies();
+        recencies_ = _serializer->get_all_recencies();
     }
 
     ASSERT_NO_CORO_WAITING;
@@ -242,15 +245,14 @@ page_cache_t::~page_cache_t() {
     have_read_ahead_cb_destroyed();
 
     drainer_.reset();
-    for (size_t i = 0, e = current_pages_.size(); i < e; ++i) {
+    size_t i = 0;
+    for (auto &&page : current_pages_) {
         if (i % 256 == 255) {
             coro_t::yield();
         }
-        current_page_t *current_page = current_pages_[i];
-        if (current_page != NULL) {
-            current_page->reset(this);
-            delete current_page;
-        }
+        ++i;
+        page.second->reset(this);
+        delete page.second;
     }
 
     {
@@ -331,27 +333,50 @@ void page_cache_t::flush_and_destroy_txn(
     sub->reset(&page_txn->flush_complete_cond_);
 }
 
+void page_cache_t::end_read_txn(scoped_ptr_t<page_txn_t> txn) {
+    guarantee(txn->touched_pages_.empty());
+    guarantee(txn->live_acqs_ == 0,
+        "A current_page_acq_t lifespan exceeds its page_txn_t's.");
+    guarantee(!txn->began_waiting_for_flush_);
+
+    txn->flush_complete_cond_.pulse();
+}
+
 
 current_page_t *page_cache_t::page_for_block_id(block_id_t block_id) {
     assert_thread();
 
-    resize_current_pages_to_id(block_id);
-    if (current_pages_[block_id] == NULL) {
-        rassert(recency_for_block_id(block_id) != repli_timestamp_t::invalid,
+    auto page_it = current_pages_.find(block_id);
+    if (page_it == current_pages_.end()) {
+        rassert(is_aux_block_id(block_id) ||
+                recency_for_block_id(block_id) != repli_timestamp_t::invalid,
                 "Expected block %" PR_BLOCK_ID " not to be deleted "
                 "(should you have used alt_create_t::create?).",
                 block_id);
-        current_pages_[block_id] = new current_page_t(block_id);
+        page_it = current_pages_.insert(
+            page_it, std::make_pair(block_id, new current_page_t(block_id)));
     } else {
-        rassert(!current_pages_[block_id]->is_deleted());
+        rassert(!page_it->second->is_deleted());
     }
 
-    return current_pages_[block_id];
+    return page_it->second;
 }
 
-current_page_t *page_cache_t::page_for_new_block_id(block_id_t *block_id_out) {
+current_page_t *page_cache_t::page_for_new_block_id(
+        block_type_t block_type,
+        block_id_t *block_id_out) {
     assert_thread();
-    block_id_t block_id = free_list_.acquire_block_id();
+    block_id_t block_id;
+    switch (block_type) {
+    case block_type_t::aux:
+        block_id = free_list_.acquire_aux_block_id();
+        break;
+    case block_type_t::normal:
+        block_id = free_list_.acquire_block_id();
+        break;
+    default:
+        unreachable();
+    }
     current_page_t *ret = internal_page_for_new_chosen(block_id);
     *block_id_out = block_id;
     return ret;
@@ -366,9 +391,12 @@ current_page_t *page_cache_t::page_for_new_chosen_block_id(block_id_t block_id) 
 
 current_page_t *page_cache_t::internal_page_for_new_chosen(block_id_t block_id) {
     assert_thread();
-    rassert(recency_for_block_id(block_id) == repli_timestamp_t::invalid,
+    rassert(is_aux_block_id(block_id) ||
+            recency_for_block_id(block_id) == repli_timestamp_t::invalid,
             "expected chosen block %" PR_BLOCK_ID "to be deleted", block_id);
-    set_recency_for_block_id(block_id, repli_timestamp_t::distant_past);
+    if (!is_aux_block_id(block_id)) {
+        set_recency_for_block_id(block_id, repli_timestamp_t::distant_past);
+    }
 
     buf_ptr_t buf = buf_ptr_t::alloc_uninitialized(max_block_size_);
 
@@ -378,11 +406,11 @@ current_page_t *page_cache_t::internal_page_for_new_chosen(block_id_t block_id) 
     memset(buf.cache_data(), 0xCD, max_block_size_.value());
 #endif
 
-    resize_current_pages_to_id(block_id);
-    guarantee(current_pages_[block_id] == NULL);
-    current_pages_[block_id] = new current_page_t(block_id, std::move(buf), this);
+    auto inserted_page = current_pages_.insert(std::make_pair(
+        block_id, new current_page_t(block_id, std::move(buf), this)));
+    guarantee(inserted_page.second);
 
-    return current_pages_[block_id];
+    return inserted_page.first->second;
 }
 
 cache_account_t page_cache_t::create_cache_account(int priority) {
@@ -412,48 +440,49 @@ cache_account_t page_cache_t::create_cache_account(int priority) {
 
 
 current_page_acq_t::current_page_acq_t()
-    : page_cache_(NULL), the_txn_(NULL) { }
+    : page_cache_(nullptr), the_txn_(nullptr) { }
 
 current_page_acq_t::current_page_acq_t(page_txn_t *txn,
-                                       block_id_t block_id,
-                                       access_t access,
+                                       block_id_t _block_id,
+                                       access_t _access,
                                        page_create_t create)
-    : page_cache_(NULL), the_txn_(NULL) {
-    init(txn, block_id, access, create);
+    : page_cache_(nullptr), the_txn_(nullptr) {
+    init(txn, _block_id, _access, create);
 }
 
 current_page_acq_t::current_page_acq_t(page_txn_t *txn,
-                                       alt_create_t create)
-    : page_cache_(NULL), the_txn_(NULL) {
-    init(txn, create);
+                                       alt_create_t create,
+                                       block_type_t block_type)
+    : page_cache_(nullptr), the_txn_(nullptr) {
+    init(txn, create, block_type);
 }
 
-current_page_acq_t::current_page_acq_t(page_cache_t *page_cache,
-                                       block_id_t block_id,
+current_page_acq_t::current_page_acq_t(page_cache_t *_page_cache,
+                                       block_id_t _block_id,
                                        read_access_t read)
-    : page_cache_(NULL), the_txn_(NULL) {
-    init(page_cache, block_id, read);
+    : page_cache_(nullptr), the_txn_(nullptr) {
+    init(_page_cache, _block_id, read);
 }
 
 void current_page_acq_t::init(page_txn_t *txn,
-                              block_id_t block_id,
-                              access_t access,
+                              block_id_t _block_id,
+                              access_t _access,
                               page_create_t create) {
-    if (access == access_t::read) {
+    if (_access == access_t::read) {
         rassert(create == page_create_t::no);
-        init(txn->page_cache(), block_id, read_access_t::read);
+        init(txn->page_cache(), _block_id, read_access_t::read);
     } else {
         txn->page_cache()->assert_thread();
-        guarantee(page_cache_ == NULL);
+        guarantee(page_cache_ == nullptr);
         page_cache_ = txn->page_cache();
-        the_txn_ = (access == access_t::write ? txn : NULL);
-        access_ = access;
+        the_txn_ = (_access == access_t::write ? txn : nullptr);
+        access_ = _access;
         declared_snapshotted_ = false;
-        block_id_ = block_id;
+        block_id_ = _block_id;
         if (create == page_create_t::yes) {
-            current_page_ = page_cache_->page_for_new_chosen_block_id(block_id);
+            current_page_ = page_cache_->page_for_new_chosen_block_id(_block_id);
         } else {
-            current_page_ = page_cache_->page_for_block_id(block_id);
+            current_page_ = page_cache_->page_for_block_id(_block_id);
         }
         dirtied_page_ = false;
         touched_page_ = false;
@@ -464,14 +493,15 @@ void current_page_acq_t::init(page_txn_t *txn,
 }
 
 void current_page_acq_t::init(page_txn_t *txn,
-                              alt_create_t) {
+                              alt_create_t,
+                              block_type_t block_type) {
     txn->page_cache()->assert_thread();
-    guarantee(page_cache_ == NULL);
+    guarantee(page_cache_ == nullptr);
     page_cache_ = txn->page_cache();
     the_txn_ = txn;
     access_ = access_t::write;
     declared_snapshotted_ = false;
-    current_page_ = page_cache_->page_for_new_block_id(&block_id_);
+    current_page_ = page_cache_->page_for_new_block_id(block_type, &block_id_);
     dirtied_page_ = false;
     touched_page_ = false;
 
@@ -479,17 +509,17 @@ void current_page_acq_t::init(page_txn_t *txn,
     current_page_->add_acquirer(this);
 }
 
-void current_page_acq_t::init(page_cache_t *page_cache,
-                              block_id_t block_id,
+void current_page_acq_t::init(page_cache_t *_page_cache,
+                              block_id_t _block_id,
                               read_access_t) {
-    page_cache->assert_thread();
-    guarantee(page_cache_ == NULL);
-    page_cache_ = page_cache;
-    the_txn_ = NULL;
+    _page_cache->assert_thread();
+    guarantee(page_cache_ == nullptr);
+    page_cache_ = _page_cache;
+    the_txn_ = nullptr;
     access_ = access_t::read;
     declared_snapshotted_ = false;
-    block_id_ = block_id;
-    current_page_ = page_cache_->page_for_block_id(block_id);
+    block_id_ = _block_id;
+    current_page_ = page_cache_->page_for_block_id(_block_id);
     dirtied_page_ = false;
     touched_page_ = false;
 
@@ -498,13 +528,13 @@ void current_page_acq_t::init(page_cache_t *page_cache,
 
 current_page_acq_t::~current_page_acq_t() {
     assert_thread();
-    // Checking page_cache_ != NULL makes sure this isn't a default-constructed acq.
-    if (page_cache_ != NULL) {
-        if (the_txn_ != NULL) {
+    // Checking page_cache_ != nullptr makes sure this isn't a default-constructed acq.
+    if (page_cache_ != nullptr) {
+        if (the_txn_ != nullptr) {
             guarantee(access_ == access_t::write);
             the_txn_->remove_acquirer(this);
         }
-        rassert(current_page_ != NULL);
+        rassert(current_page_ != nullptr);
         if (in_a_list()) {
             // Note that the current_page_acq can be in the current_page_ acquirer
             // list and still be snapshotted. However it will not have a
@@ -523,7 +553,7 @@ current_page_acq_t::~current_page_acq_t() {
 void current_page_acq_t::declare_readonly() {
     assert_thread();
     access_ = access_t::read;
-    if (current_page_ != NULL) {
+    if (current_page_ != nullptr) {
         current_page_->pulse_pulsables(this);
     }
 }
@@ -535,7 +565,7 @@ void current_page_acq_t::declare_snapshotted() {
     // Allow redeclaration of snapshottedness.
     if (!declared_snapshotted_) {
         declared_snapshotted_ = true;
-        rassert(current_page_ != NULL);
+        rassert(current_page_ != nullptr);
         current_page_->add_keepalive();
         current_page_->pulse_pulsables(this);
     }
@@ -554,18 +584,18 @@ signal_t *current_page_acq_t::write_acq_signal() {
 
 page_t *current_page_acq_t::current_page_for_read(cache_account_t *account) {
     assert_thread();
-    rassert(snapshotted_page_.has() || current_page_ != NULL);
+    rassert(snapshotted_page_.has() || current_page_ != nullptr);
     read_cond_.wait();
     if (snapshotted_page_.has()) {
         return snapshotted_page_.get_page_for_read();
     }
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     return current_page_->the_page_for_read(help(), account);
 }
 
 repli_timestamp_t current_page_acq_t::recency() {
     assert_thread();
-    rassert(snapshotted_page_.has() || current_page_ != NULL);
+    rassert(snapshotted_page_.has() || current_page_ != nullptr);
 
     // We wait for write_cond_ when getting the recency (if we're a write acquirer)
     // so that we can't see the recency change before/after the write_cond_ is
@@ -579,36 +609,36 @@ repli_timestamp_t current_page_acq_t::recency() {
     if (snapshotted_page_.has()) {
         return snapshotted_page_.timestamp();
     }
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     return page_cache_->recency_for_block_id(block_id_);
 }
 
 page_t *current_page_acq_t::current_page_for_write(cache_account_t *account) {
     assert_thread();
     rassert(access_ == access_t::write);
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     write_cond_.wait();
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     dirtied_page_ = true;
     return current_page_->the_page_for_write(help(), account);
 }
 
-void current_page_acq_t::set_recency(repli_timestamp_t recency) {
+void current_page_acq_t::set_recency(repli_timestamp_t _recency) {
     assert_thread();
     rassert(access_ == access_t::write);
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     write_cond_.wait();
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     touched_page_ = true;
-    page_cache_->set_recency_for_block_id(block_id_, recency);
+    page_cache_->set_recency_for_block_id(block_id_, _recency);
 }
 
 void current_page_acq_t::mark_deleted() {
     assert_thread();
     rassert(access_ == access_t::write);
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     write_cond_.wait();
-    rassert(current_page_ != NULL);
+    rassert(current_page_ != nullptr);
     dirtied_page_ = true;
     current_page_->mark_deleted(help());
     // No need to call consider_evicting_current_page here -- there's a
@@ -654,7 +684,7 @@ void current_page_acq_t::pulse_write_available() {
 current_page_t::current_page_t(block_id_t block_id)
     : block_id_(block_id),
       is_deleted_(false),
-      last_write_acquirer_(NULL),
+      last_write_acquirer_(nullptr),
       num_keepalives_(0) {
     // Increment the block version so that we can distinguish between unassigned
     // current_page_acq_t::block_version_ values (which are 0) and assigned ones.
@@ -668,7 +698,7 @@ current_page_t::current_page_t(block_id_t block_id,
     : block_id_(block_id),
       page_(new page_t(block_id, std::move(buf), page_cache)),
       is_deleted_(false),
-      last_write_acquirer_(NULL),
+      last_write_acquirer_(nullptr),
       num_keepalives_(0) {
     // Increment the block version so that we can distinguish between unassigned
     // current_page_acq_t::block_version_ values (which are 0) and assigned ones.
@@ -678,12 +708,12 @@ current_page_t::current_page_t(block_id_t block_id,
 
 current_page_t::current_page_t(block_id_t block_id,
                                buf_ptr_t buf,
-                               const counted_t<standard_block_token_t> &token,
+                               const counted_t<block_token_t> &token,
                                page_cache_t *page_cache)
     : block_id_(block_id),
       page_(new page_t(block_id, std::move(buf), token, page_cache)),
       is_deleted_(false),
-      last_write_acquirer_(NULL),
+      last_write_acquirer_(nullptr),
       num_keepalives_(0) {
     // Increment the block version so that we can distinguish between unassigned
     // current_page_acq_t::block_version_ values (which are 0) and assigned ones.
@@ -704,9 +734,11 @@ void current_page_t::reset(page_cache_t *page_cache) {
     rassert(acquirers_.empty());
     rassert(num_keepalives_ == 0);
 
-    // KSI: Does last_write_acquirer_ even need to be NULL?  Could we not just inform
-    // it of our impending destruction?
-    rassert(last_write_acquirer_ == NULL);
+    // last_write_acquirer_ has to be null (flush started) so that we don't lose track
+    // of our in-memory block_version_t values that track which version of a buf is
+    // newer in compute_changes.  current_page_t::should_be_evicted tests for this being
+    // null.
+    rassert(last_write_acquirer_ == nullptr);
 
     page_.reset_page_ptr(page_cache);
     // No need to call consider_evicting_current_page here -- we're already getting
@@ -730,7 +762,7 @@ bool current_page_t::should_be_evicted() const {
     }
 
     // A reason: We still have a connection to last_write_acquirer_.  (Important.)
-    if (last_write_acquirer_ != NULL) {
+    if (last_write_acquirer_ != nullptr) {
         return false;
     }
 
@@ -762,7 +794,7 @@ void current_page_t::add_acquirer(current_page_acq_t *acq) {
         block_version_t v = prev_version.subsequent();
         acq->block_version_ = v;
 
-        rassert(acq->the_txn_ != NULL);
+        rassert(acq->the_txn_ != nullptr);
         page_txn_t *const acq_txn = acq->the_txn_;
 
         last_write_acquirer_version_ = v;
@@ -770,7 +802,7 @@ void current_page_t::add_acquirer(current_page_acq_t *acq) {
         if (last_write_acquirer_ != acq_txn) {
             rassert(!acq_txn->pages_write_acquired_last_.has_element(this));
 
-            if (last_write_acquirer_ != NULL) {
+            if (last_write_acquirer_ != nullptr) {
                 page_txn_t *prec = last_write_acquirer_;
 
                 rassert(prec->pages_write_acquired_last_.has_element(this));
@@ -783,7 +815,7 @@ void current_page_t::add_acquirer(current_page_acq_t *acq) {
             last_write_acquirer_ = acq_txn;
         }
     } else {
-        rassert(acq->the_txn_ == NULL);
+        rassert(acq->the_txn_ == nullptr);
         acq->block_version_ = prev_version;
     }
 
@@ -794,7 +826,7 @@ void current_page_t::add_acquirer(current_page_acq_t *acq) {
 void current_page_t::remove_acquirer(current_page_acq_t *acq) {
     current_page_acq_t *next = acquirers_.next(acq);
     acquirers_.remove(acq);
-    if (next != NULL) {
+    if (next != nullptr) {
         pulse_pulsables(next);
     }
 }
@@ -805,7 +837,7 @@ void current_page_t::pulse_pulsables(current_page_acq_t *const acq) {
     // First, avoid pulsing when there's nothing to pulse.
     {
         current_page_acq_t *prev = acquirers_.prev(acq);
-        if (!(prev == NULL || (prev->access_ == access_t::read
+        if (!(prev == nullptr || (prev->access_ == access_t::read
                                && prev->read_cond_.is_pulsed()))) {
             return;
         }
@@ -818,7 +850,7 @@ void current_page_t::pulse_pulsables(current_page_acq_t *const acq) {
         // so the next node might not have been pulsed for read.  Also we might as
         // well stop if we're at the end of the chain (and have been pulsed).
         current_page_acq_t *next = acquirers_.next(acq);
-        if (next == NULL || next->read_cond_.is_pulsed()) {
+        if (next == nullptr || next->read_cond_.is_pulsed()) {
             return;
         }
     }
@@ -827,7 +859,7 @@ void current_page_t::pulse_pulsables(current_page_acq_t *const acq) {
 
     // It's time to pulse the pulsables.
     current_page_acq_t *cur = acq;
-    while (cur != NULL) {
+    while (cur != nullptr) {
         // We know that the previous node has read access and has been pulsed as
         // readable, so we pulse the current node as readable.
         cur->pulse_read_available();
@@ -853,7 +885,7 @@ void current_page_t::pulse_pulsables(current_page_acq_t *const acq) {
             // Even the first write-acquirer gets read access (there's no need for an
             // "intent" mode).  But subsequent acquirers need to wait, because the
             // write-acquirer might modify the value.
-            if (acquirers_.prev(cur) == NULL) {
+            if (acquirers_.prev(cur) == nullptr) {
                 // (It gets exclusive write access if there's no preceding reader.)
                 guarantee(!is_deleted_);
                 cur->pulse_write_available();
@@ -912,7 +944,7 @@ page_t *current_page_t::the_page_for_read(current_page_help_t help,
 
 page_t *current_page_t::the_page_for_read_or_deleted(current_page_help_t help) {
     if (is_deleted_) {
-        return NULL;
+        return nullptr;
     } else {
         convert_from_serializer_if_necessary(help);
         return page_.get_page_for_read();
@@ -926,22 +958,22 @@ page_t *current_page_t::the_page_for_write(current_page_help_t help,
     return page_.get_page_for_write(help.page_cache, account);
 }
 
-page_txn_t::page_txn_t(page_cache_t *page_cache,
+page_txn_t::page_txn_t(page_cache_t *_page_cache,
                        throttler_acq_t throttler_acq,
                        cache_conn_t *cache_conn)
-    : page_cache_(page_cache),
+    : page_cache_(_page_cache),
       cache_conn_(cache_conn),
       throttler_acq_(std::move(throttler_acq)),
       live_acqs_(0),
       began_waiting_for_flush_(false),
       spawned_flush_(false),
       mark_(marked_not) {
-    if (cache_conn != NULL) {
+    if (cache_conn != nullptr) {
         page_txn_t *old_newest_txn = cache_conn->newest_txn_;
         cache_conn->newest_txn_ = this;
-        if (old_newest_txn != NULL) {
+        if (old_newest_txn != nullptr) {
             rassert(old_newest_txn->cache_conn_ == cache_conn);
-            old_newest_txn->cache_conn_ = NULL;
+            old_newest_txn->cache_conn_ = nullptr;
             connect_preceder(old_newest_txn);
         }
     }
@@ -1003,7 +1035,7 @@ void page_txn_t::remove_acquirer(current_page_acq_t *acq) {
     // It's not snapshotted because you can't snapshot write acqs.  (We
     // rely on this fact solely because we need to grab the block_id_t
     // and current_page_acq_t currently doesn't know it.)
-    rassert(acq->current_page_ != NULL);
+    rassert(acq->current_page_ != nullptr);
 
     const block_version_t block_version = acq->block_version();
 
@@ -1045,14 +1077,14 @@ void page_txn_t::announce_waiting_for_flush() {
     page_cache_->im_waiting_for_flush(this);
 }
 
-std::map<block_id_t, page_cache_t::block_change_t>
+std::unordered_map<block_id_t, page_cache_t::block_change_t>
 page_cache_t::compute_changes(const std::vector<page_txn_t *> &txns) {
     // We combine changes, using the block_version_t value to see which change
     // happened later.  This even works if a single transaction acquired the same
     // block twice.
 
     // The map of changes we make.
-    std::map<block_id_t, block_change_t> changes;
+    std::unordered_map<block_id_t, block_change_t> changes;
 
     for (auto it = txns.begin(); it != txns.end(); ++it) {
         page_txn_t *txn = *it;
@@ -1060,7 +1092,7 @@ page_cache_t::compute_changes(const std::vector<page_txn_t *> &txns) {
             const dirtied_page_t &d = txn->snapshotted_dirtied_pages_[i];
 
             block_change_t change(d.block_version, true,
-                                  d.ptr.has() ? d.ptr.get_page_for_read() : NULL,
+                                  d.ptr.has() ? d.ptr.get_page_for_read() : nullptr,
                                   d.ptr.has() ? d.ptr.timestamp() : repli_timestamp_t::invalid);
 
             auto res = changes.insert(std::make_pair(d.block_id, change));
@@ -1088,7 +1120,7 @@ page_cache_t::compute_changes(const std::vector<page_txn_t *> &txns) {
             auto res = changes.insert(std::make_pair(t.block_id,
                                                      block_change_t(t.block_version,
                                                                     false,
-                                                                    NULL,
+                                                                    nullptr,
                                                                     t.tstamp)));
             if (!res.second) {
                 // The insertion failed.  We need to combine the versions.
@@ -1142,24 +1174,25 @@ void page_cache_t::remove_txn_set_from_graph(page_cache_t *page_cache,
             rassert(current_page->last_write_acquirer_ == txn);
 
 #ifndef NDEBUG
-            // All existing acquirers should be read acquirers, since this txn _was_
-            // the last write acquirer.
+            // All existing acquirers should be read acquirers, since this txn _was_ the
+            // last write acquirer.  (Preceding write acquirers must have unacquired the
+            // page.)
             for (current_page_acq_t *acq = current_page->acquirers_.head();
-                 acq != NULL;
+                 acq != nullptr;
                  acq = current_page->acquirers_.next(acq)) {
                 rassert(acq->access() == access_t::read);
             }
 #endif
 
             txn->pages_write_acquired_last_.remove(current_page);
-            current_page->last_write_acquirer_ = NULL;
+            current_page->last_write_acquirer_ = nullptr;
             page_cache->consider_evicting_current_page(current_page->block_id_);
         }
 
-        if (txn->cache_conn_ != NULL) {
+        if (txn->cache_conn_ != nullptr) {
             rassert(txn->cache_conn_->newest_txn_ == txn);
-            txn->cache_conn_->newest_txn_ = NULL;
-            txn->cache_conn_ = NULL;
+            txn->cache_conn_->newest_txn_ = nullptr;
+            txn->cache_conn_ = nullptr;
         }
 
         txn->flush_complete_cond_.pulse();
@@ -1169,7 +1202,7 @@ void page_cache_t::remove_txn_set_from_graph(page_cache_t *page_cache,
 struct block_token_tstamp_t {
     block_token_tstamp_t(block_id_t _block_id,
                          bool _is_deleted,
-                         counted_t<standard_block_token_t> _block_token,
+                         counted_t<block_token_t> _block_token,
                          repli_timestamp_t _tstamp,
                          page_t *_page)
         : block_id(_block_id), is_deleted(_is_deleted),
@@ -1177,9 +1210,9 @@ struct block_token_tstamp_t {
           page(_page) { }
     block_id_t block_id;
     bool is_deleted;
-    counted_t<standard_block_token_t> block_token;
+    counted_t<block_token_t> block_token;
     repli_timestamp_t tstamp;
-    // The page, or NULL, if we don't know it.
+    // The page, or nullptr, if we don't know it.
     page_t *page;
 };
 
@@ -1192,7 +1225,7 @@ struct ancillary_info_t {
 };
 
 void page_cache_t::do_flush_changes(page_cache_t *page_cache,
-                                    const std::map<block_id_t, block_change_t> &changes,
+                                    std::unordered_map<block_id_t, block_change_t> &&changes,
                                     const std::vector<page_txn_t *> &txns,
                                     fifo_enforcer_write_token_t index_write_token) {
     rassert(!changes.empty());
@@ -1209,13 +1242,13 @@ void page_cache_t::do_flush_changes(page_cache_t *page_cache,
 
         for (auto it = changes.begin(); it != changes.end(); ++it) {
             if (it->second.modified) {
-                if (it->second.page == NULL) {
+                if (it->second.page == nullptr) {
                     // The block is deleted.
                     blocks_by_tokens.push_back(block_token_tstamp_t(it->first,
                                                                     true,
-                                                                    counted_t<standard_block_token_t>(),
+                                                                    counted_t<block_token_t>(),
                                                                     repli_timestamp_t::invalid,
-                                                                    NULL));
+                                                                    nullptr));
                 } else {
                     page_t *page = it->second.page;
                     if (page->block_token().has()) {
@@ -1249,9 +1282,9 @@ void page_cache_t::do_flush_changes(page_cache_t *page_cache,
                 // We only touched the page.
                 blocks_by_tokens.push_back(block_token_tstamp_t(it->first,
                                                                 false,
-                                                                counted_t<standard_block_token_t>(),
+                                                                counted_t<block_token_t>(),
                                                                 it->second.tstamp,
-                                                                NULL));
+                                                                nullptr));
             }
         }
     }
@@ -1266,7 +1299,7 @@ void page_cache_t::do_flush_changes(page_cache_t *page_cache,
             }
         } blocks_written_cb;
 
-        std::vector<counted_t<standard_block_token_t> > tokens
+        std::vector<counted_t<block_token_t>> tokens
             = page_cache->serializer_->block_writes(write_infos,
                                                     /* disk account is overridden
                                                      * by merger_serializer_t */
@@ -1291,17 +1324,18 @@ void page_cache_t::do_flush_changes(page_cache_t *page_cache,
         for (auto it = blocks_by_tokens.begin(); it != blocks_by_tokens.end();
              ++it) {
             if (it->is_deleted) {
-                write_ops.push_back(index_write_op_t(it->block_id,
-                                                     counted_t<standard_block_token_t>(),
-                                                     repli_timestamp_t::invalid));
+                write_ops.push_back(index_write_op_t(
+                    it->block_id,
+                    make_optional(counted_t<block_token_t>()),
+                    make_optional(repli_timestamp_t::invalid)));
             } else if (it->block_token.has()) {
                 write_ops.push_back(index_write_op_t(it->block_id,
-                                                     it->block_token,
-                                                     it->tstamp));
+                                                     make_optional(it->block_token),
+                                                     make_optional(it->tstamp)));
             } else {
                 write_ops.push_back(index_write_op_t(it->block_id,
-                                                     boost::none,
-                                                     it->tstamp));
+                                                     r_nullopt,
+                                                     make_optional(it->tstamp)));
             }
         }
 
@@ -1324,7 +1358,7 @@ void page_cache_t::do_flush_changes(page_cache_t *page_cache,
                 coro_t::spawn_on_thread([&]() {
                     // Update the block tokens of the written blocks
                     for (auto &block : blocks_by_tokens) {
-                        if (block.block_token.has() && block.page != NULL) {
+                        if (block.block_token.has() && block.page != nullptr) {
                             // We know page is still a valid pointer because of the
                             // page_ptr_t in snapshotted_dirtied_pages_.
 
@@ -1343,6 +1377,9 @@ void page_cache_t::do_flush_changes(page_cache_t *page_cache,
                         }
                     }
 
+                    // Clear `changes`, since we are going to evict the pages
+                    // that it has pointers to in the next step.
+                    changes.clear();
                     for (auto &txn : txns) {
                         for (size_t i = 0, e = txn->snapshotted_dirtied_pages_.size();
                              i < e;
@@ -1367,7 +1404,7 @@ void page_cache_t::do_flush_changes(page_cache_t *page_cache,
 }
 
 void page_cache_t::do_flush_txn_set(page_cache_t *page_cache,
-                                    std::map<block_id_t, block_change_t> *changes_ptr,
+                                    std::unordered_map<block_id_t, block_change_t> *changes_ptr,
                                     const std::vector<page_txn_t *> &txns) {
     // This is called with spawn_now_dangerously!  The reason is partly so that we
     // don't put a zillion coroutines on the message loop when doing a bunch of
@@ -1379,7 +1416,7 @@ void page_cache_t::do_flush_txn_set(page_cache_t *page_cache,
     // set of changes we're actually doing is, since any transaction may have touched
     // the same blocks.
 
-    std::map<block_id_t, block_change_t> changes = std::move(*changes_ptr);
+    std::unordered_map<block_id_t, block_change_t> changes = std::move(*changes_ptr);
     rassert(!changes.empty());
 
     fifo_enforcer_write_token_t index_write_token
@@ -1387,7 +1424,7 @@ void page_cache_t::do_flush_txn_set(page_cache_t *page_cache,
 
     // Okay, yield, thank you.
     coro_t::yield();
-    do_flush_changes(page_cache, changes, txns, index_write_token);
+    do_flush_changes(page_cache, std::move(changes), txns, index_write_token);
 
     // Flush complete.
 
@@ -1521,7 +1558,7 @@ void page_cache_t::im_waiting_for_flush(page_txn_t *base) {
             (*it)->spawned_flush_ = true;
         }
 
-        std::map<block_id_t, block_change_t> changes
+        std::unordered_map<block_id_t, block_change_t> changes
             = page_cache_t::compute_changes(flush_set);
 
         if (!changes.empty()) {

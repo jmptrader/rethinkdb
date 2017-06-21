@@ -1,21 +1,30 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/terms/terms.hpp"
 
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "parsing/utf8.hpp"
+#include "rdb_protocol/datum_stream/eq_join.hpp"
+#include "rdb_protocol/datum_stream/fold.hpp"
+#include "rdb_protocol/datum_stream/map.hpp"
+#include "rdb_protocol/datum_stream/ordered_union.hpp"
+#include "rdb_protocol/datum_stream/range.hpp"
+#include "rdb_protocol/datum_stream/union.hpp"
+#include "rdb_protocol/datum_stream/vector.hpp"
 #include "rdb_protocol/error.hpp"
 #include "rdb_protocol/func.hpp"
 #include "rdb_protocol/math_utils.hpp"
 #include "rdb_protocol/op.hpp"
+#include "rdb_protocol/order_util.hpp"
 
 namespace ql {
 
 template<class T>
 class map_acc_term_t : public grouped_seq_op_term_t {
 protected:
-    map_acc_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    map_acc_term_t(compile_env_t *env, const raw_term_t &term)
         : grouped_seq_op_term_t(env, term, argspec_t(1, 2), optargspec_t({"index"})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args,
@@ -85,11 +94,12 @@ private:
     virtual bool uses_idx() const { return true; }
     virtual scoped_ptr_t<val_t> on_idx(
         env_t *env, counted_t<table_t> tbl, scoped_ptr_t<val_t> idx) const {
-        boost::optional<std::string> idx_str;
+        optional<std::string> idx_str;
         if (idx.has()) {
-            idx_str = idx->as_str().to_std();
+            idx_str.set(idx->as_str().to_std());
         }
-        counted_t<table_slice_t> slice(new table_slice_t(tbl, idx_str, sorting()));
+        counted_t<table_slice_t> slice(
+            new table_slice_t(tbl, idx_str, sorting()));
         return term_t::new_val(single_selection_t::from_slice(
             env,
             term_t::backtrace(),
@@ -119,7 +129,7 @@ private:
 
 class count_term_t : public grouped_seq_op_term_t {
 public:
-    count_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    count_term_t(compile_env_t *env, const raw_term_t &term)
         : grouped_seq_op_term_t(env, term, argspec_t(1, 2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args,
@@ -128,9 +138,18 @@ private:
         if (args->num_args() == 1) {
             if (v0->get_type().is_convertible(val_t::type_t::DATUM)) {
                 datum_t d = v0->as_datum();
-                if (d.get_type() == datum_t::R_BINARY) {
+                switch (static_cast<int>(d.get_type())) { // TODO: See issue 5177
+                case datum_t::R_BINARY:
                     return new_val(datum_t(
                        safe_to_double(d.as_binary().size())));
+                case datum_t::R_STR:
+                    return new_val(datum_t(
+                        safe_to_double(utf8::count_codepoints(d.as_str()))));
+                case datum_t::R_OBJECT:
+                    return new_val(datum_t(
+                        safe_to_double(d.obj_size())));
+                default:
+                    break;
                 }
             }
             return v0->as_seq(env->env)
@@ -140,7 +159,7 @@ private:
             if (v1->get_type().is_convertible(val_t::type_t::FUNC)) {
                 counted_t<datum_stream_t> stream = v0->as_seq(env->env);
                 stream->add_transformation(
-                        filter_wire_func_t(v1->as_func(), boost::none),
+                        filter_wire_func_t(v1->as_func(), r_nullopt),
                         backtrace());
                 return stream->run_terminal(env->env, count_wire_func_t());
             } else {
@@ -148,7 +167,7 @@ private:
                     new_eq_comparison_func(v1->as_datum(), backtrace());
                 counted_t<datum_stream_t> stream = v0->as_seq(env->env);
                 stream->add_transformation(
-                        filter_wire_func_t(f, boost::none), backtrace());
+                        filter_wire_func_t(f, r_nullopt), backtrace());
 
                 return stream->run_terminal(env->env, count_wire_func_t());
             }
@@ -159,10 +178,12 @@ private:
 
 class map_term_t : public grouped_seq_op_term_t {
 public:
-    map_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    map_term_t(compile_env_t *env, const raw_term_t &term)
         : grouped_seq_op_term_t(env, term, argspec_t(2, -1)) { }
 private:
-    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
+    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env,
+                                          args_t *args,
+                                          eval_flags_t) const {
         std::vector<counted_t<datum_stream_t> > streams;
         streams.reserve(args->num_args() - 1);
         for (size_t i = 0; i < args->num_args() - 1; ++i) {
@@ -171,7 +192,7 @@ private:
 
         counted_t<const func_t> func =
             args->arg(env, args->num_args() - 1)->as_func();
-        boost::optional<std::size_t> func_arity = func->arity();
+        optional<std::size_t> func_arity = func->arity();
         if (!!func_arity) {
             rcheck(func_arity.get() == 0 || func_arity.get() == args->num_args() - 1,
                    base_exc_t::LOGIC,
@@ -196,15 +217,146 @@ private:
     virtual const char *name() const { return "map"; }
 };
 
+class eq_join_term_t : public grouped_seq_op_term_t {
+public:
+    eq_join_term_t(compile_env_t *env, const raw_term_t &term)
+        : grouped_seq_op_term_t(env,
+                                term,
+                                argspec_t(3),
+                                optargspec_t({"index", "ordered"})) { }
+
+    virtual const char *name() const { return "eqjoin"; }
+private:
+    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env,
+                                          args_t *args,
+                                          eval_flags_t) const {
+        counted_t<datum_stream_t> stream = args->arg(env, 0)->as_seq(env->env);
+        counted_t<table_t> table = args->arg(env, 2)->as_table();
+
+        // Either a field name or a predicate function:
+        counted_t<const func_t> predicate_function;
+
+        predicate_function = args->arg(env, 1)->as_func(GET_FIELD_SHORTCUT);
+
+        bool ordered = false;
+        scoped_ptr_t<val_t> maybe_ordered = args->optarg(env, "ordered");
+        if (maybe_ordered.has()) {
+            ordered = maybe_ordered->as_bool();
+        }
+        datum_t key;
+        scoped_ptr_t<val_t> maybe_key = args->optarg(env, "index");
+        if (maybe_key.has()) {
+            key = maybe_key->as_datum();
+        } else {
+            key = datum_t(datum_string_t(table->get_pkey()));
+        }
+        counted_t<eq_join_datum_stream_t> eq_join_stream =
+            make_counted<eq_join_datum_stream_t>(stream,
+                                                 table,
+                                                 key.as_str(),
+                                                 predicate_function,
+                                                 ordered,
+                                                 backtrace());
+
+        return new_val(env->env, eq_join_stream);
+    }
+};
+
+class fold_term_t : public grouped_seq_op_term_t {
+public:
+    fold_term_t(compile_env_t *env, const raw_term_t &term)
+      : grouped_seq_op_term_t(env,
+                              term,
+                              argspec_t(3),
+                              optargspec_t({"emit", "final_emit"})) { }
+private:
+    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env,
+                                          args_t *args,
+                                          eval_flags_t) const {
+        counted_t<datum_stream_t> stream = args->arg(env, 0)->as_seq(env->env);
+
+        datum_t base = args->arg(env, 1)->as_datum();
+
+        counted_t<const func_t> acc_func =
+            args->arg(env, 2)->as_func();
+        optional<std::size_t> acc_func_arity = acc_func->arity();
+
+        if (static_cast<bool>(acc_func_arity)) {
+            rcheck(acc_func_arity.get() == 0 || acc_func_arity.get() == 2,
+                   base_exc_t::LOGIC,
+                   strprintf("The accumulator function passed to `fold`"
+                             " should expect 2 arguments"));
+        }
+
+        scoped_ptr_t<val_t> emit_arg = args->optarg(env, "emit");
+        scoped_ptr_t<val_t> final_emit_arg = args->optarg(env, "final_emit");
+
+        if (!emit_arg.has()) {
+            // Handle case without emit function.
+            datum_t result = base;
+            batchspec_t batchspec = batchspec_t::user(batch_type_t::TERMINAL, env->env);
+            {
+                datum_t row;
+                std::vector<datum_t> acc_args;
+                while (row = stream->next(env->env, batchspec), row.has()) {
+                    acc_args.push_back(std::move(result));
+                    acc_args.push_back(std::move(row));
+
+                    result = acc_func->call(env->env, acc_args)->as_datum();
+
+                    r_sanity_check(result.has());
+                    acc_args.clear();
+                }
+            }
+
+            if (final_emit_arg.has()) {
+                datum_t final_result;
+                std::vector<datum_t> final_args{std::move(result)};
+
+                counted_t<const func_t> final_emit_func = final_emit_arg->as_func();
+                final_result = final_emit_func->call(env->env, final_args)->as_datum();
+                r_sanity_check(final_result.has());
+                return new_val(final_result);
+            } else {
+                return new_val(result);
+            }
+        } else {
+            counted_t<const func_t> emit_func = emit_arg->as_func();
+            counted_t<datum_stream_t> fold_stream;
+            if (final_emit_arg.has()) {
+                counted_t<const func_t> final_emit_func = final_emit_arg->as_func();
+                fold_stream
+                    = make_counted<fold_datum_stream_t>(std::move(stream),
+                                                        base,
+                                                        std::move(acc_func),
+                                                        std::move(emit_func),
+                                                        std::move(final_emit_func),
+                                                        backtrace());
+            } else {
+                fold_stream
+                    = make_counted<fold_datum_stream_t>(std::move(stream),
+                                                        base,
+                                                        std::move(acc_func),
+                                                        std::move(emit_func),
+                                                        counted_t<const func_t>(),
+                                                        backtrace());
+            }
+            return new_val(env->env, fold_stream);
+        }
+    }
+    virtual const char *name() const { return "fold"; }
+};
+
 class concatmap_term_t : public grouped_seq_op_term_t {
 public:
-    concatmap_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    concatmap_term_t(compile_env_t *env, const raw_term_t &term)
         : grouped_seq_op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
         counted_t<datum_stream_t> stream = args->arg(env, 0)->as_seq(env->env);
         stream->add_transformation(
-            concatmap_wire_func_t(result_hint_t::NO_HINT, args->arg(env, 1)->as_func()),
+            concatmap_wire_func_t(result_hint_t::NO_HINT,
+                                  args->arg(env, 1)->as_func()),
                 backtrace());
         return new_val(env->env, stream);
     }
@@ -213,7 +365,7 @@ private:
 
 class group_term_t : public grouped_seq_op_term_t {
 public:
-    group_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    group_term_t(compile_env_t *env, const raw_term_t &term)
         : grouped_seq_op_term_t(env, term, argspec_t(1, -1),
                                 optargspec_t({"index", "multi"})) { }
 private:
@@ -233,10 +385,10 @@ private:
             if (index_str == tbl->get_pkey()) {
                 auto field = index->as_datum();
                 funcs.push_back(new_get_field_func(field, backtrace()));
-                slice = make_counted<table_slice_t>(tbl, index_str);
+                slice = make_counted<table_slice_t>(tbl, make_optional(index_str));
             } else {
                 slice = make_counted<table_slice_t>(
-                    tbl, index_str, sorting_t::ASCENDING);
+                    tbl, make_optional(index_str), sorting_t::ASCENDING);
                 append_index = true;
             }
             r_sanity_check(slice.has());
@@ -265,7 +417,7 @@ private:
 
 class filter_term_t : public grouped_seq_op_term_t {
 public:
-    filter_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    filter_term_t(compile_env_t *env, const raw_term_t &term)
         : grouped_seq_op_term_t(env, term, argspec_t(2), optargspec_t({"default"})),
           default_filter_term(lazy_literal_optarg(env, "default")) { }
 
@@ -275,9 +427,9 @@ private:
         scoped_ptr_t<val_t> v0 = args->arg(env, 0);
         scoped_ptr_t<val_t> v1 = args->arg(env, 1, LITERAL_OK);
         counted_t<const func_t> f = v1->as_func(CONSTANT_SHORTCUT);
-        boost::optional<wire_func_t> defval;
+        optional<wire_func_t> defval;
         if (default_filter_term.has()) {
-            defval = wire_func_t(default_filter_term->eval_to_func(env->scope));
+            defval.set(wire_func_t(default_filter_term->eval_to_func(env->scope)));
         }
 
         if (v0->get_type().is_convertible(val_t::type_t::SELECTION)) {
@@ -294,12 +446,12 @@ private:
 
     virtual const char *name() const { return "filter"; }
 
-    counted_t<func_term_t> default_filter_term;
+    counted_t<const func_term_t> default_filter_term;
 };
 
 class reduce_term_t : public grouped_seq_op_term_t {
 public:
-    reduce_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    reduce_term_t(compile_env_t *env, const raw_term_t &term)
         : grouped_seq_op_term_t(env, term, argspec_t(2),
                                 optargspec_t({ "base" })) { }
 private:
@@ -317,17 +469,26 @@ struct rcheck_transform_visitor_t : public bt_rcheckable_t,
     explicit rcheck_transform_visitor_t(Args &&... args)
         : bt_rcheckable_t(std::forward<Args...>(args)...) { }
     void check_f(const wire_func_t &f) const {
-        rcheck_src(f.get_bt(),
-                   f.compile_wire_func()->is_deterministic(),
-                   base_exc_t::LOGIC,
-                   "Cannot call `changes` after a non-deterministic function.");
+        switch (f.compile_wire_func()->is_deterministic()) {
+            case deterministic_t::always:
+            case deterministic_t::single_server:
+                // ok
+                break;
+
+            case deterministic_t::no:
+                rfail_src(f.get_bt(),
+                          base_exc_t::LOGIC,
+                          "Cannot call `changes` after a non-deterministic function.");
+
+            default: unreachable();
+        }
     }
     void operator()(const map_wire_func_t &f) const {
         check_f(f);
     }
     void operator()(const filter_wire_func_t &f) const {
         check_f(f.filter_func);
-        if (f.default_filter_val) {
+        if (f.default_filter_val.has_value()) {
             check_f(*f.default_filter_val);
         }
     }
@@ -339,6 +500,7 @@ struct rcheck_transform_visitor_t : public bt_rcheckable_t,
         case result_hint_t::NO_HINT:
             rfail(base_exc_t::LOGIC, "Cannot call `changes` after `concat_map`.");
             // fallthru
+
         default: unreachable();
         }
     }
@@ -372,18 +534,21 @@ struct rcheck_spec_visitor_t : public bt_rcheckable_t,
                    env->limits().array_size_limit()));
     }
     void operator()(const changefeed::keyspec_t::point_t &) const { }
+    void operator()(const changefeed::keyspec_t::empty_t &) const { }
     env_t *env;
 };
 
 class changes_term_t : public op_term_t {
 public:
-    changes_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    changes_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(
             env, term, argspec_t(1),
             optargspec_t({"squash",
                           "changefeed_queue_size",
-                          "include_initial_vals",
-                          "include_states"})) { }
+                          "include_initial",
+                          "include_offsets",
+                          "include_states",
+                          "include_types"})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
         scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -404,8 +569,21 @@ private:
         if (scoped_ptr_t<val_t> v = args->optarg(env, "include_states")) {
             include_states = v->as_bool();
         }
-        scoped_ptr_t<val_t> include_initial_vals_val =
-            args->optarg(env, "include_initial_vals");
+
+        bool include_types = false;
+        if (scoped_ptr_t<val_t> v = args->optarg(env, "include_types")) {
+            include_types = v->as_bool();
+        }
+
+        bool include_initial = false;
+        if (scoped_ptr_t<val_t> v = args->optarg(env, "include_initial")) {
+            include_initial = v->as_bool();
+        }
+
+        bool include_offsets = false;
+        if (scoped_ptr_t<val_t> v = args->optarg(env, "include_offsets")) {
+            include_offsets = v->as_bool();
+        }
 
         scoped_ptr_t<val_t> v = args->arg(env, 0);
         configured_limits_t limits = env->env->limits_with_changefeed_queue_size(
@@ -416,10 +594,7 @@ private:
             std::vector<changespec_t> changespecs = seq->get_changespecs();
             r_sanity_check(changespecs.size() >= 1);
             for (auto &&changespec : changespecs) {
-                bool include_initial_vals = include_initial_vals_val.has()
-                    ? include_initial_vals_val->as_bool()
-                    : changespec.include_initial_vals();
-                if (include_initial_vals) {
+                if (include_initial) {
                     r_sanity_check(changespec.stream.has());
                 }
                 boost::apply_visitor(rcheck_spec_visitor_t(env->env, backtrace()),
@@ -427,14 +602,18 @@ private:
                 streams.push_back(
                     changespec.keyspec.table->read_changes(
                         env->env,
-                        include_initial_vals ? std::move(changespec.stream)
-                                             : counted_t<datum_stream_t>(),
-                        limits,
-                        squash,
-                        include_states,
-                        std::move(changespec.keyspec.spec),
-                        backtrace(),
-                        changespec.keyspec.table_name));
+                        changefeed::streamspec_t(
+                            include_initial
+                                ? std::move(changespec.stream)
+                                : counted_t<datum_stream_t>(),
+                            changespec.keyspec.table_name,
+                            include_offsets,
+                            include_states,
+                            include_types,
+                            limits,
+                            squash,
+                            std::move(changespec.keyspec.spec)),
+                        backtrace()));
             }
             if (streams.size() == 1) {
                 return new_val(env->env, streams[0]);
@@ -448,16 +627,27 @@ private:
                         streams.size()));
             }
         } else if (v->get_type().is_convertible(val_t::type_t::SINGLE_SELECTION)) {
-                bool include_initial_vals = include_initial_vals_val.has()
-                    ? include_initial_vals_val->as_bool()
-                    : true;
+            auto sel = v->as_single_selection();
             return new_val(
                 env->env,
-                v->as_single_selection()->read_changes(
-                    include_initial_vals,
-                    limits,
-                    squash,
-                    include_states));
+                sel->get_tbl()->tbl->read_changes(
+                    env->env,
+                    changefeed::streamspec_t(
+                        include_initial
+                            // We want to provide an empty stream in this case
+                            // because we get the initial values from the stamp
+                            // read instead.
+                            ? make_counted<vector_datum_stream_t>(
+                                sel->get_bt(), std::vector<datum_t>(), r_nullopt)
+                            : counted_t<vector_datum_stream_t>(),
+                        sel->get_tbl()->display_name(),
+                        include_offsets,
+                        include_states,
+                        include_types,
+                        limits,
+                        squash,
+                        sel->get_spec()),
+                    sel->get_bt()));
         }
         auto selection = v->as_selection(env->env);
         rfail(base_exc_t::LOGIC,
@@ -468,7 +658,7 @@ private:
 
 class minval_term_t final : public op_term_t {
 public:
-    minval_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    minval_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(0)) { }
 private:
     scoped_ptr_t<val_t> eval_impl(scope_env_t *, args_t *, eval_flags_t) const {
@@ -479,7 +669,7 @@ private:
 
 class maxval_term_t final : public op_term_t {
 public:
-    maxval_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    maxval_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(0)) { }
 private:
     scoped_ptr_t<val_t> eval_impl(scope_env_t *, args_t *, eval_flags_t) const {
@@ -496,7 +686,7 @@ enum class between_null_t { UNBOUNDED, ERROR };
 
 class between_term_t : public bounded_op_term_t {
 public:
-    between_term_t(compile_env_t *env, const protob_t<const Term> &term,
+    between_term_t(compile_env_t *env, const raw_term_t &term,
                    between_null_t _null_behavior)
         : bounded_op_term_t(env, term, argspec_t(3), optargspec_t({"index"})),
           null_behavior(_null_behavior) { }
@@ -528,7 +718,7 @@ private:
         if (sindex.has()) {
             idx = sindex->as_str().to_std();
         } else {
-            boost::optional<std::string> old_idx = tbl_slice->get_idx();
+            optional<std::string> old_idx = tbl_slice->get_idx();
             idx = old_idx ? *old_idx : tbl_slice->get_tbl()->get_pkey();
         }
         return new_val(
@@ -542,22 +732,101 @@ private:
     }
     virtual const char *name() const { return "between"; }
 
-    protob_t<Term> filter_func;
     between_null_t null_behavior;
 };
 
+
 class union_term_t : public op_term_t {
 public:
-    union_term_t(compile_env_t *env, const protob_t<const Term> &term)
-        : op_term_t(env, term, argspec_t(0, -1)) { }
+    union_term_t(compile_env_t *env, const raw_term_t &term)
+        : op_term_t(env, term, argspec_t(0, -1), optargspec_t({"interleave"})) { }
 private:
-    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
+    virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env,
+                                          args_t *args,
+                                          eval_flags_t eval_flags) const {
         std::vector<counted_t<datum_stream_t> > streams;
         for (size_t i = 0; i < args->num_args(); ++i) {
             streams.push_back(args->arg(env, i)->as_seq(env->env));
         }
-        counted_t<datum_stream_t> union_stream = make_counted<union_datum_stream_t>(
+
+        optional<raw_term_t> r_interleave_arg_op = get_src().optarg("interleave");
+
+        std::vector<scoped_ptr_t<val_t> > evaluated_interleave_args;
+
+        bool allow_unordered_interleave = true;
+        bool order_by_field = false;
+
+        counted_t<datum_stream_t> union_stream;
+
+        if (r_interleave_arg_op) {
+
+            if (r_interleave_arg_op->type() == Term::MAKE_ARRAY) {
+                // Array of elements which may contain functions or r.desc/asc.
+                allow_unordered_interleave = false;
+                order_by_field = true;
+
+                counted_t<const term_t> interleave_term;
+                // Steal arguments from an array as an optarg to allow functions in array.
+                auto it = optargs.find("interleave");
+                r_sanity_check(it != optargs.end());
+                interleave_term = it->second;
+
+                const std::vector<counted_t<const term_t> > &array_args
+                    = interleave_term->get_original_args();
+
+                std::vector<scoped_ptr_t<val_t> > array_args_evaluated;
+                for (auto &arg : array_args) {
+                    array_args_evaluated.push_back(arg->eval(env, eval_flags));
+                }
+
+                union_stream = make_counted<ordered_union_datum_stream_t>(
+                    std::move(streams),
+                    build_comparisons_from_optional_terms(this,
+                                                          env,
+                                                          std::move(array_args_evaluated),
+                                                          *r_interleave_arg_op),
+                    env->env,
+                    backtrace());
+            } else {
+                scoped_ptr_t<val_t> interleave_arg = args->optarg(env, "interleave");
+                // A single element, either a bool or a term as above.
+                datum_t interleave_datum;
+                bool use_as_term = true;
+                if (interleave_arg->get_type().is_convertible(val_t::type_t::DATUM)) {
+                    interleave_datum = interleave_arg->as_datum();
+                    if (interleave_datum.get_type() == datum_t::type_t::R_BOOL) {
+                        order_by_field = false;
+                        allow_unordered_interleave = interleave_datum.as_bool();
+                        use_as_term = false;
+                    }
+                }
+                if (use_as_term) {
+                    allow_unordered_interleave = false;
+                    order_by_field = true;
+
+                    union_stream = make_counted<ordered_union_datum_stream_t>(
+                        std::move(streams),
+                        build_comparisons_from_single_term(this,
+                                                           env,
+                                                           std::move(interleave_arg),
+                                                           *r_interleave_arg_op),
+                        env->env,
+                        backtrace());
+                }
+            }
+        }
+
+        if (allow_unordered_interleave) {
+            union_stream = make_counted<union_datum_stream_t>(
                 env->env, std::move(streams), backtrace());
+        } else if (!order_by_field) {
+            union_stream = make_counted<ordered_union_datum_stream_t>(
+                std::move(streams),
+                std::vector<std::pair<order_direction_t, counted_t<const func_t> > >(),
+                env->env,
+                backtrace());
+        }
+        r_sanity_check(union_stream.has());
         return new_val(env->env, union_stream);
     }
     virtual const char *name() const { return "union"; }
@@ -565,7 +834,7 @@ private:
 
 class zip_term_t : public op_term_t {
 public:
-    zip_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    zip_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -578,7 +847,7 @@ private:
 
 class range_term_t : public op_term_t {
 public:
-    range_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    range_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(0, 2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -602,92 +871,101 @@ private:
 };
 
 counted_t<term_t> make_minval_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<minval_term_t>(env, term);
 }
 
 counted_t<term_t> make_maxval_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<maxval_term_t>(env, term);
 }
 
 counted_t<term_t> make_between_deprecated_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<between_term_t>(env, term, between_null_t::UNBOUNDED);
 }
 
 counted_t<term_t> make_between_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<between_term_t>(env, term, between_null_t::ERROR);
 }
 
 counted_t<term_t> make_changes_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<changes_term_t>(env, term);
 }
 
 counted_t<term_t> make_reduce_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<reduce_term_t>(env, term);
 }
 
 counted_t<term_t> make_map_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<map_term_t>(env, term);
 }
 
+counted_t<term_t> make_eq_join_term(
+        compile_env_t *env, const raw_term_t &term) {
+    return make_counted<eq_join_term_t>(env, term);
+}
+
+counted_t<term_t> make_fold_term(
+        compile_env_t *env, const raw_term_t &term) {
+    return make_counted<fold_term_t>(env, term);
+}
 counted_t<term_t> make_filter_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<filter_term_t>(env, term);
 }
 
 counted_t<term_t> make_concatmap_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<concatmap_term_t>(env, term);
 }
 
 counted_t<term_t> make_group_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<group_term_t>(env, term);
 }
 
 counted_t<term_t> make_count_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<count_term_t>(env, term);
 }
 
 counted_t<term_t> make_avg_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<avg_term_t>(env, term);
 }
 
 counted_t<term_t> make_sum_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sum_term_t>(env, term);
 }
 
 counted_t<term_t> make_min_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<min_term_t>(env, term);
 }
 
 counted_t<term_t> make_max_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<max_term_t>(env, term);
 }
 
 counted_t<term_t> make_union_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<union_term_t>(env, term);
 }
 
 counted_t<term_t> make_zip_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<zip_term_t>(env, term);
 }
 
 counted_t<term_t> make_range_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<range_term_t>(env, term);
 }
 

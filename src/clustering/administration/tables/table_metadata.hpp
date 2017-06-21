@@ -46,6 +46,13 @@ ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(
     write_ack_config_t::SINGLE,
     write_ack_config_t::MAJORITY);
 
+class user_data_t {
+public:
+    ql::datum_t datum;
+};
+
+user_data_t default_user_data();
+
 /* `table_config_t` describes the complete contents of the `rethinkdb.table_config`
 artificial table. */
 
@@ -71,14 +78,16 @@ public:
     table_basic_config_t basic;
     std::vector<shard_t> shards;
     std::map<std::string, sindex_config_t> sindexes;
+    optional<write_hook_config_t> write_hook;
     write_ack_config_t write_ack_config;
     write_durability_t durability;
+    user_data_t user_data;  // has user-exposed name "data"
 };
+
+RDB_DECLARE_EQUALITY_COMPARABLE(table_config_t);
 
 RDB_DECLARE_SERIALIZABLE(table_config_t::shard_t);
 RDB_DECLARE_EQUALITY_COMPARABLE(table_config_t::shard_t);
-RDB_DECLARE_SERIALIZABLE(table_config_t);
-RDB_DECLARE_EQUALITY_COMPARABLE(table_config_t);
 
 class table_shard_scheme_t {
 public:
@@ -133,5 +142,153 @@ public:
 
 RDB_DECLARE_SERIALIZABLE(table_config_and_shards_t);
 RDB_DECLARE_EQUALITY_COMPARABLE(table_config_and_shards_t);
+
+class table_config_and_shards_change_t {
+public:
+    class set_table_config_and_shards_t {
+    public:
+        table_config_and_shards_t new_config_and_shards;
+    };
+
+    class write_hook_create_t {
+    public:
+        write_hook_config_t config;
+    };
+
+    class write_hook_drop_t {
+    public:
+    };
+
+    class sindex_create_t {
+    public:
+        std::string name;
+        sindex_config_t config;
+    };
+
+    class sindex_drop_t {
+    public:
+        std::string name;
+    };
+
+    class sindex_rename_t {
+    public:
+        std::string name;
+        std::string new_name;
+        bool overwrite;
+    };
+
+    table_config_and_shards_change_t() { }
+
+    explicit table_config_and_shards_change_t(set_table_config_and_shards_t &&_change)
+        : change(std::move(_change)) { }
+    explicit table_config_and_shards_change_t(sindex_create_t &&_change)
+        : change(std::move(_change)) { }
+    explicit table_config_and_shards_change_t(sindex_drop_t &&_change)
+        : change(std::move(_change)) { }
+    explicit table_config_and_shards_change_t(sindex_rename_t &&_change)
+        : change(std::move(_change)) { }
+    explicit table_config_and_shards_change_t(write_hook_create_t &&_change)
+        : change(std::move(_change)) { }
+    explicit table_config_and_shards_change_t(write_hook_drop_t &&_change)
+        : change(std::move(_change)) { }
+
+
+    /* Note, it's important that `apply_change` does not change
+    `table_config_and_shards` if it returns false. */
+    bool apply_change(table_config_and_shards_t *table_config_and_shards) const {
+        return boost::apply_visitor(
+            apply_change_visitor_t(table_config_and_shards), change);
+    }
+
+    bool name_and_database_equal(const table_basic_config_t &table_basic_config) const {
+        const set_table_config_and_shards_t *set_table_config_and_shards =
+            boost::get<set_table_config_and_shards_t>(&change);
+        if (set_table_config_and_shards == nullptr) {
+            return true;
+        } else {
+            return set_table_config_and_shards->new_config_and_shards.config.basic.name == table_basic_config.name &&
+                set_table_config_and_shards->new_config_and_shards.config.basic.database == table_basic_config.database;
+        }
+    }
+
+    RDB_MAKE_ME_SERIALIZABLE_1(table_config_and_shards_change_t, change);
+
+private:
+    boost::variant<
+        set_table_config_and_shards_t,
+        sindex_create_t,
+        sindex_drop_t,
+        sindex_rename_t,
+        write_hook_create_t,
+        write_hook_drop_t> change;
+
+    class apply_change_visitor_t
+        : public boost::static_visitor<bool> {
+    public:
+        explicit apply_change_visitor_t(
+                table_config_and_shards_t *_table_config_and_shards)
+            : table_config_and_shards(_table_config_and_shards) { }
+
+        result_type operator()(
+                const set_table_config_and_shards_t &set_table_config_and_shards) const {
+            *table_config_and_shards =
+                set_table_config_and_shards.new_config_and_shards;
+            return true;
+        }
+
+        result_type operator()(const write_hook_create_t &write_hook_create) const {
+            table_config_and_shards->config.write_hook.set(write_hook_create.config);
+            return true;
+        }
+
+        result_type operator()(UNUSED const write_hook_drop_t &write_hook_drop) const {
+            table_config_and_shards->config.write_hook = r_nullopt;
+            return true;
+        }
+
+        result_type operator()(const sindex_create_t &sindex_create) const {
+            auto pair = table_config_and_shards->config.sindexes.insert(
+                std::make_pair(sindex_create.name, sindex_create.config));
+            return pair.second;
+        }
+
+        result_type operator()(const sindex_drop_t &sindex_drop) const {
+            auto size = table_config_and_shards->config.sindexes.erase(sindex_drop.name);
+            return size == 1;
+        }
+
+        result_type operator()(const sindex_rename_t &sindex_rename) const {
+            if (table_config_and_shards->config.sindexes.count(
+                    sindex_rename.name) == 0) {
+                /* The index `sindex_rename.name` does not exist. */
+                return false;
+            }
+            if (sindex_rename.name != sindex_rename.new_name) {
+                if (table_config_and_shards->config.sindexes.count(
+                            sindex_rename.new_name) == 1 &&
+                        sindex_rename.overwrite == false) {
+                    /* The index `sindex_rename.new_name` already exits and should not be
+                    overwritten. */
+                    return false;
+                } else {
+                    table_config_and_shards->config.sindexes[sindex_rename.new_name] =
+                        table_config_and_shards->config.sindexes.at(sindex_rename.name);
+                    table_config_and_shards->config.sindexes.erase(sindex_rename.name);
+                }
+            }
+            return true;
+        }
+
+    private:
+        table_config_and_shards_t *table_config_and_shards;
+    };
+};
+
+RDB_DECLARE_SERIALIZABLE(table_config_and_shards_change_t::set_table_config_and_shards_t);
+RDB_DECLARE_SERIALIZABLE(table_config_and_shards_change_t::write_hook_create_t);
+RDB_DECLARE_SERIALIZABLE(table_config_and_shards_change_t::write_hook_drop_t);
+RDB_DECLARE_SERIALIZABLE(table_config_and_shards_change_t::sindex_create_t);
+RDB_DECLARE_SERIALIZABLE(table_config_and_shards_change_t::sindex_drop_t);
+RDB_DECLARE_SERIALIZABLE(table_config_and_shards_change_t::sindex_rename_t);
 
 #endif /* CLUSTERING_ADMINISTRATION_TABLES_TABLE_METADATA_HPP_ */

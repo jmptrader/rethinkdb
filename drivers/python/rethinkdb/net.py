@@ -1,60 +1,40 @@
-# Copyright 2010-2015 RethinkDB, all rights reserved.
+# Copyright 2010-2016 RethinkDB, all rights reserved.
 
+import collections
 import errno
-import json
+import imp
 import numbers
+import os
+import pprint
 import socket
+import ssl
 import struct
 import time
-import ssl
-try:
-    from importlib import import_module
-except ImportError:
-    def import_module(name, package=None):
-        # song & dance needed to do relative import in 2.6, which
-        # doesn't have importlib
-        return __import__(name[1:], globals(), locals(), [], 1)
 
 from . import ql2_pb2 as p
 
-__all__ = ['connect', 'set_loop_type', 'Connection', 'Cursor']
+__all__ = ['connect', 'set_loop_type', 'Connection', 'Cursor', 'DEFAULT_PORT']
+
+DEFAULT_PORT = 28015
 
 pErrorType = p.Response.ErrorType
 pResponse = p.Response.ResponseType
 pQuery = p.Query.QueryType
 
+from .ast import DB, Repl, ReQLDecoder, ReQLEncoder, expr
 from .errors import *
-from .ast import RqlQuery, RqlTopLevelQuery, DB, Repl
-from .ast import recursively_convert_pseudotypes
+from .handshake import *
 
 try:
     from ssl import match_hostname, CertificateError
 except ImportError:
-    from backports.ssl_match_hostname import match_hostname, CertificateError
-
-try:
-    xrange
-except NameError:
-    xrange = range
+    from .backports.ssl_match_hostname import match_hostname, CertificateError
 
 try:
     {}.iteritems
     dict_items = lambda d: d.iteritems()
 except AttributeError:
     dict_items = lambda d: d.items()
-
-def decodeUTF(inputPipe):
-    # attempt to decode input as utf-8 with fallbacks to get something useful
-    try:
-        return inputPipe.decode('utf-8', errors='ignore')
-    except TypeError:
-        try:
-            return inputPipe.decode('utf-8')
-        except UnicodeError:
-            return repr(inputPipe)
-
-def convert_pseudo(value, query):
-    return recursively_convert_pseudotypes(value, query.global_optargs)
 
 def maybe_profile(value, res):
     if res.profile is not None:
@@ -68,28 +48,29 @@ class Query(object):
         self.term = term
         self.global_optargs = global_optargs
 
-    def serialize(self):
+        global_optargs = global_optargs or { }
+        self._json_encoder = global_optargs.pop('json_encoder', None)
+        self._json_decoder = global_optargs.pop('json_decoder', None)
+
+    def serialize(self, reql_encoder=ReQLEncoder()):
         message = [self.type]
         if self.term is not None:
-            message.append(self.term.build())
+            message.append(self.term)
         if self.global_optargs is not None:
-            optargs = {}
-            for k, v in dict_items(self.global_optargs):
-                optargs[k] = v.build() if isinstance(v, RqlQuery) else v
-            message.append(optargs)
-        query_str = json.dumps(message, ensure_ascii=False, allow_nan=False).encode('utf-8')
+            message.append(expr(self.global_optargs))
+        query_str = reql_encoder.encode(message).encode('utf-8')
         query_header = struct.pack('<QL', self.token, len(query_str))
         return query_header + query_str
 
 
 class Response(object):
-    def __init__(self, token, json_str):
+    def __init__(self, token, json_str, reql_decoder=ReQLDecoder()):
         try:
             json_str = json_str.decode('utf-8')
         except AttributeError:
             pass               # Python3 str objects are already utf-8
         self.token = token
-        full_response = json.loads(json_str)
+        full_response = reql_decoder.decode(json_str)
         self.type = full_response["t"]
         self.data = full_response["r"]
         self.backtrace = full_response.get("b", None)
@@ -98,22 +79,23 @@ class Response(object):
 
     def make_error(self, query):
         if self.type == pResponse.CLIENT_ERROR:
-            return RqlClientError(self.data[0], query.term, self.backtrace)
+            return ReqlDriverError(self.data[0], query.term, self.backtrace)
         elif self.type == pResponse.COMPILE_ERROR:
-            return RqlCompileError(self.data[0], query.term, self.backtrace)
+            return ReqlServerCompileError(self.data[0], query.term, self.backtrace)
         elif self.type == pResponse.RUNTIME_ERROR:
             return {
-                pErrorType.INTERNAL: RqlInternalError,
-                pErrorType.RESOURCE: RqlResourceError,
-                pErrorType.LOGIC: RqlLogicError,
-                pErrorType.NON_EXISTENCE: RqlNonExistenceError,
-                pErrorType.OP_FAILED: RqlOpFailedError,
-                pErrorType.OP_INDETERMINATE: RqlOpIndeterminateError,
-                pErrorType.USER: RqlUserError
-            }.get(self.error_type, RqlRuntimeError)(
+                pErrorType.INTERNAL: ReqlInternalError,
+                pErrorType.RESOURCE_LIMIT: ReqlResourceLimitError,
+                pErrorType.QUERY_LOGIC: ReqlQueryLogicError,
+                pErrorType.NON_EXISTENCE: ReqlNonExistenceError,
+                pErrorType.OP_FAILED: ReqlOpFailedError,
+                pErrorType.OP_INDETERMINATE: ReqlOpIndeterminateError,
+                pErrorType.USER: ReqlUserError,
+                pErrorType.PERMISSION_ERROR: ReqlPermissionError
+            }.get(self.error_type, ReqlRuntimeError)(
                 self.data[0], query.term, self.backtrace)
-        return RqlDriverError("Unknown Response type %d encountered" +
-                              " in a response." % self.type)
+        return ReqlDriverError(("Unknown Response type %d encountered" +
+                                " in a response.") % self.type)
 
 
 # This class encapsulates all shared behavior between cursor implementations.
@@ -137,24 +119,34 @@ class Response(object):
 #         occurred yet
 #     Exception - an error has occurred in the cursor and should be raised
 #         to the user once all results in `items` have been returned.  This
-#         will be a RqlCursorEmpty exception if the cursor completed successfully.
+#         will be a ReqlCursorEmpty exception if the cursor completed successfully.
 #
 # A class that derives from this should implement the following functions:
 #     def _get_next(self, timeout):
 #         where `timeout` is the maximum amount of time (in seconds) to wait for the
-#         next result in the cursor before raising a RqlTimeoutError.
+#         next result in the cursor before raising a ReqlTimeoutError.
 #     def _empty_error(self):
 #         which returns the appropriate error to be raised when the cursor is empty
 class Cursor(object):
-    def __init__(self, conn_instance, query):
+    def __init__(self, conn_instance, query, first_response, items_type = collections.deque):
         self.conn = conn_instance
         self.query = query
-        self.items = list()
-        self.outstanding_requests = 1
-        self.threshold = 0
+        self.items = items_type()
+        self.outstanding_requests = 0
+        self.threshold = 1
         self.error = None
+        self._json_decoder = self.conn._parent._get_json_decoder(self.query)
 
         self.conn._cursor_cache[self.query.token] = self
+
+        self._maybe_fetch_batch()
+        self._extend_internal(first_response)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
 
     def close(self):
         if self.error is None:
@@ -170,13 +162,19 @@ class Cursor(object):
         elif isinstance(wait, numbers.Real) and wait >= 0:
             return wait
         else:
-            raise RqlDriverError("Invalid wait timeout '%s'" % str(wait))
+            raise ReqlDriverError("Invalid wait timeout '%s'" % str(wait))
 
     def next(self, wait=True):
         return self._get_next(Cursor._wait_to_timeout(wait))
 
-    def _extend(self, res):
+    def _extend(self, res_buf):
         self.outstanding_requests -= 1
+        self._maybe_fetch_batch()
+
+        res = Response(self.query.token, res_buf, self._json_decoder)
+        self._extend_internal(res)
+
+    def _extend_internal(self, res):
         self.threshold = len(res.data)
         if self.error is None:
             if res.type == pResponse.SUCCESS_PARTIAL:
@@ -186,44 +184,65 @@ class Cursor(object):
                 self.error = self._empty_error()
             else:
                 self.error = res.make_error(self.query)
-        self._maybe_fetch_batch()
 
         if self.outstanding_requests == 0 and self.error is not None:
             del self.conn._cursor_cache[res.token]
-
+    
     def __str__(self):
-        val_str = ', '.join(map(repr, self.items[:10]))
-        if len(self.items) > 10 or self.error is None:
-            val_str += ', ...'
-
+        val_str = pprint.pformat([self.items[x] for x in range(min(10, len(self.items)))] + (['...'] if len(self.items) > 10 else []))
+        if val_str.endswith("'...']"):
+            val_str = val_str[:-len("'...']")] + "...]"
+        spacer_str = '\n' if '\n' in val_str else ''
         if self.error is None:
-            err_str = 'streaming'
-        elif isinstance(self.error, RqlCursorEmpty):
-            err_str = 'done streaming'
+            status_str = 'streaming'
+        elif isinstance(self.error, ReqlCursorEmpty):
+            status_str = 'done streaming'
         else:
-            err_str = 'error: %s' % repr(self.error)
-
-        return "%s (%s):\n[%s]" % (object.__str__(self), err_str, val_str)
+            status_str = 'error: %s' % str(self.error)
+        
+        return "%s.%s (%s): %s%s" % (
+            self.__class__.__module__, self.__class__.__name__,
+            status_str,
+            spacer_str, val_str
+        )
+    
+    def __repr__(self):
+        val_str = pprint.pformat([self.items[x] for x in range(min(10, len(self.items)))] + (['...'] if len(self.items) > 10 else []))
+        if val_str.endswith("'...']"):
+            val_str = val_str[:-len("'...']")] + "...]"
+        spacer_str = '\n' if '\n' in val_str else ''
+        if self.error is None:
+            status_str = 'streaming'
+        elif isinstance(self.error, ReqlCursorEmpty):
+            status_str = 'done streaming'
+        else:
+            status_str = 'error: %s' % repr(self.error)
+        
+        return "<%s.%s object at %s (%s): %s%s>" % (
+            self.__class__.__module__, self.__class__.__name__,
+            hex(id(self)),
+            status_str,
+            spacer_str, val_str
+        )
 
     def _error(self, message):
         # Set an error and extend with a dummy response to trigger any waiters
         if self.error is None:
-            self.error = RqlRuntimeError(message, self.query.term, [])
-            dummy_response = Response(self.query.token,
-                '{"t":%d,"r":[]}' % pResponse.SUCCESS_SEQUENCE)
+            self.error = ReqlRuntimeError(message, self.query.term, [])
+            dummy_response = '{"t":%d,"r":[]}' % pResponse.SUCCESS_SEQUENCE
             self._extend(dummy_response)
 
     def _maybe_fetch_batch(self):
         if self.error is None and \
-           len(self.items) <= self.threshold and \
+           len(self.items) < self.threshold and \
            self.outstanding_requests == 0:
             self.outstanding_requests += 1
             self.conn._parent._continue(self)
 
 
-class DefaultCursorEmpty(RqlCursorEmpty, StopIteration):
-    def __init__(self, term):
-        RqlCursorEmpty.__init__(self, term)
+class DefaultCursorEmpty(ReqlCursorEmpty, StopIteration):
+    def __init__(self):
+        super(DefaultCursorEmpty, self).__init__()
 
 
 class DefaultCursor(Cursor):
@@ -234,7 +253,7 @@ class DefaultCursor(Cursor):
         return self._get_next(None)
 
     def _empty_error(self):
-        return DefaultCursorEmpty(self.query.term)
+        return DefaultCursorEmpty()
 
     def _get_next(self, timeout):
         deadline = None if timeout is None else time.time() + timeout
@@ -242,8 +261,8 @@ class DefaultCursor(Cursor):
             self._maybe_fetch_batch()
             if self.error is not None:
                 raise self.error
-            self.conn._read_response(self.query.token, deadline)
-        return convert_pseudo(self.items.pop(0), self.query)
+            self.conn._read_response(self.query, deadline)
+        return self.items.popleft()
 
 
 class SocketWrapper(object):
@@ -257,59 +276,79 @@ class SocketWrapper(object):
         deadline = time.time() + timeout
 
         try:
-            self._socket = \
-                socket.create_connection((self.host, self.port), timeout)
+            self._socket = socket.create_connection((self.host, self.port), timeout)
             self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
             if len(self.ssl) > 0:
-                ssl_context = self._get_ssl_context(self.ssl["ca_certs"])
                 try:
-                    self._socket = ssl_context.wrap_socket(self._socket,
-                                                           server_hostname=self.host)
-                except IOError as exc:
+                    if hasattr(ssl, 'SSLContext'): # Python2.7 and 3.2+, or backports.ssl
+                        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                        if hasattr(ssl_context, "options"):
+                            ssl_context.options |= getattr(ssl, "OP_NO_SSLv2", 0)
+                            ssl_context.options |= getattr(ssl, "OP_NO_SSLv3", 0)
+                        ssl_context.verify_mode = ssl.CERT_REQUIRED
+                        ssl_context.check_hostname = True # redundant with match_hostname
+                        ssl_context.load_verify_locations(self.ssl["ca_certs"])
+                        self._socket = ssl_context.wrap_socket(self._socket, server_hostname=self.host)
+                    else: # this does not disable SSLv2 or SSLv3
+                        self._socket = ssl.wrap_socket(
+                            self._socket, cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_SSLv23,
+                            ca_certs=self.ssl["ca_certs"])
+                except IOError as err:
                     self._socket.close()
-                    raise RqlDriverError("SSL handshake failed: %s" % (str(exc),))
+                    
+                    if 'EOF occurred in violation of protocol' in str(err) or 'sslv3 alert handshake failure' in str(err):
+                        # probably on an older version of OpenSSL
+                        raise ReqlDriverError("SSL handshake failed, likely because Python is linked against an old version of OpenSSL that does not support either TLSv1.2 or any of the allowed ciphers. This can be worked around by lowering the security setting on the server with the options `--tls-min-protocol TLSv1 --tls-ciphers EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH:AES256-SHA` (see server log for more information): %s" % str(err))
+                    else:
+                        raise ReqlDriverError("SSL handshake failed (see server log for more information): %s" % str(err))
                 try:
                     match_hostname(self._socket.getpeercert(), hostname=self.host)
                 except CertificateError:
                     self._socket.close()
                     raise
 
-            self.sendall(parent._parent.handshake)
-
-            # The response from the server is a null-terminated string
-            response = b''
+            parent._parent.handshake.reset()
+            response = None
             while True:
-                char = self.recvall(1, deadline)
-                if char == b'\0':
+                request = parent._parent.handshake.next_message(response)
+                if request is None:
                     break
-                response += char
-        except RqlDriverError as ex:
+                # This may happen in the `V1_0` protocol where we send two requests as
+                # an optimization, then need to read each separately
+                if request is not "":
+                    self.sendall(request)
+
+                # The response from the server is a null-terminated string
+                response = b''
+                while True:
+                    char = self.recvall(1, deadline)
+                    if char == b'\0':
+                        break
+                    response += char
+        except (ReqlAuthError, ReqlTimeoutError):
+            self.close()
+            raise
+        except ReqlDriverError as ex:
             self.close()
             error = str(ex)\
                 .replace('receiving from', 'during handshake with')\
                 .replace('sending to', 'during handshake with')
-            raise RqlDriverError(error)
+            raise ReqlDriverError(error)
         except socket.timeout as ex:
             self.close()
-            raise RqlTimeoutError()
+            raise ReqlTimeoutError(self.host, self.port)
         except Exception as ex:
             self.close()
-            raise RqlDriverError("Could not connect to %s:%s. Error: %s" %
-                                 (self.host, self.port, ex))
-
-        if response != b"SUCCESS":
-            self.close()
-            raise RqlDriverError(("Server dropped connection " +
-                                  "with message: \"%s\"") %
-                                 decodeUTF(response).strip())
+            raise ReqlDriverError("Could not connect to %s:%s. Error: %s" %
+                                  (self.host, self.port, str(ex)))
 
     def is_open(self):
         return self._socket is not None
 
     def close(self):
-        if self._socket is not None:
+        if self.is_open():
             try:
                 self._socket.shutdown(socket.SHUT_RDWR)
                 self._socket.close()
@@ -331,29 +370,29 @@ class SocketWrapper(object):
                 except socket.timeout:
                     self._read_buffer = res
                     self._socket.settimeout(None)
-                    raise RqlTimeoutError()
+                    raise ReqlTimeoutError(self.host, self.port)
                 except IOError as ex:
                     if ex.errno == errno.ECONNRESET:
                         self.close()
-                        raise RqlDriverError("Connection is closed.")
+                        raise ReqlDriverError("Connection is closed.")
                     elif ex.errno == errno.EWOULDBLOCK:
                         # This should only happen with a timeout of 0
-                        raise RqlTimeoutError()
+                        raise ReqlTimeoutError(self.host, self.port)
                     elif ex.errno != errno.EINTR:
                         self.close()
-                        raise RqlDriverError(('Connection interrupted ' +
+                        raise ReqlDriverError(('Connection interrupted ' +
                                               'receiving from %s:%s - %s') %
                                              (self.host, self.port, str(ex)))
                 except Exception as ex:
                     self.close()
-                    raise RqlDriverError('Error receiving from %s:%s - %s' %
+                    raise ReqlDriverError('Error receiving from %s:%s - %s' %
                                          (self.host, self.port, str(ex)))
                 except:
                     self.close()
                     raise
             if len(chunk) == 0:
                 self.close()
-                raise RqlDriverError("Connection is closed.")
+                raise ReqlDriverError("Connection is closed.")
             res += chunk
         return res
 
@@ -365,31 +404,19 @@ class SocketWrapper(object):
             except IOError as ex:
                 if ex.errno == errno.ECONNRESET:
                     self.close()
-                    raise RqlDriverError("Connection is closed.")
+                    raise ReqlDriverError("Connection is closed.")
                 elif ex.errno != errno.EINTR:
                     self.close()
-                    raise RqlDriverError(('Connection interrupted ' +
+                    raise ReqlDriverError(('Connection interrupted ' +
                                           'sending to %s:%s - %s') %
                                          (self.host, self.port, str(ex)))
             except Exception as ex:
                 self.close()
-                raise RqlDriverError('Error sending to %s:%s - %s' %
+                raise ReqlDriverError('Error sending to %s:%s - %s' %
                                      (self.host, self.port, str(ex)))
             except:
                 self.close()
                 raise
-
-    def _get_ssl_context(self, ca_certs):
-        ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-        if hasattr(ctx, "options"):
-            ctx.options |= getattr(ssl, "OP_NO_SSLv2", 0)
-            ctx.options |= getattr(ssl, "OP_NO_SSLv3", 0)
-
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.check_hostname = True
-        ctx.load_verify_locations(ca_certs)
-        return ctx
-
 
 class ConnectionInstance(object):
     def __init__(self, parent):
@@ -399,6 +426,14 @@ class ConnectionInstance(object):
         self._socket = None
         self._closing = False
 
+    def client_port(self):
+        if self.is_open():
+            return self._socket._socket.getsockname()[1]
+
+    def client_address(self):
+        if self.is_open():
+            return self._socket._socket.getsockname()[0]
+
     def connect(self, timeout):
         self._socket = SocketWrapper(self, timeout)
         return self._parent
@@ -406,7 +441,7 @@ class ConnectionInstance(object):
     def is_open(self):
         return self._socket.is_open()
 
-    def close(self, noreply_wait, token):
+    def close(self, noreply_wait=False, token=None):
         self._closing = True
 
         # Cursors may remove themselves when errored, so copy a list of them
@@ -423,26 +458,28 @@ class ConnectionInstance(object):
             self._header_in_progress = None
 
     def run_query(self, query, noreply):
-        self._socket.sendall(query.serialize())
+        self._socket.sendall(query.serialize(self._parent._get_json_encoder(query)))
         if noreply:
             return None
 
         # Get response
-        res = self._read_response(query.token)
+        res = self._read_response(query)
 
         if res.type == pResponse.SUCCESS_ATOM:
-            return maybe_profile(convert_pseudo(res.data[0], query), res)
+            return maybe_profile(res.data[0], res)
         elif res.type in (pResponse.SUCCESS_PARTIAL,
                           pResponse.SUCCESS_SEQUENCE):
-            cursor = DefaultCursor(self, query)
-            cursor._extend(res)
+            cursor = DefaultCursor(self, query, res)
             return maybe_profile(cursor, res)
         elif res.type == pResponse.WAIT_COMPLETE:
             return None
+        elif res.type == pResponse.SERVER_INFO:
+            return res.data[0]
         else:
             raise res.make_error(query)
 
-    def _read_response(self, token, deadline=None):
+    def _read_response(self, query, deadline=None):
+        token = query.token
         # We may get an async continue result, in which case we save
         # it and read the next response
         while True:
@@ -463,37 +500,38 @@ class ConnectionInstance(object):
                 self._parent.reconnect(noreply_wait=False)
                 raise ex
 
-            # Construct response
-            res = Response(res_token, res_buf)
+            res = None
 
-            cursor = self._cursor_cache.get(res.token)
+            cursor = self._cursor_cache.get(res_token)
             if cursor is not None:
-                self._handle_cursor_response(cursor, res)
-
-            if res.token == token:
-                return res
-            elif not self._closing and cursor is None:
+                # Construct response
+                cursor._extend(res_buf)
+                if res_token == token:
+                    return res
+            elif res_token == token:
+                return Response(
+                    res_token, res_buf,
+                    self._parent._get_json_decoder(query))
+            elif not self._closing:
                 # This response is corrupted or not intended for us
-                self.close(False, None)
-                raise RqlDriverError("Unexpected response received.")
-
-    def _handle_cursor_response(self, cursor, res):
-        cursor._extend(res)
+                self.close()
+                raise ReqlDriverError("Unexpected response received.")
 
 
 class Connection(object):
     _r = None
+    _json_decoder = ReQLDecoder
+    _json_encoder = ReQLEncoder
 
-    def __init__(self, conn_type, host, port, db, auth_key, timeout, ssl, **kwargs):
+    def __init__(self, conn_type, host, port, db, auth_key, user, password, timeout, ssl, _handshake_version, **kwargs):
         self.db = db
-        self.auth_key = auth_key.encode('ascii')
-        self.handshake = \
-            struct.pack("<2L", p.VersionDummy.Version.V0_4, len(self.auth_key)) + \
-            self.auth_key + \
-            struct.pack("<L", p.VersionDummy.Protocol.JSON)
 
         self.host = host
-        self.port = port
+        try:
+            self.port = int(port)
+        except ValueError:
+            raise ReqlDriverError("Could not convert port %r to an integer." % port)
+
         self.connect_timeout = timeout
 
         self.ssl = ssl
@@ -503,18 +541,40 @@ class Connection(object):
         self._instance = None
         self._next_token = 0
 
+        if 'json_encoder' in kwargs:
+            self._json_encoder = kwargs.pop('json_encoder')
+        if 'json_decoder' in kwargs:
+            self._json_decoder = kwargs.pop('json_decoder')
+
+        if auth_key is None and password is None:
+            auth_key = password = ''
+        elif auth_key is None and password is not None:
+            auth_key = password
+        elif auth_key is not None and password is None:
+            password = auth_key
+        else:
+            # auth_key is not None and password is not None
+            raise ReqlDriverError("`auth_key` and `password` are both set.")
+
+        if _handshake_version == 4:
+            self.handshake = HandshakeV0_4(self.host, self.port, auth_key)
+        else:
+            self.handshake = HandshakeV1_0(
+                self._json_decoder(), self._json_encoder(), self.host, self.port, user, password)
+
+    def client_port(self):
+        if self.is_open():
+            return self._instance.client_port()
+
+    def client_address(self):
+        if self.is_open():
+            return self._instance.client_address()
+
     def reconnect(self, noreply_wait=True, timeout=None):
         if timeout is None:
             timeout = self.connect_timeout
 
         self.close(noreply_wait)
-
-        # Do this here rather than in the constructor so that we don't throw
-        # in the constructor (which doesn't play well with Tornado)
-        try:
-            self.port = int(self.port)
-        except ValueError:
-            raise RqlDriverError("Could not convert port %s to an integer." % self.port)
 
         self._instance = self._conn_type(self, **self._child_kwargs)
         return self._instance.connect(timeout)
@@ -540,7 +600,7 @@ class Connection(object):
 
     def check_open(self):
         if self._instance is None or not self._instance.is_open():
-            raise RqlDriverError('Connection is closed.')
+            raise ReqlDriverError('Connection is closed.')
 
     def close(self, noreply_wait=True):
         if self._instance is not None:
@@ -553,6 +613,11 @@ class Connection(object):
     def noreply_wait(self):
         self.check_open()
         q = Query(pQuery.NOREPLY_WAIT, self._new_token(), None, None)
+        return self._instance.run_query(q, False)
+
+    def server(self):
+        self.check_open()
+        q = Query(pQuery.SERVER_INFO, self._new_token(), None, None)
         return self._instance.run_query(q, False)
 
     def _new_token(self):
@@ -577,19 +642,53 @@ class Connection(object):
         q = Query(pQuery.STOP, cursor.query.token, None, None)
         return self._instance.run_query(q, True)
 
+    def _get_json_decoder(self, query):
+        return (query._json_decoder or self._json_decoder)(query.global_optargs)
+
+    def _get_json_encoder(self, query):
+        return (query._json_encoder or self._json_encoder)()
+
 class DefaultConnection(Connection):
     def __init__(self, *args, **kwargs):
         Connection.__init__(self, ConnectionInstance, *args, **kwargs)
 
-
 connection_type = DefaultConnection
 
-def connect(host='localhost', port=28015, db=None, auth_key="", timeout=20, ssl=dict(), **kwargs):
-    global connection_type
-    conn = connection_type(host, port, db, auth_key, timeout, ssl, **kwargs)
+def connect(host=None, port=None, db=None, auth_key=None, user=None, password=None, timeout=20, ssl=None, _handshake_version=10, **kwargs):
+    if host is None:
+        host = 'localhost'
+    if port is None:
+        port = DEFAULT_PORT
+    if user is None:
+        user = 'admin'
+    if timeout is None:
+        timeout = 20
+    if ssl is None:
+        ssl = dict()
+    if _handshake_version is None:
+        _handshake_version = 10
+
+    conn = connection_type(host, port, db, auth_key, user, password, timeout, ssl, _handshake_version, **kwargs)
     return conn.reconnect(timeout=timeout)
 
 def set_loop_type(library):
     global connection_type
-    mod = import_module('.net_%s' % library, package=__package__)
-    connection_type = mod.Connection
+    import pkg_resources
+    
+    # find module file
+    manager = pkg_resources.ResourceManager()
+    libPath = '%(library)s_net/net_%(library)s.py' % {'library':library}
+    if not manager.resource_exists(__name__, libPath):
+        raise ValueError('Unknown loop type: %r' % library)
+    
+    # load the module
+    modulePath = manager.resource_filename(__name__, libPath)
+    moduleName = 'net_%s' % library
+    moduleFile, pathName, desc = imp.find_module(moduleName, [os.path.dirname(modulePath)])
+    module = imp.load_module('rethinkdb.' + moduleName, moduleFile, pathName, desc)
+    
+    # set the connection type
+    connection_type = module.Connection
+    
+    # cleanup
+    manager.cleanup_resources()

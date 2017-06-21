@@ -15,6 +15,7 @@ bool reversed(sorting_t sorting) { return sorting == sorting_t::DESCENDING; }
 
 namespace ql {
 
+
 void debug_print(printf_buffer_t *buf, const rget_item_t &item) {
     buf->appendf("rget_item{key=");
     debug_print(buf, item.key);
@@ -25,15 +26,27 @@ void debug_print(printf_buffer_t *buf, const rget_item_t &item) {
     buf->appendf("}");
 }
 
+void debug_print(printf_buffer_t *buf, const keyed_stream_t &stream) {
+    buf->appendf("keyed_stream_t(");
+    debug_print(buf, stream.stream);
+    buf->appendf(", ");
+    debug_print(buf, stream.last_key);
+    buf->appendf(")");
+}
+
+void debug_print(printf_buffer_t *buf, const stream_t &stream) {
+    debug_print(buf, stream.substreams);
+}
+
 accumulator_t::accumulator_t() : finished(false) { }
 accumulator_t::~accumulator_t() { }
 void accumulator_t::mark_finished() { finished = true; }
 
-void accumulator_t::finish(result_t *out) {
+void accumulator_t::finish(continue_bool_t last_cb, result_t *out) {
     mark_finished();
     // We fill in the result if there have been no errors.
     if (boost::get<exc_t>(out) == NULL) {
-        finish_impl(out);
+        finish_impl(last_cb, out);
     }
 }
 
@@ -60,17 +73,24 @@ protected:
     explicit grouped_acc_t(T &&_default_val)
         : default_val(std::move(_default_val)) { }
     virtual ~grouped_acc_t() { }
+
+    virtual void finish_impl(continue_bool_t, result_t *out) {
+        *out = grouped_t<T>();
+        boost::get<grouped_t<T> >(*out).swap(acc);
+        guarantee(acc.size() == 0);
+    }
 private:
-    virtual continue_bool_t operator()(env_t *env,
-                                         groups_t *groups,
-                                         const store_key_t &key,
-                                         const datum_t &sindex_val) {
+    virtual continue_bool_t operator()(
+            env_t *env,
+            groups_t *groups,
+            const store_key_t &key,
+            const std::function<datum_t()> &lazy_sindex_val) {
         for (auto it = groups->begin(); it != groups->end(); ++it) {
             auto pair = acc.insert(std::make_pair(it->first, default_val));
             auto t_it = pair.first;
             bool keep = !pair.second;
             for (auto el = it->second.begin(); el != it->second.end(); ++el) {
-                keep |= accumulate(env, *el, &t_it->second, key, sindex_val);
+                keep |= accumulate(env, *el, &t_it->second, key, lazy_sindex_val);
             }
             if (!keep) {
                 acc.erase(t_it);
@@ -82,41 +102,28 @@ private:
                             const datum_t &el,
                             T *t,
                             const store_key_t &key,
-                            // sindex_val may be NULL
-                            const datum_t &sindex_val) = 0;
+                            const std::function<datum_t()> &lazy_sindex_val) = 0;
 
     virtual bool should_send_batch() = 0;
 
-    virtual void finish_impl(result_t *out) {
-        *out = grouped_t<T>();
-        boost::get<grouped_t<T> >(*out).swap(acc);
-        guarantee(acc.size() == 0);
-    }
-
-    virtual void unshard(env_t *env,
-                         const store_key_t &last_key,
-                         const std::vector<result_t *> &results) {
+    virtual void unshard(env_t *env, const std::vector<result_t *> &results) {
         guarantee(acc.size() == 0);
         std::map<datum_t, std::vector<T *>, optional_datum_less_t> vecs;
+        r_sanity_check(results.size() != 0);
         for (auto res = results.begin(); res != results.end(); ++res) {
             guarantee(*res);
             grouped_t<T> *gres = boost::get<grouped_t<T> >(*res);
             guarantee(gres);
-            // `gres`'s ordering doesn't affect things here because we're putting the
-            // values into a parallel map.
             for (auto kv = gres->begin(); kv != gres->end(); ++kv) {
                 vecs[kv->first].push_back(&kv->second);
             }
         }
         for (auto kv = vecs.begin(); kv != vecs.end(); ++kv) {
             auto t_it = acc.insert(std::make_pair(kv->first, default_val)).first;
-            unshard_impl(env, &t_it->second, last_key, kv->second);
+            unshard_impl(env, &t_it->second, kv->second);
         }
     }
-    virtual void unshard_impl(env_t *env,
-                              T *acc,
-                              const store_key_t &last_key,
-                              const std::vector<T *> &ts) = 0;
+    virtual void unshard_impl(env_t *env, T *acc, const std::vector<T *> &ts) = 0;
 
 protected:
     const T *get_default_val() { return &default_val; }
@@ -128,70 +135,87 @@ private:
 
 class append_t : public grouped_acc_t<stream_t> {
 public:
-    append_t(sorting_t _sorting, batcher_t *_batcher)
+    append_t(region_t region,
+             store_key_t last_key,
+             sorting_t _sorting,
+             require_sindexes_t _require_sindex_val,
+             batcher_t *_batcher)
+        : grouped_acc_t<stream_t>(
+            stream_t(std::move(region), std::move(last_key))),
+        sorting(_sorting),
+        key_le(sorting),
+        batcher(_batcher),
+        require_sindex_val(_require_sindex_val) { }
+    append_t() // Only use this for unsharding.
         : grouped_acc_t<stream_t>(stream_t()),
-          sorting(_sorting), key_le(sorting), batcher(_batcher) { }
+          sorting(sorting_t::UNORDERED), key_le(sorting), batcher(nullptr) { }
 protected:
     virtual bool should_send_batch() {
         return batcher != NULL && batcher->should_send_batch();
     }
+
+    void finish_impl(continue_bool_t last_cb, result_t *out) final {
+        // If we never aborted then we've read the whole range, so update the
+        // `keyed_stream_t`s to reflect that.
+        if (last_cb == continue_bool_t::CONTINUE) {
+            stop_at_boundary(!reversed(sorting)
+                             ? store_key_t::max()
+                             : store_key_t::min());
+        }
+        grouped_acc_t::finish_impl(last_cb, out);
+    }
+
+    void stop_at_boundary(store_key_t &&key) final {
+        for (auto &&pair : *get_acc()) {
+            for (auto &&stream_pair : pair.second.substreams) {
+                // We have to do it this way rather than using the end of
+                // the range in `stream_pair.first` because we might be
+                // sorting by an sindex.
+                stream_pair.second.last_key = std::move(key);
+            }
+        }
+    }
+
     virtual bool accumulate(env_t *,
                             const datum_t &el,
                             stream_t *stream,
                             const store_key_t &key,
-                            // sindex_val may be NULL
-                            const datum_t &sindex_val) {
+                            // Returns a datum that might be null
+                            const std::function<datum_t()> &lazy_sindex_val) {
         if (batcher) batcher->note_el(el);
         // We don't bother storing the sindex if we aren't sorting (this is
         // purely a performance optimization).
-        datum_t rget_sindex_val = (sorting == sorting_t::UNORDERED)
+        datum_t rget_sindex_val =
+            require_sindex_val != require_sindexes_t::YES &&
+            (sorting == sorting_t::UNORDERED)
             ? datum_t()
-            : sindex_val;
-        stream->push_back(rget_item_t(store_key_t(key), rget_sindex_val, el));
+            : lazy_sindex_val();
+        guarantee(stream->substreams.size() == 1);
+        auto *keyed_stream = &stream->substreams.begin()->second;
+        keyed_stream->stream.push_back(
+            rget_item_t(store_key_t(key), rget_sindex_val, el));
+        // Update the last considered key.
+        if ((keyed_stream->last_key < key && !reversed(sorting))
+            || (keyed_stream->last_key > key && reversed(sorting))) {
+            keyed_stream->last_key = key;
+        }
         return true;
     }
 
-    virtual datum_t unpack(stream_t *) {
+    datum_t unpack(stream_t *) {
         r_sanity_check(false); // We never unpack a stream.
         unreachable();
     }
 
-    virtual void unshard_impl(env_t *,
-                              stream_t *out,
-                              const store_key_t &last_key,
-                              const std::vector<stream_t *> &streams) {
-        uint64_t sz = 0;
-        for (auto it = streams.begin(); it != streams.end(); ++it) {
-            sz += (*it)->size();
-        }
-        out->reserve(sz);
-        if (sorting == sorting_t::UNORDERED) {
-            for (auto it = streams.begin(); it != streams.end(); ++it) {
-                for (auto item = (*it)->begin(); item != (*it)->end(); ++item) {
-                    if (key_le.is_le(item->key, last_key)) {
-                        out->push_back(std::move(*item));
-                    }
-                }
-            }
-        } else {
-            // We do a merge sort to preserve sorting.
-            std::vector<std::pair<stream_t::iterator, stream_t::iterator> > v;
-            v.reserve(streams.size());
-            for (auto it = streams.begin(); it != streams.end(); ++it) {
-                v.push_back(std::make_pair((*it)->begin(), (*it)->end()));
-            }
-            for (;;) {
-                stream_t::iterator *best = NULL;
-                for (auto it = v.begin(); it != v.end(); ++it) {
-                    if (it->first != it->second) {
-                        if (best == NULL || key_le.is_le(it->first->key, (*best)->key)) {
-                            best = &it->first;
-                        }
-                    }
-                }
-                if (best == NULL || !key_le.is_le((*best)->key, last_key)) break;
-                out->push_back(std::move(**best));
-                ++(*best);
+    void unshard_impl(env_t *,
+                      stream_t *out,
+                      const std::vector<stream_t *> &streams) final {
+        r_sanity_check(streams.size() > 0);
+        for (auto &&stream : streams) {
+            r_sanity_check(stream->substreams.size() > 0);
+            for (auto &&pair : stream->substreams) {
+                bool inserted = out->substreams.insert(pair).second;
+                guarantee(inserted);
             }
         }
     }
@@ -199,10 +223,20 @@ private:
     const sorting_t sorting;
     const key_le_t key_le;
     batcher_t *const batcher;
+    require_sindexes_t require_sindex_val;
 };
 
-scoped_ptr_t<accumulator_t> make_append(const sorting_t &sorting, batcher_t *batcher) {
-    return make_scoped<append_t>(sorting, batcher);
+scoped_ptr_t<accumulator_t> make_append(region_t region,
+                                        store_key_t last_key,
+                                        sorting_t sorting,
+                                        batcher_t *batcher,
+                                        require_sindexes_t require_sindex_val) {
+    return make_scoped<append_t>(
+        std::move(region), std::move(last_key), sorting, require_sindex_val, batcher);
+}
+
+scoped_ptr_t<accumulator_t> make_unsharding_append() {
+    return make_scoped<append_t>();
 }
 
 // This has to inherit from `eager_acc_t` so it can be produced in the terminal
@@ -213,9 +247,15 @@ public:
     limit_append_t(
         is_primary_t _is_primary,
         size_t _n,
-        sorting_t sorting,
+        region_t region,
+        store_key_t last_key,
+        sorting_t _sorting,
         std::vector<scoped_ptr_t<op_t> > *_ops)
-        : append_t(sorting, &batcher),
+        : append_t(region,
+                   last_key,
+                   _sorting,
+                   require_sindexes_t::NO,
+                   &batcher),
           is_primary(_is_primary),
           seen_distinct(false),
           seen(0),
@@ -226,7 +266,7 @@ private:
     virtual void operator()(env_t *, groups_t *) {
         guarantee(false); // Don't use this as an eager accumulator.
     }
-    virtual void add_res(env_t *, result_t *) {
+    virtual void add_res(env_t *, result_t *, sorting_t) {
         guarantee(false); // Don't use this as an eager accumulator.
     }
     virtual scoped_ptr_t<val_t> finish_eager(
@@ -242,18 +282,23 @@ private:
                             const datum_t &el,
                             stream_t *stream,
                             const store_key_t &key,
-                            // sindex_val may be NULL
-                            const datum_t &sindex_val) {
+                            // Returns a datum that might be null
+                            const std::function<datum_t()> &lazy_sindex_val) {
         bool ret;
         size_t seen_this_time = 0;
         {
             stream_t substream;
-            ret = append_t::accumulate(env, el, &substream, key, sindex_val);
-            for (auto &&item : substream) {
-                if (boost::optional<datum_t> d
+            guarantee(stream->substreams.size() == 1);
+            substream.substreams.insert(
+                std::make_pair(stream->substreams.begin()->first, keyed_stream_t()));
+            ret = append_t::accumulate(env, el, &substream, key, lazy_sindex_val);
+            for (auto &&item : substream.substreams.begin()->second.stream) {
+                if (optional<datum_t> d
                     = ql::changefeed::apply_ops(item.data, *ops, env, item.sindex_key)) {
                     item.data = *d;
-                    stream->push_back(std::move(item));
+                    guarantee(stream->substreams.size() == 1);
+                    stream->substreams.begin()->second.stream.push_back(
+                        std::move(item));
                     seen_this_time += 1;
                 }
             }
@@ -265,23 +310,30 @@ private:
                     seen_distinct = true;
                 }
             } else {
-                guarantee(stream->size() > 0);
-                rget_item_t *last = &stream->back();
+                guarantee(stream->substreams.size() == 1);
+                raw_stream_t *raw_stream = &stream->substreams.begin()->second.stream;
+                guarantee(raw_stream->size() > 0);
+                rget_item_t *last = &raw_stream->back();
                 if (start_sindex) {
                     std::string cur =
                         datum_t::extract_secondary(key_to_unescaped_str(last->key));
-                    // We need to do this because the truncated sindex keys might be
-                    // different sizes depending on the length of the primary key.
-                    // (Also, I hate literally everything about our on-disk key format.)
-                    size_t minlen = std::min(cur.size(), (*start_sindex).size());
-                    if (cur.compare(0, minlen, *start_sindex, 0, minlen) != 0) {
+                    size_t minlen = ql::datum_t::max_trunc_size();
+                    if (cur.size() < minlen
+                        || cur.compare(0, minlen, *start_sindex, 0, minlen) != 0) {
                         seen_distinct = true;
                     }
                 } else {
                     if (seen >= n) {
-                        if (datum_t::key_is_truncated(last->key)) {
-                            start_sindex = datum_t::extract_secondary(
-                                key_to_unescaped_str(last->key));
+                        std::string cur = ql::datum_t::extract_secondary(
+                            key_to_unescaped_str(last->key));
+                        // If the sindex portion of the key is long enough that
+                        // it might be >= the length of a truncated sindex, we
+                        // need to rember the key so we can make sure not to
+                        // stop in the middle of a sindex range where some of
+                        // the values are out of order because of truncation.
+                        bool remember_key = (cur.size() >= ql::datum_t::max_trunc_size());
+                        if (remember_key) {
+                            start_sindex.set(std::move(cur));
                         } else {
                             seen_distinct = true;
                         }
@@ -291,7 +343,7 @@ private:
         }
         return ret;
     }
-    boost::optional<std::string> start_sindex;
+    optional<std::string> start_sindex;
     is_primary_t is_primary;
     bool seen_distinct;
     size_t seen, n;
@@ -327,8 +379,8 @@ private:
             } else {
                 rcheck_toplevel(
                     size <= env->limits().array_size_limit(), base_exc_t::RESOURCE,
-                    strprintf("Array over size limit `%zu`.",
-                              env->limits().array_size_limit()).c_str());
+                    format_array_size_error(env->limits()
+                              .array_size_limit()).c_str());
             }
             lst1->reserve(lst1->size() + lst2->size());
             std::move(lst2->begin(), lst2->end(), std::back_inserter(*lst1));
@@ -336,7 +388,7 @@ private:
         gs->clear();
     }
 
-    virtual void add_res(env_t *env, result_t *res) {
+    virtual void add_res(env_t *env, result_t *res, sorting_t sorting) {
         grouped_t<stream_t> *streams = boost::get<grouped_t<stream_t> >(res);
         r_sanity_check(streams);
 
@@ -345,7 +397,9 @@ private:
         for (auto kv = streams->begin(); kv != streams->end(); ++kv) {
             datums_t *lst = &groups[kv->first];
             stream_t *stream = &kv->second;
-            size += stream->size();
+            for (auto &&pair : stream->substreams) {
+                size += pair.second.stream.size();
+            }
             if (is_grouped_data(streams, kv->first)) {
                 rcheck_toplevel(
                     size <= env->limits().array_size_limit(), base_exc_t::RESOURCE,
@@ -355,12 +409,71 @@ private:
             } else {
                 rcheck_toplevel(
                     size <= env->limits().array_size_limit(), base_exc_t::RESOURCE,
-                    strprintf("Array over size limit `%zu`.",
-                              env->limits().array_size_limit()).c_str());
+                          format_array_size_error(env->limits()
+                              .array_size_limit()).c_str());
             }
 
-            for (auto it = stream->begin(); it != stream->end(); ++it) {
-                lst->push_back(std::move(it->data));
+            // It's safe to YOLO unshard like this without considering
+            // `last_key` because whoever is using `to_array` should be calling
+            // `accumulate_all`.
+            if (sorting != sorting_t::UNORDERED) {
+                // We first initialize `is_sindex_sort` to `false` and then reset it to
+                // `none` because GCC 4.8 hates us and keeps thinking that
+                // `*is_sindex_sort` is uninitialized even after checking
+                // `is_sindex_sort` to not be none.
+                optional<bool> is_sindex_sort(false);
+                is_sindex_sort = r_nullopt;
+                std::vector<std::pair<raw_stream_t::iterator,
+                                      raw_stream_t::iterator> > v;
+                v.reserve(stream->substreams.size());
+                for (auto &&pair : stream->substreams) {
+                    if (pair.second.stream.size() > 0) {
+                        bool is_sindex = pair.second.stream[0].sindex_key.get_type()
+                            != datum_t::UNINITIALIZED;
+                        if (is_sindex) {
+                            std::stable_sort(pair.second.stream.begin(),
+                                             pair.second.stream.end(),
+                                             sindex_compare_t(sorting));
+                        }
+                        if (is_sindex_sort) {
+                            r_sanity_check(*is_sindex_sort == is_sindex);
+                        } else {
+                            is_sindex_sort.set(is_sindex);
+                        }
+                    }
+                    r_sanity_check(pair.second.last_key == store_key_max
+                                   || pair.second.last_key == store_key_min);
+                    v.push_back(std::make_pair(pair.second.stream.begin(),
+                                               pair.second.stream.end()));
+                }
+                for (;;) {
+                    raw_stream_t::iterator *best = nullptr;
+                    for (auto &&pair : v) {
+                        if (pair.first != pair.second) {
+                            r_sanity_check(is_sindex_sort);
+                            if ((best == nullptr)
+                                || (*is_sindex_sort
+                                    ? is_better(pair.first->sindex_key,
+                                                (*best)->sindex_key,
+                                                sorting)
+                                    : is_better(pair.first->key,
+                                                (*best)->key,
+                                                sorting))) {
+                                best = &pair.first;
+                            }
+                        }
+                    }
+                    if (best == nullptr) break;
+                    lst->push_back(std::move(((*best)++)->data));
+                }
+            } else {
+                for (auto &&pair : stream->substreams) {
+                    r_sanity_check(pair.second.last_key == store_key_max
+                                   || pair.second.last_key == store_key_min);
+                    for (auto &&val : pair.second.stream) {
+                        lst->push_back(std::move(val.data));
+                    }
+                }
             }
         }
     }
@@ -399,17 +512,17 @@ protected:
     explicit terminal_t(T &&t) : grouped_acc_t<T>(std::move(t)) { }
 private:
     virtual void operator()(env_t *env, groups_t *groups) {
-        grouped_t<T> *acc = grouped_acc_t<T>::get_acc();
-        const T *default_val = grouped_acc_t<T>::get_default_val();
+        grouped_t<T> *_acc = grouped_acc_t<T>::get_acc();
+        const T *_default_val = grouped_acc_t<T>::get_default_val();
         for (auto it = groups->begin(); it != groups->end(); ++it) {
-            auto pair = acc->insert(std::make_pair(it->first, *default_val));
+            auto pair = _acc->insert(std::make_pair(it->first, *_default_val));
             auto t_it = pair.first;
             bool keep = !pair.second;
             for (auto el = it->second.begin(); el != it->second.end(); ++el) {
                 keep |= accumulate(env, *el, &t_it->second);
             }
             if (!keep) {
-                acc->erase(t_it);
+                _acc->erase(t_it);
             }
         }
         groups->clear();
@@ -419,46 +532,46 @@ private:
                                              bool is_grouped,
                                              UNUSED const configured_limits_t &limits) {
         accumulator_t::mark_finished();
-        grouped_t<T> *acc = grouped_acc_t<T>::get_acc();
-        const T *default_val = grouped_acc_t<T>::get_default_val();
+        grouped_t<T> *_acc = grouped_acc_t<T>::get_acc();
+        const T *_default_val = grouped_acc_t<T>::get_default_val();
         scoped_ptr_t<val_t> retval;
         if (is_grouped) {
             counted_t<grouped_data_t> ret(new grouped_data_t());
             // The order of `acc` doesn't matter here because we're putting stuff
             // into the parallel map, `ret`.
-            for (auto kv = acc->begin(); kv != acc->end(); ++kv) {
+            for (auto kv = _acc->begin(); kv != _acc->end(); ++kv) {
                 ret->insert(std::make_pair(kv->first, unpack(&kv->second)));
             }
             retval = make_scoped<val_t>(std::move(ret), bt);
-        } else if (acc->size() == 0) {
-            T t(*default_val);
+        } else if (_acc->size() == 0) {
+            T t(*_default_val);
             retval = make_scoped<val_t>(unpack(&t), bt);
         } else {
             // Order doesnt' matter here because the size is 1.
-            r_sanity_check(acc->size() == 1 && !acc->begin()->first.has());
-            retval = make_scoped<val_t>(unpack(&acc->begin()->second), bt);
+            r_sanity_check(_acc->size() == 1 && !_acc->begin()->first.has());
+            retval = make_scoped<val_t>(unpack(&_acc->begin()->second), bt);
         }
-        acc->clear();
+        _acc->clear();
         return retval;
     }
     virtual datum_t unpack(T *t) = 0;
 
-    virtual void add_res(env_t *env, result_t *res) {
-        grouped_t<T> *acc = grouped_acc_t<T>::get_acc();
-        const T *default_val = grouped_acc_t<T>::get_default_val();
+    virtual void add_res(env_t *env, result_t *res, sorting_t) {
+        grouped_t<T> *_acc = grouped_acc_t<T>::get_acc();
+        const T *_default_val = grouped_acc_t<T>::get_default_val();
         if (auto e = boost::get<exc_t>(res)) {
             throw *e;
         }
         grouped_t<T> *gres = boost::get<grouped_t<T> >(res);
         r_sanity_check(gres);
-        if (acc->size() == 0) {
-            acc->swap(*gres);
+        if (_acc->size() == 0) {
+            _acc->swap(*gres);
         } else {
             // Order in fact does NOT matter here.  The reason is, each `kv->first`
             // value is different, which means each operation works on a different
             // key/value pair of `acc`.
             for (auto kv = gres->begin(); kv != gres->end(); ++kv) {
-                auto t_it = acc->insert(std::make_pair(kv->first, *default_val)).first;
+                auto t_it = _acc->insert(std::make_pair(kv->first, *_default_val)).first;
                 unshard_impl(env, &t_it->second, &kv->second);
             }
         }
@@ -468,14 +581,15 @@ private:
                             const datum_t &el,
                             T *t,
                             const store_key_t &,
-                            const datum_t &) {
+                            const std::function<datum_t()> &) {
         return accumulate(env, el, t);
     }
     virtual bool accumulate(env_t *env,
                             const datum_t &el,
                             T *t) = 0;
 
-    virtual void unshard_impl(env_t *env, T *out, const store_key_t &, const std::vector<T *> &ts) {
+    virtual void unshard_impl(
+        env_t *env, T *out, const std::vector<T *> &ts) {
         for (auto it = ts.begin(); it != ts.end(); ++it) {
             unshard_impl(env, out, *it);
         }
@@ -550,14 +664,14 @@ private:
 
 class sum_terminal_t : public skip_terminal_t<double> {
 public:
-    explicit sum_terminal_t(const sum_wire_func_t &f)
-        : skip_terminal_t<double>(f, 0.0L) { }
+    explicit sum_terminal_t(const sum_wire_func_t &_f)
+        : skip_terminal_t<double>(_f, 0.0L) { }
 private:
     virtual void maybe_acc(env_t *env,
                            const datum_t &el,
                            double *out,
-                           const acc_func_t &f) {
-        *out += f(env, el).as_num();
+                           const acc_func_t &_f) {
+        *out += _f(env, el).as_num();
     }
     virtual datum_t unpack(double *d) {
         return datum_t(*d);
@@ -569,15 +683,15 @@ private:
 
 class avg_terminal_t : public skip_terminal_t<std::pair<double, uint64_t> > {
 public:
-    explicit avg_terminal_t(const avg_wire_func_t &f)
+    explicit avg_terminal_t(const avg_wire_func_t &_f)
         : skip_terminal_t<std::pair<double, uint64_t> >(
-            f, std::make_pair(0.0L, 0ULL)) { }
+            _f, std::make_pair(0.0L, 0ULL)) { }
 private:
     virtual void maybe_acc(env_t *env,
                            const datum_t &el,
                            std::pair<double, uint64_t> *out,
-                           const acc_func_t &f) {
-        out->first += f(env, el).as_num();
+                           const acc_func_t &_f) {
+        out->first += _f(env, el).as_num();
         out->second += 1;
     }
     virtual datum_t unpack(
@@ -636,18 +750,18 @@ bool datum_gt(const datum_t &val1, const datum_t &val2) {
 
 class optimizing_terminal_t : public skip_terminal_t<optimizer_t> {
 public:
-    optimizing_terminal_t(const skip_wire_func_t &f,
+    optimizing_terminal_t(const skip_wire_func_t &_f,
                           const char *_name,
                           bool (*_cmp)(const datum_t &val1, const datum_t &val2))
-        : skip_terminal_t<optimizer_t>(f, optimizer_t()),
+        : skip_terminal_t<optimizer_t>(_f, optimizer_t()),
           name(_name),
           cmp(_cmp) { }
 private:
     virtual void maybe_acc(env_t *env,
                            const datum_t &el,
                            optimizer_t *out,
-                           const acc_func_t &f) {
-        optimizer_t other(el, f(env, el));
+                           const acc_func_t &_f) {
+        optimizer_t other(el, _f(env, el));
         out->swap_if_other_better(&other, cmp);
     }
     virtual datum_t unpack(optimizer_t *el) {
@@ -715,7 +829,12 @@ public:
     }
     T *operator()(const limit_read_t &lr) const {
         return new limit_append_t(
-            lr.is_primary, lr.n, lr.sorting, lr.ops);
+            lr.is_primary,
+            lr.n,
+            lr.shard,
+            lr.last_key,
+            lr.sorting,
+            lr.ops);
     }
 };
 
@@ -733,9 +852,9 @@ class ungrouped_op_t : public op_t {
 protected:
 private:
     virtual void operator()(
-        env_t *env, groups_t *groups, const datum_t &sindex_val) {
+        env_t *env, groups_t *groups, const std::function<datum_t()> &lazy_sindex_val) {
         for (auto it = groups->begin(); it != groups->end();) {
-            lst_transform(env, &it->second, sindex_val);
+            lst_transform(env, &it->second, lazy_sindex_val);
             if (it->second.size() == 0) {
                 groups->erase(it++); // This is important for batching with filter.
             } else {
@@ -743,9 +862,9 @@ private:
             }
         }
     }
-    // sindex_val may be NULL.
+    // `lazy_sindex_val` returns a datum that might be null
     virtual void lst_transform(
-        env_t *env, datums_t *lst, const datum_t &sindex_val) = 0;
+        env_t *env, datums_t *lst, const std::function<datum_t()> &lazy_sindex_val) = 0;
 };
 
 class group_trans_t : public op_t {
@@ -760,7 +879,7 @@ public:
 private:
     virtual void operator()(env_t *env,
                             groups_t *groups,
-                            const datum_t &sindex_val) {
+                            const std::function<datum_t()> &lazy_sindex_val) {
         if (groups->size() == 0) return;
         r_sanity_check(groups->size() == 1 && !groups->begin()->first.has());
         datums_t *ds = &groups->begin()->second;
@@ -783,6 +902,7 @@ private:
                 }
             }
             if (append_index) {
+                datum_t sindex_val = lazy_sindex_val();
                 r_sanity_check(sindex_val.has());
                 arr.push_back(sindex_val);
             }
@@ -866,7 +986,7 @@ public:
         : f(_f.compile_wire_func()) { }
 private:
     virtual void lst_transform(
-        env_t *env, datums_t *lst, const datum_t &) {
+        env_t *env, datums_t *lst, const std::function<datum_t()> &) {
         try {
             for (auto it = lst->begin(); it != lst->end(); ++it) {
                 *it = f->call(env, *it)->as_datum();
@@ -888,11 +1008,12 @@ public:
 private:
     // sindex_val may be NULL
     virtual void lst_transform(
-        env_t *, datums_t *lst, const datum_t &sindex_val) {
+        env_t *, datums_t *lst, const std::function<datum_t()> &lazy_sindex_val) {
         auto it = lst->begin();
         auto loc = it;
         for (; it != lst->end(); ++it) {
             if (use_index) {
+                datum_t sindex_val = lazy_sindex_val();
                 r_sanity_check(sindex_val.has());
                 *it = sindex_val;
             }
@@ -913,12 +1034,12 @@ class filter_trans_t : public ungrouped_op_t {
 public:
     explicit filter_trans_t(const filter_wire_func_t &_f)
         : f(_f.filter_func.compile_wire_func()),
-          default_val(_f.default_filter_val
+          default_val(_f.default_filter_val.has_value()
                       ? _f.default_filter_val->compile_wire_func()
                       : counted_t<const func_t>()) { }
 private:
     virtual void lst_transform(
-        env_t *env, datums_t *lst, const datum_t &) {
+        env_t *env, datums_t *lst, const std::function<datum_t()> &) {
         auto it = lst->begin();
         auto loc = it;
         try {
@@ -942,7 +1063,7 @@ public:
         : f(_f.compile_wire_func()) { }
 private:
     virtual void lst_transform(
-        env_t *env, datums_t *lst, const datum_t &) {
+        env_t *env, datums_t *lst, const std::function<datum_t()> &) {
         datums_t new_lst;
         batchspec_t bs = batchspec_t::user(batch_type_t::TERMINAL, env);
         profile::sampler_t sampler("Evaluating CONCAT_MAP elements.", env->trace);
@@ -970,7 +1091,7 @@ public:
     explicit zip_trans_t(const zip_wire_func_t &) {}
 private:
     virtual void lst_transform(env_t *, datums_t *lst,
-                               const datum_t &) {
+                               const std::function<datum_t()> &) {
         for (auto it = lst->begin(); it != lst->end(); ++it) {
             auto left = (*it).get_field("left", NOTHROW);
             auto right = (*it).get_field("right", NOTHROW);
@@ -1009,6 +1130,8 @@ scoped_ptr_t<op_t> make_op(const transform_variant_t &tv) {
 }
 
 RDB_IMPL_SERIALIZABLE_3_FOR_CLUSTER(rget_item_t, key, sindex_key, data);
+RDB_IMPL_SERIALIZABLE_2_FOR_CLUSTER(keyed_stream_t, stream, last_key);
+RDB_IMPL_SERIALIZABLE_1_FOR_CLUSTER(stream_t, substreams);
 
 ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(
         sorting_t, int8_t,

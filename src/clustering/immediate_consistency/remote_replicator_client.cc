@@ -158,6 +158,7 @@ remote_replicator_client_t::remote_replicator_client_t(
     store_(store),
     region_(store->get_region()),
     branch_id_(branch_id),
+    mode_(backfill_mode_t::PAUSED),
 
     next_write_waiter_(nullptr),
 
@@ -257,7 +258,7 @@ remote_replicator_client_t::remote_replicator_client_t(
         backfill. */
         {
             cond_t backfiller_is_up_to_date;
-            mailbox_t<void()> ack_mbox(
+            mailbox_t<> ack_mbox(
                 mailbox_manager,
                 [&](signal_t *) { backfiller_is_up_to_date.pulse(); });
             send(mailbox_manager, replica_bcard.synchronize_mailbox,
@@ -282,9 +283,11 @@ remote_replicator_client_t::remote_replicator_client_t(
                         parent->next_write_waiter_->pulse_if_not_already_pulsed();
                     }
                 }
-                /* If the backfill throttler is telling us to pause, then interrupt
+                /* If the backfill throttler is telling us to pause, or it is no longer
+                 ok to backfill because of secondary index construction, then interrupt
                 `backfillee.go()` */
-                return !preempt_signal->is_pulsed();
+                return parent->store_->check_ok_to_receive_backfill()
+                    && !preempt_signal->is_pulsed();
             }
             remote_replicator_client_t *parent;
             signal_t *preempt_signal;
@@ -296,7 +299,6 @@ remote_replicator_client_t::remote_replicator_client_t(
             interruptor);
 
         if (tracker_->get_backfill_threshold() != region_.inner.right) {
-            guarantee(backfill_throttler_lock.get_preempt_signal()->is_pulsed());
             /* Switch mode to `PAUSED` so that writes can proceed while we wait to
             reacquire the throttler lock */
             mutex_assertion_t::acq_t mutex_assertion_acq(&mutex_assertion_);
@@ -321,7 +323,6 @@ remote_replicator_client_t::remote_replicator_client_t(
         guarantee(tracker_->is_homogeneous());
         guarantee(tracker_->get_prev_timestamp() ==
             timestamp_enforcer_->get_latest_all_before_completed());
-        tracker_.reset();   /* we don't need `tracker_` anymore */
 
 #ifndef NDEBUG
         /* Sanity check that the store's metainfo is all on the correct branch and
@@ -346,6 +347,7 @@ remote_replicator_client_t::remote_replicator_client_t(
         replica_.init(new replica_t(mailbox_manager_, store_, branch_history_manager,
             branch_id, timestamp_enforcer_->get_latest_all_before_completed()));
 
+        tracker_.reset();   /* we don't need `tracker_` anymore */
         mode_ = backfill_mode_t::STREAMING;
 
         if (next_write_waiter_ != nullptr) {
@@ -369,7 +371,7 @@ void remote_replicator_client_t::on_write_async(
         write_t &&write,
         state_timestamp_t timestamp,
         order_token_t order_token,
-        const mailbox_t<void()>::address_t &ack_addr)
+        const mailbox_t<>::address_t &ack_addr)
         THROWS_ONLY(interrupted_exc_t) {
     wait_interruptible(&registered_, interruptor);
 
@@ -450,7 +452,7 @@ void remote_replicator_client_t::on_write_sync(
         state_timestamp_t timestamp,
         order_token_t order_token,
         write_durability_t durability,
-        const mailbox_t<void(write_response_t)>::address_t &ack_addr)
+        const mailbox_t<write_response_t>::address_t &ack_addr)
         THROWS_ONLY(interrupted_exc_t) {
     /* The current implementation of the dispatcher will never send us an async write
     once it's started sending sync writes, but we don't want to rely on that detail, so
@@ -466,7 +468,7 @@ void remote_replicator_client_t::on_write_sync(
 
 void remote_replicator_client_t::on_dummy_write(
         signal_t *interruptor,
-        const mailbox_t<void(write_response_t)>::address_t &ack_addr)
+        const mailbox_t<write_response_t>::address_t &ack_addr)
         THROWS_ONLY(interrupted_exc_t) {
     write_response_t response;
     replica_->do_dummy_write(interruptor, &response);
@@ -477,7 +479,7 @@ void remote_replicator_client_t::on_read(
         signal_t *interruptor,
         const read_t &read,
         state_timestamp_t min_timestamp,
-        const mailbox_t<void(read_response_t)>::address_t &ack_addr)
+        const mailbox_t<read_response_t>::address_t &ack_addr)
         THROWS_ONLY(interrupted_exc_t) {
     read_response_t response;
     replica_->do_read(read, min_timestamp, interruptor, &response);

@@ -6,7 +6,7 @@
 
 class buf_parent_t;
 
-enum class continue_bool_t { CONTINUE, ABORT };
+enum class continue_bool_t { CONTINUE = 0, ABORT = 1 };
 
 class value_deleter_t {
 public:
@@ -20,5 +20,7 @@ protected:
 };
 
 enum class release_superblock_t {RELEASE, KEEP};
+
+enum class is_stamp_read_t { NO, YES };
 
 #endif /* BTREE_TYPES_HPP_ */

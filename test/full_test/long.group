@@ -9,7 +9,6 @@ error_tolerant.change-primary
 error_tolerant.kill-secondary
 error_tolerant.more-or-less
 error_tolerant.rebalance
-interface.progress
 regression.676
 split_workloads.add-secondary-multi-serial-mix
 split_workloads.change-primary-multi-serial-mix
@@ -24,4 +23,4 @@ split_workloads.rebalance-multi-serial-mix
 split_workloads.remove-secondary-multi-serial-mix
 split_workloads.transfer-multi-serial-mix
 static_cluster.rget-huge
-unit.JSON
+static_cluster.rget-huge-proxy

@@ -1008,7 +1008,7 @@ TODO: retire this
                     margin: 0;
                     font-family: @sans;
                 }
-                .name, .quick_info, .status {
+                .name, .quick_info, .status, .explore {
                     @offset: 8px;
                     padding: 0 @offset * 2;
                     border-left: thin solid #e4e4e4;
@@ -1033,6 +1033,14 @@ TODO: retire this
                     text-overflow: ellipsis;
                     .flex-grow(2);
                 }
+                .explore {
+                  border-left: none;
+
+                  .btn {
+                    opacity: 0;
+                    .transition(~"0.1s opacity ease-out");
+                  }
+                }
                 .quick_info {
                     .with-icon('images/graph-icon.png');
                     color: #626264;
@@ -1050,6 +1058,11 @@ TODO: retire this
                     &.label-partial-success {
                         .with-icon('images/yellow-light_glow.png');
                     }
+                }
+
+
+                &:hover .explore .btn {
+                  opacity: 1;
                 }
             }
         }
@@ -2167,16 +2180,18 @@ TODO: retire this
                     color: #e65b54; // text color + color overlay
                     font-weight: bold;
                     text-shadow: 0 1px 0 #fff; // drop shadow
+                    box-sizing: border-box;
                 }
 
                 &.message {
-                    width: 40%;
+                    width: 70%;
                     display: inline-block;
                     @icon_width: 30px;
                     @icon_padding: 20px;
                     background: @icon_padding center no-repeat url('images/resolve_issue-message_icon.png');
                     padding-left: @icon_width + @icon_padding;
                     &:before { .divider(-(@icon_width + @icon_padding)); }
+                    box-sizing: border-box;
                 }
 
                 &.datetime {

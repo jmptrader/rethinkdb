@@ -23,7 +23,7 @@ merger_serializer_t::~merger_serializer_t() {
     rassert(outstanding_index_write_ops.empty());
 }
 
-counted_t<standard_block_token_t> merger_serializer_t::index_read(block_id_t block_id) {
+counted_t<block_token_t> merger_serializer_t::index_read(block_id_t block_id) {
     // First check if there is an updated entry for the block id...
     const auto write_op = outstanding_index_write_ops.find(block_id);
     if (write_op != outstanding_index_write_ops.end()) {
@@ -39,7 +39,7 @@ counted_t<standard_block_token_t> merger_serializer_t::index_read(block_id_t blo
 void merger_serializer_t::index_write(new_mutex_in_line_t *mutex_acq,
                                       const std::function<void()> &on_writes_reflected,
                                       const std::vector<index_write_op_t> &write_ops) {
-    rassert(coro_t::self() != NULL);
+    rassert(coro_t::self() != nullptr);
     assert_thread();
 
     // Apply our set of write ops atomically
@@ -98,10 +98,10 @@ void merger_serializer_t::do_index_write() {
 void merger_serializer_t::merge_index_write_op(const index_write_op_t &to_be_merged,
                                                index_write_op_t *into_out) const {
     rassert(to_be_merged.block_id == into_out->block_id);
-    if (to_be_merged.token.is_initialized()) {
+    if (to_be_merged.token.has_value()) {
         into_out->token = to_be_merged.token;
     }
-    if (to_be_merged.recency.is_initialized()) {
+    if (to_be_merged.recency.has_value()) {
         into_out->recency = to_be_merged.recency;
     }
 }

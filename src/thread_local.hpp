@@ -9,6 +9,7 @@
 #include "arch/runtime/coroutines.hpp"
 #endif
 
+#include "arch/compiler.hpp"
 #include "errors.hpp"
 #include "concurrency/cache_line_padded.hpp"
 #include "utils.hpp"
@@ -61,56 +62,56 @@
  */
 
 #ifndef THREADED_COROUTINES
-#define TLS_with_init(type, name, initial)                              \
-    static __thread type TLS_ ## name = initial;                        \
-                                                                        \
+
+#define DEFINE_TLS_ACCESSORS(type, name)                                \
     NOINLINE type TLS_get_ ## name () {                                 \
         return TLS_ ## name;                                            \
     }                                                                   \
                                                                         \
-    NOINLINE void TLS_set_ ## name (type const &val) {                  \
-        TLS_ ## name = val;                                             \
+    template <class T>                                                  \
+    NOINLINE void TLS_set_ ## name (T&& val) {                          \
+        TLS_ ## name = std::forward<T>(val);                            \
     }
 
+#define TLS(type, name)                                                 \
+    static THREAD_LOCAL type TLS_ ## name;                              \
+    DEFINE_TLS_ACCESSORS(type, name)
+
+#define TLS_with_init(type, name, initial)                              \
+    static THREAD_LOCAL type TLS_ ## name(initial);                     \
+    DEFINE_TLS_ACCESSORS(type, name)
+
 #else  // THREADED_COROUTINES
+
+#define DEFINE_TLS_ACCESSORS(type, name)                                \
+    type TLS_get_ ## name () {                                          \
+        return TLS_ ## name[get_thread_id().threadnum].value;           \
+    }                                                                   \
+                                                                        \
+    template <class T>                                                  \
+    void TLS_set_ ## name(T&& val) {                                    \
+        TLS_ ## name[get_thread_id().threadnum].value = std::forward<T>(val); \
+    }
+
+#define TLS(type, name)                                                 \
+    static std::vector<cache_line_padded_t<type> >                      \
+        TLS_ ## name(MAX_THREADS);                                      \
+    DEFINE_TLS_ACCESSORS(type, name)
+
 #define TLS_with_init(type, name, initial)                              \
     static std::vector<cache_line_padded_t<type> >                      \
         TLS_ ## name(MAX_THREADS, cache_line_padded_t<type>(initial));  \
-                                                                        \
-    type TLS_get_ ## name () {                                          \
-        return TLS_ ## name[get_thread_id().threadnum].value;           \
-    }                                                                   \
-                                                                        \
-    void TLS_set_ ## name(type const &val) {                            \
-        TLS_ ## name[get_thread_id().threadnum].value = val;            \
-    }
+    DEFINE_TLS_ACCESSORS(type, name)
 
 #endif  // THREADED_COROUTINES
 
-#ifndef THREADED_COROUTINES
-#define TLS(type, name)                                                 \
-    static __thread type TLS_ ## name;                                  \
-                                                                        \
-    NOINLINE type TLS_get_ ## name () {                                 \
-        return TLS_ ## name;                                            \
-    }                                                                   \
-                                                                        \
-    NOINLINE void TLS_set_ ## name (type const &val) {                  \
-        TLS_ ## name = val;                                             \
-    }
+#define GLIBCXX_4_8 20130322
 
-#else // THREADED_COROUTINES
-#define TLS(type, name)                                                 \
-    static cache_line_padded_t<type> TLS_ ## name[MAX_THREADS];         \
-                                                                        \
-    type TLS_get_ ## name () {                                          \
-        return TLS_ ## name[get_thread_id().threadnum].value;           \
-    }                                                                   \
-                                                                        \
-    void TLS_set_ ## name(type const &val) {                            \
-        TLS_ ## name[get_thread_id().threadnum].value = val;            \
-    }
-
-#endif // not THREADED_COROUTINES
+#if defined(_LIBCPP_TYPE_TRAITS) || defined(_MSC_VER) || __GLIBCXX__ >= GLIBCXX_4_8
+// libc++ with type traights support, visual studio and libstdc++ >= 4.8
+using std::is_trivially_destructible;
+#else
+#define is_trivially_destructible std::has_trivial_destructor
+#endif
 
 #endif /* THREAD_LOCAL_HPP_ */

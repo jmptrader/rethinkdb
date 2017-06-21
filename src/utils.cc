@@ -1,9 +1,6 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "utils.hpp"
 
-#include <math.h>
-#include <ftw.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
 #include <signal.h>
@@ -13,20 +10,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
-#include <sys/resource.h>
-#include <unistd.h>
-
 #include <google/protobuf/stubs/common.h>
+
+#ifdef _WIN32
+#include "windows.hpp"
+#include <io.h>     // NOLINT
+#include <direct.h> // NOLINT
+#ifndef __MINGW32__
+#include <filesystem>
+#endif
+#else  // _WIN32
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <ftw.h>
+#endif  // _WIN32
 
 #include "errors.hpp"
 #include <boost/date_time.hpp>
 
-#include "arch/io/disk.hpp"
 #include "arch/runtime/coroutines.hpp"
 #include "arch/runtime/runtime.hpp"
-#include "clustering/administration/main/directory_lock.hpp"
 #include "config/args.hpp"
 #include "containers/archive/archive.hpp"
 #include "containers/archive/file_stream.hpp"
@@ -34,9 +38,18 @@
 #include "debug.hpp"
 #include "logger.hpp"
 #include "rdb_protocol/ql2.pb.h"
-#include "thread_local.hpp"
 
 void run_generic_global_startup_behavior() {
+    // Make sure stderr is non-buffered
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
+#ifdef _WIN32
+    // When running in Cygwin on Windows, line-buffering
+    // doesn't appear to work properly. So we disable buffering
+    // on `stdout` on Windows as well.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+#endif
+
     install_generic_crash_handler();
     install_new_oom_handler();
 
@@ -45,6 +58,7 @@ void run_generic_global_startup_behavior() {
     // two servers in the same cluster have different locales.
     setlocale(LC_ALL, "C");
 
+#ifndef _WIN32
     rlimit file_limit;
     int res = getrlimit(RLIMIT_NOFILE, &file_limit);
     guarantee_err(res == 0, "getrlimit with RLIMIT_NOFILE failed");
@@ -71,7 +85,13 @@ void run_generic_global_startup_behavior() {
         logWRN("The call to set the open file descriptor limit failed (errno = %d - %s)\n",
             get_errno(), errno_string(get_errno()).c_str());
     }
+#endif // !defined(_WIN32)
 
+#ifdef _WIN32
+    WSADATA wsa_data;
+    DWORD res = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    guarantee_winerr(res == NO_ERROR, "WSAStartup failed");
+#endif
 }
 
 startup_shutdown_t::startup_shutdown_t() {
@@ -83,11 +103,13 @@ startup_shutdown_t::~startup_shutdown_t() {
 }
 
 
-void print_hd(const void *vbuf, size_t offset, size_t ulength) {
+void print_hexdump(const void *vbuf, size_t offset, size_t ulength) {
+#ifndef _WIN32
     flockfile(stderr);
+#endif
 
     if (ulength == 0) {
-        fprintf(stderr, "(data length is zero)\n");
+        debugf("(data length is zero)\n");
     }
 
     const char *buf = reinterpret_cast<const char *>(vbuf);
@@ -98,7 +120,7 @@ void print_hd(const void *vbuf, size_t offset, size_t ulength) {
                               0xBD, 0xBD, 0xBD, 0xBD,
                               0xBD, 0xBD, 0xBD, 0xBD };
     uint8_t zero_sample[16] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     uint8_t ff_sample[16] = { 0xff, 0xff, 0xff, 0xff,
                               0xff, 0xff, 0xff, 0xff,
                               0xff, 0xff, 0xff, 0xff,
@@ -142,7 +164,9 @@ void print_hd(const void *vbuf, size_t offset, size_t ulength) {
         length -= 16;
     }
 
+#ifndef _WIN32
     funlockfile(stderr);
+#endif
 }
 
 void format_time(struct timespec time, printf_buffer_t *buf, local_or_utc_time_t zone) {
@@ -151,9 +175,14 @@ void format_time(struct timespec time, printf_buffer_t *buf, local_or_utc_time_t
         boost::posix_time::ptime as_ptime = boost::posix_time::from_time_t(time.tv_sec);
         t = boost::posix_time::to_tm(as_ptime);
     } else {
+#ifdef _WIN32
+        errno_t res = localtime_s(&t, &time.tv_sec);
+        guarantee_xerr(res == 0, res, "localtime_s() failed.");
+#else
         struct tm *res1;
         res1 = localtime_r(&time.tv_sec, &t);
         guarantee_err(res1 == &t, "localtime_r() failed.");
+#endif
     }
     buf->appendf(
         "%04d-%02d-%02dT%02d:%02d:%02d.%09ld",
@@ -212,153 +241,30 @@ bool parse_time(const std::string &str, local_or_utc_time_t zone,
 }
 
 with_priority_t::with_priority_t(int priority) {
-    rassert(coro_t::self() != NULL);
+    rassert(coro_t::self() != nullptr);
     previous_priority = coro_t::self()->get_priority();
     coro_t::self()->set_priority(priority);
 }
 with_priority_t::~with_priority_t() {
-    rassert(coro_t::self() != NULL);
+    rassert(coro_t::self() != nullptr);
     coro_t::self()->set_priority(previous_priority);
 }
 
-void *malloc_aligned(size_t size, size_t alignment) {
-    void *ptr = NULL;
-    int res = posix_memalign(&ptr, alignment, size);  // NOLINT(runtime/rethinkdb_fn)
-    if (res != 0) {
-        if (res == EINVAL) {
-            crash_or_trap("posix_memalign with bad alignment: %zu.", alignment);
-        } else if (res == ENOMEM) {
-            crash_oom();
-        } else {
-            crash_or_trap("posix_memalign failed with unknown result: %d.", res);
-        }
-    }
-    return ptr;
-}
-
-void *rmalloc(size_t size) {
-    void *res = malloc(size);  // NOLINT(runtime/rethinkdb_fn)
-    if (res == NULL && size != 0) {
-        crash_oom();
-    }
-    return res;
-}
-
-void *rrealloc(void *ptr, size_t size) {
-    void *res = realloc(ptr, size);  // NOLINT(runtime/rethinkdb_fn)
-    if (res == NULL && size != 0) {
-        crash_oom();
-    }
-    return res;
-}
-
-bool risfinite(double arg) {
-    // isfinite is a macro on OS X in math.h, so we can't just say std::isfinite.
-    using namespace std; // NOLINT(build/namespaces) due to platform variation
-    return isfinite(arg);
-}
-
-rng_t::rng_t(int seed) {
-#ifndef NDEBUG
-    if (seed == -1) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        seed = tv.tv_usec;
-    }
+void system_random_bytes(void *out, int64_t nbytes) {
+#ifdef _WIN32
+    HCRYPTPROV hProv;
+    BOOL res = CryptAcquireContext(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT);
+    guarantee_winerr(res, "CryptAcquireContext failed");
+    res = CryptGenRandom(hProv, nbytes, static_cast<BYTE*>(out));
+    DWORD err = GetLastError();
+    CryptReleaseContext(hProv, 0);
+    guarantee_xwinerr(res, err, "CryptGenRandom failed");
 #else
-    seed = 314159;
-#endif
-    xsubi[2] = seed / (1 << 16);
-    xsubi[1] = seed % (1 << 16);
-    xsubi[0] = 0x330E;
-}
-
-int rng_t::randint(int n) {
-    guarantee(n > 0, "non-positive argument for randint's [0,n) interval");
-    long x = nrand48(xsubi);  // NOLINT(runtime/int)
-    return x % n;
-}
-
-uint64_t rng_t::randuint64(uint64_t n) {
-    guarantee(n > 0, "non-positive argument for randint's [0,n) interval");
-    uint32_t x_low = jrand48(xsubi);  // NOLINT(runtime/int)
-    uint32_t x_high = jrand48(xsubi);  // NOLINT(runtime/int)
-    uint64_t x = x_high;
-    x <<= 32;
-    x += x_low;
-    return x % n;
-}
-
-double rng_t::randdouble() {
-    uint64_t x = rng_t::randuint64(1LL << 53);
-    double res = x;
-    return res / (1LL << 53);
-}
-
-struct nrand_xsubi_t {
-    unsigned short xsubi[3];  // NOLINT(runtime/int)
-};
-
-TLS_with_init(bool, rng_initialized, false)
-TLS(nrand_xsubi_t, rng_data)
-
-void get_dev_urandom(void *out, int64_t nbytes) {
     blocking_read_file_stream_t urandom;
     guarantee(urandom.init("/dev/urandom"), "failed to open /dev/urandom to initialize thread rng");
     int64_t readres = force_read(&urandom, out, nbytes);
     guarantee(readres == nbytes);
-}
-
-int randint(int n) {
-    guarantee(n > 0, "non-positive argument for randint's [0,n) interval");
-    nrand_xsubi_t buffer;
-    if (!TLS_get_rng_initialized()) {
-        CT_ASSERT(sizeof(buffer.xsubi) == 6);
-        get_dev_urandom(&buffer.xsubi, sizeof(buffer.xsubi));
-        TLS_set_rng_initialized(true);
-    } else {
-        buffer = TLS_get_rng_data();
-    }
-    long x = nrand48(buffer.xsubi);  // NOLINT(runtime/int)
-    TLS_set_rng_data(buffer);
-    return x % n;
-}
-
-uint64_t randuint64(uint64_t n) {
-    guarantee(n > 0, "non-positive argument for randint's [0,n) interval");
-    nrand_xsubi_t buffer;
-    if (!TLS_get_rng_initialized()) {
-        CT_ASSERT(sizeof(buffer.xsubi) == 6);
-        get_dev_urandom(&buffer.xsubi, sizeof(buffer.xsubi));
-        TLS_set_rng_initialized(true);
-    } else {
-        buffer = TLS_get_rng_data();
-    }
-    uint32_t x_low = jrand48(buffer.xsubi);  // NOLINT(runtime/int)
-    uint32_t x_high = jrand48(buffer.xsubi);  // NOLINT(runtime/int)
-    uint64_t x = x_high;
-    x <<= 32;
-    x += x_low;
-    TLS_set_rng_data(buffer);
-    return x % n;
-}
-
-size_t randsize(size_t n) {
-    guarantee(n > 0, "non-positive argument for randint's [0,n) interval");
-    size_t ret = 0;
-    size_t i = SIZE_MAX;
-    while (i != 0) {
-        int x = randint(0x10000);
-        ret = ret * 0x10000 + x;
-        i /= 0x10000;
-    }
-    return ret % n;
-}
-
-double randdouble() {
-    uint64_t x = randuint64(1LL << 53);
-    double res = x;
-    return res / (1LL << 53);
+#endif
 }
 
 bool begins_with_minus(const char *string) {
@@ -414,10 +320,6 @@ bool strtou64_strict(const std::string &str, int base, uint64_t *out_result) {
     }
 }
 
-bool notf(bool x) {
-    return !x;
-}
-
 std::string vstrprintf(const char *format, va_list ap) {
     printf_buffer_t buf(ap, format);
 
@@ -439,75 +341,6 @@ std::string strprintf(const char *format, ...) {
     return ret;
 }
 
-bool hex_to_int(char c, int *out) {
-    if (c >= '0' && c <= '9') {
-        *out = c - '0';
-        return true;
-    } else if (c >= 'a' && c <= 'f') {
-        *out = c - 'a' + 10;
-        return true;
-    } else if (c >= 'A' && c <= 'F') {
-        *out = c - 'A' + 10;
-        return true;
-    } else {
-        return false;
-    }
-}
-
-char int_to_hex(int x) {
-    rassert(x >= 0 && x < 16);
-    if (x < 10) {
-        return '0' + x;
-    } else {
-        return 'A' + x - 10;
-    }
-}
-
-bool blocking_read_file(const char *path, std::string *contents_out) {
-    scoped_fd_t fd;
-
-    {
-        int res;
-        do {
-            res = open(path, O_RDONLY);
-        } while (res == -1 && get_errno() == EINTR);
-
-        if (res == -1) {
-            return false;
-        }
-        fd.reset(res);
-    }
-
-    std::string ret;
-
-    char buf[4096];
-    for (;;) {
-        ssize_t res;
-        do {
-            res = read(fd.get(), buf, sizeof(buf));
-        } while (res == -1 && get_errno() == EINTR);
-
-        if (res == -1) {
-            return false;
-        }
-
-        if (res == 0) {
-            *contents_out = ret;
-            return true;
-        }
-
-        ret.append(buf, buf + res);
-    }
-}
-
-std::string blocking_read_file(const char *path) {
-    std::string ret;
-    bool success = blocking_read_file(path, &ret);
-    guarantee(success);
-    return ret;
-}
-
-
 std::string sanitize_for_logger(const std::string &s) {
     std::string sanitized = s;
     for (size_t i = 0; i < sanitized.length(); ++i) {
@@ -526,72 +359,6 @@ std::string errno_string(int errsv) {
     return std::string(errstr);
 }
 
-int remove_directory_helper(const char *path, UNUSED const struct stat *ptr,
-                            UNUSED const int flag, UNUSED FTW *ftw) {
-    logNTC("In recursion: removing file %s\n", path);
-    int res = ::remove(path);
-    guarantee_err(res == 0, "Fatal error: failed to delete '%s'.", path);
-    return 0;
-}
-
-void remove_directory_recursive(const char *path) {
-    // max_openfd is ignored on OS X (which claims the parameter
-    // specifies the maximum traversal depth) and used by Linux to
-    // limit the number of file descriptors that are open (by opening
-    // and closing directories extra times if it needs to go deeper
-    // than that).
-    const int max_openfd = 128;
-    logNTC("Recursively removing directory %s\n", path);
-    int res = nftw(path, remove_directory_helper, max_openfd, FTW_PHYS | FTW_MOUNT | FTW_DEPTH);
-    guarantee_err(res == 0 || get_errno() == ENOENT, "Trouble while traversing and destroying temporary directory %s.", path);
-}
-
-base_path_t::base_path_t(const std::string &path) : path_(path) { }
-
-void base_path_t::make_absolute() {
-    char absolute_path[PATH_MAX];
-    char *res = realpath(path_.c_str(), absolute_path);
-    guarantee_err(res != NULL, "Failed to determine absolute path for '%s'", path_.c_str());
-    path_.assign(absolute_path);
-}
-
-const std::string& base_path_t::path() const {
-    guarantee(!path_.empty());
-    return path_;
-}
-
-std::string temporary_directory_path(const base_path_t& base_path) {
-    return base_path.path() + "/tmp";
-}
-
-bool is_rw_directory(const base_path_t& path) {
-    if (access(path.path().c_str(), R_OK | F_OK | W_OK) != 0)
-        return false;
-    struct stat details;
-    if (stat(path.path().c_str(), &details) != 0)
-        return false;
-    return (details.st_mode & S_IFDIR) > 0;
-}
-
-void recreate_temporary_directory(const base_path_t& base_path) {
-    const base_path_t path(temporary_directory_path(base_path));
-
-    if (is_rw_directory(path) && check_dir_emptiness(path))
-        return;
-    remove_directory_recursive(path.path().c_str());
-
-    int res;
-    do {
-        res = mkdir(path.path().c_str(), 0755);
-    } while (res == -1 && get_errno() == EINTR);
-    guarantee_err(res == 0, "mkdir of temporary directory %s failed",
-                  path.path().c_str());
-
-    // Call fsync() on the parent directory to guarantee that the newly
-    // created directory's directory entry is persisted to disk.
-    warn_fsync_parent_directory(path.path().c_str());
-}
-
 // GCC and CLANG are smart enough to optimize out strlen(""), so this works.
 // This is the simplist thing I could find that gave warning in all of these
 // cases:
@@ -599,4 +366,5 @@ void recreate_temporary_directory(const base_path_t& base_path) {
 // * RETHINKDB_VERSION=""
 // * RETHINKDB_VERSION=1.2
 // (the correct case is something like RETHINKDB_VERSION="1.2")
+
 UNUSED static const char _assert_RETHINKDB_VERSION_nonempty = 1/(!!strlen(RETHINKDB_VERSION));

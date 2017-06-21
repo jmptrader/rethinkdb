@@ -1,27 +1,31 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef ARCH_RUNTIME_COROUTINES_HPP_
 #define ARCH_RUNTIME_COROUTINES_HPP_
 
+#include <exception>
 #ifndef NDEBUG
 #include <string>
 #endif
 
+#include "arch/compiler.hpp"
 #include "arch/runtime/callable_action.hpp"
 #include "arch/runtime/context_switching.hpp"
 #include "arch/runtime/runtime_utils.hpp"
 #include "threading.hpp"
 #include "time.hpp"
 
-const size_t MAX_COROUTINE_STACK_SIZE = 8*1024*1024;
-
-// Enable cross-coroutine backtraces in debug mode, or when coro profiling is enabled
-#if (!defined(NDEBUG) && !defined(__MACH__)) || defined(ENABLE_CORO_PROFILER)
+// Enable cross-coroutine backtraces in debug mode, or when coro profiling is enabled.
+// We don't enable it on ARM, because taking backtraces currently isn't working
+// reliably and sometimes causes crashes.
+#if (!defined(NDEBUG) && !defined(__MACH__) && !defined(__arm__)) \
+    || defined(ENABLE_CORO_PROFILER)
 #define CROSS_CORO_BACKTRACES            1
 #endif
 #define CROSS_CORO_BACKTRACES_MAX_SIZE  64
 
 threadnum_t get_thread_id();
 struct coro_globals_t;
+class coro_t;
 
 
 struct coro_profiler_mixin_t {
@@ -32,6 +36,12 @@ struct coro_profiler_mixin_t {
 #endif
 };
 
+/* The `coro_lru_entry_t` is used to keep track of coroutines that have protected
+stacks and to eventually unprotect them using a least-recently-used strategy. */
+struct coro_lru_entry_t : public intrusive_list_node_t<coro_lru_entry_t> {
+    explicit coro_lru_entry_t(coro_t *parent) : coro(parent) { }
+    coro_t *coro;
+};
 
 /* A coro_t represents a fiber of execution within a thread. Create one with spawn_*(). Within a
 coroutine, call wait() to return control to the scheduler; the coroutine will be resumed when
@@ -47,15 +57,15 @@ public:
     friend bool is_coroutine_stack_overflow(void *);
     friend bool has_n_bytes_free_stack_space(size_t);
 
-    template<class Callable>
-    static void spawn_now_dangerously(Callable &&action) {
-        coro_t *coro = get_and_init_coro(std::forward<Callable>(action));
+    template<class callable_t>
+    static void spawn_now_dangerously(callable_t &&action) {
+        coro_t *coro = get_and_init_coro(std::forward<callable_t>(action));
         coro->notify_now_deprecated();
     }
 
-    template<class Callable>
-    static coro_t *spawn_sometime(Callable &&action) {
-        coro_t *coro = get_and_init_coro(std::forward<Callable>(action));
+    template<class callable_t>
+    static coro_t *spawn_sometime(callable_t &&action) {
+        coro_t *coro = get_and_init_coro(std::forward<callable_t>(action));
         coro->notify_sometime();
         return coro;
     }
@@ -63,9 +73,9 @@ public:
     /* This is an optimization over spawn_sometime() followed by an on_thread_t.
     It avoids two thread messages, since it doesn't have to run on the original
     thread first, and also doesn't switch back at the end of the coro's lifetime. */
-    template<class Callable>
-    static coro_t *spawn_on_thread(Callable &&action, threadnum_t thread) {
-        coro_t *coro = get_and_init_coro(std::forward<Callable>(action));
+    template<class callable_t>
+    static coro_t *spawn_on_thread(callable_t &&action, threadnum_t thread) {
+        coro_t *coro = get_and_init_coro(std::forward<callable_t>(action));
         coro->current_thread_ = thread;
         coro->notify_sometime();
         return coro;
@@ -74,9 +84,9 @@ public:
     /* Whenever possible, `spawn_sometime()` should be used instead of
     `spawn_later_ordered()` (or `spawn_ordered()`). `spawn_later_ordered()` does not
     honor scheduler priorities. */
-    template<class Callable>
-    static coro_t *spawn_later_ordered(Callable &&action) {
-        coro_t *coro = get_and_init_coro(std::forward<Callable>(action));
+    template<class callable_t>
+    static coro_t *spawn_later_ordered(callable_t &&action) {
+        coro_t *coro = get_and_init_coro(std::forward<callable_t>(action));
         coro->notify_later_ordered();
         return coro;
     }
@@ -169,19 +179,23 @@ private:
     // Generates a spawn-time backtrace and stores it into `spawn_backtrace`.
     void grab_spawn_backtrace();
 
+    // Performs a context switch from `current_context` to this coroutine.
+    // Also enables stack-overflow protection on this coroutine.
+    void switch_to_coro_with_protection(coro_context_ref_t *current_context);
+
     // If this function footprint ever changes, you may need to update the parse_coroutine_info function
-    template<class Callable>
-    static coro_t *get_and_init_coro(Callable &&action) {
+    template<class callable_t>
+    static coro_t *get_and_init_coro(callable_t &&action) {
         coro_t *coro = get_coro();
 #ifndef NDEBUG
-        coro->parse_coroutine_type(__PRETTY_FUNCTION__);
+        coro->parse_coroutine_type(CURRENT_FUNCTION_PRETTY);
 #endif
         coro->grab_spawn_backtrace();
-        coro->action_wrapper.reset(std::forward<Callable>(action));
+        coro->action_wrapper.reset(std::forward<callable_t>(action));
 
         // If we were called from a coroutine, the new coroutine inherits our
         // caller's priority.
-        if (self() != NULL) {
+        if (self() != nullptr) {
             coro->set_priority(self()->get_priority());
         } else {
             // Otherwise, just reset to the default.
@@ -194,9 +208,8 @@ private:
     static coro_t *get_coro();
 
     static void return_coro_to_free_list(coro_t *coro);
-    static void maybe_evict_from_free_list();
 
-    static void run() NORETURN;
+    NORETURN static void run();
 
     friend class coro_profiler_t;
     friend struct coro_globals_t;
@@ -213,6 +226,9 @@ private:
     bool waiting_;
 
     callable_action_wrapper_t action_wrapper;
+
+    /* Used to eventually unprotect the coroutine if it has been inactive for a while. */
+    coro_lru_entry_t protected_stack_lru_entry_;
 
 #ifndef NDEBUG
     int64_t selfname_number;
@@ -233,6 +249,60 @@ bool is_coroutine_stack_overflow(void *addr);
 /* Returns true if at least n bytes are available on the stack of the current coroutine. */
 bool has_n_bytes_free_stack_space(size_t n);
 bool coroutines_have_been_initialized();
+
+/* Checks that there are at least n bytes of stack space available on the current
+coroutine. If that is the case, this function calls `fun` right away.
+Otherwise it spawns a new coroutine, runs `fun` in there, waits for it to
+finish if necessary, and returns the result of the call.*/
+template<class result_t, class callable_t>
+inline result_t call_with_enough_stack(callable_t &&fun, const size_t min_bytes_free) {
+    coro_t *origin = coro_t::self();
+    // This implementation only works if we're in a coroutine. If we're not,
+    // we just call `fun` right away and hope that the stack size is not an issue
+    // in those situations.
+    if (origin == nullptr || has_n_bytes_free_stack_space(min_bytes_free)) {
+        return fun();
+    } else {
+        result_t res;
+        std::exception_ptr exception;
+        bool did_block = false;
+        bool done_immediately = false;
+        coro_t::spawn_now_dangerously([&]() {
+            try {
+                res = fun();
+            } catch (...) {
+                exception = std::current_exception();
+            }
+            if (did_block) {
+                origin->notify_sometime();
+            } else {
+                done_immediately = true;
+            }
+        });
+        // Note that if `fun()` doesn't block, we will get here after the coroutine
+        // we spawned has already finished, since we're using `spawn_now_dangerously`.
+        // So ASSERT_FINITE_CORO_WAITING restrictions over `fun()` should remain
+        // valid with `call_with_enough_stack`.
+        did_block = true;
+        if (!done_immediately) {
+            rassert(origin == coro_t::self());
+            origin->wait();
+        }
+        if (exception != nullptr) {
+            std::rethrow_exception(exception);
+        }
+        return res;
+    }
+}
+
+// Special case for `void` return type
+template<class callable_t>
+inline void call_with_enough_stack(callable_t &&fun, size_t min_bytes_free) {
+    call_with_enough_stack<int>([&]() -> int {
+        fun();
+        return 0;
+    }, min_bytes_free);
+}
 
 class home_coro_mixin_t {
 private:

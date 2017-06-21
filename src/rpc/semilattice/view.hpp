@@ -2,8 +2,7 @@
 #ifndef RPC_SEMILATTICE_VIEW_HPP_
 #define RPC_SEMILATTICE_VIEW_HPP_
 
-#include "errors.hpp"
-#include <boost/shared_ptr.hpp>
+#include <memory>
 
 #include "concurrency/interruptor.hpp"
 #include "concurrency/pubsub.hpp"
@@ -41,21 +40,21 @@ public:
     class subscription_t {
     public:
         explicit subscription_t(std::function<void()> cb) : subs(cb) { }
-        subscription_t(std::function<void()> cb, boost::shared_ptr<semilattice_read_view_t> v) : subs(cb) {
+        subscription_t(std::function<void()> cb, std::shared_ptr<semilattice_read_view_t> v) : subs(cb) {
             reset(v);
         }
-        void reset(boost::shared_ptr<semilattice_read_view_t> v) {
+        void reset(std::shared_ptr<semilattice_read_view_t> v) {
             subs.reset(v->get_publisher());
             view = v;
         }
         void reset() {
-            subs.reset(NULL);
+            subs.reset(nullptr);
             view.reset();
         }
     private:
         /* Hold a pointer to the `semilattice_read_view_t` so it doesn't die while
         we are subscribed to it */
-        boost::shared_ptr<semilattice_read_view_t> view;
+        std::shared_ptr<semilattice_read_view_t> view;
         publisher_t<std::function<void()> >::subscription_t subs;
     };
 

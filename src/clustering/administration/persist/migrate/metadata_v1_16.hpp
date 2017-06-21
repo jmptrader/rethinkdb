@@ -7,15 +7,14 @@
 #include <string>
 #include <vector>
 
-#include "errors.hpp"
-#include <boost/optional.hpp>
-
 #include "btree/keys.hpp"
 #include "buffer_cache/types.hpp"
-#include "containers/auth_key.hpp"
+#include "clustering/administration/persist/migrate/metadata_v1_14.hpp"
 #include "containers/name_string.hpp"
+#include "containers/optional.hpp"
 #include "containers/uuid.hpp"
 #include "region/region_map.hpp"
+#include "rpc/connectivity/server_id.hpp"
 #include "rpc/semilattice/joins/deletable.hpp"
 #include "rpc/semilattice/joins/versioned.hpp"
 #include "rpc/semilattice/joins/macros.hpp"
@@ -43,6 +42,9 @@ RDB_DECLARE_EQUALITY_COMPARABLE(version_t);
    version that the backfiller is at. */
 
 struct version_range_t {
+    bool is_coherent() const {
+        return earliest == latest;
+    }
     version_t earliest;
     version_t latest;
 };
@@ -68,7 +70,7 @@ RDB_DECLARE_SERIALIZABLE(branch_history_t);
 struct server_semilattice_metadata_t {
     versioned_t<name_string_t> name;
     versioned_t<std::set<name_string_t> > tags;
-    versioned_t<boost::optional<uint64_t> > cache_size_bytes;
+    versioned_t<optional<uint64_t> > cache_size_bytes;
 };
 
 RDB_DECLARE_SERIALIZABLE(server_semilattice_metadata_t);
@@ -166,7 +168,7 @@ struct cluster_semilattice_metadata_t {
 RDB_DECLARE_SERIALIZABLE(cluster_semilattice_metadata_t);
 
 struct auth_semilattice_metadata_t {
-    versioned_t<auth_key_t> auth_key;
+    versioned_t<metadata_v1_14::auth_key_t> auth_key;
 };
 
 RDB_DECLARE_SERIALIZABLE(auth_semilattice_metadata_t);

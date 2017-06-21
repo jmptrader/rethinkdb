@@ -21,13 +21,16 @@ static const int MAX_UNSAVED_CHANGES = 1000;
 
 void flush_cache(cache_conn_t *cache, UNUSED signal_t *interruptor) {
     scoped_ptr_t<txn_t> txn;
-    scoped_ptr_t<real_superblock_t> superblock;
-    get_btree_superblock_and_txn_for_writing(cache, nullptr,
-        write_access_t::write, 1, write_durability_t::HARD, &superblock, &txn);
-    buf_write_t write(superblock->get());
-    /* `txn`'s destructor will block until all of the transactions that acquired the
+    {
+        scoped_ptr_t<real_superblock_t> superblock;
+        get_btree_superblock_and_txn_for_writing(cache, nullptr,
+            write_access_t::write, 1, write_durability_t::HARD, &superblock, &txn);
+        buf_write_t write(superblock->get());
+    }
+    /* `commit` will block until all of the transactions that acquired the
     superblock before we did and modified the metainfo have been flushed to disk. It's a
     shame we can't wait on `interruptor` using this API. */
+    txn->commit();
 }
 
 class unsaved_data_limiter_t {
@@ -40,8 +43,8 @@ public:
     there's too much unsaved data already, then it will block until some of the data is
     flushed. */
     void prepare_for_changes(int num_changes, signal_t *interruptor) {
-        scoped_ptr_t<new_semaphore_acq_t> sem_acq =
-            make_scoped<new_semaphore_acq_t>(&semaphore, num_changes);
+        scoped_ptr_t<new_semaphore_in_line_t> sem_acq =
+            make_scoped<new_semaphore_in_line_t>(&semaphore, num_changes);
         wait_interruptible(sem_acq->acquisition_signal(), interruptor);
         if (unflushed_sem_acq.has()) {
             unflushed_sem_acq->transfer_in(std::move(*sem_acq));
@@ -49,7 +52,7 @@ public:
             unflushed_sem_acq = std::move(sem_acq);
         }
         if (unflushed_sem_acq->count() > MAX_UNSAVED_CHANGES / 4) {
-            scoped_ptr_t<new_semaphore_acq_t> temp;
+            scoped_ptr_t<new_semaphore_in_line_t> temp;
             std::swap(temp, unflushed_sem_acq);
             coro_t::spawn_sometime(std::bind(&unsaved_data_limiter_t::flush, this,
                 std::move(temp), drainer.lock()));
@@ -58,7 +61,7 @@ public:
 
 private:
     void flush(
-            const scoped_ptr_t<new_semaphore_acq_t> &,
+            const scoped_ptr_t<new_semaphore_in_line_t> &,
             auto_drainer_t::lock_t keepalive) {
         try {
             flush_cache(cache, keepalive.get_drain_signal());
@@ -66,7 +69,7 @@ private:
             /* ignore */
         }
         /* Once `flush()` returns, then the `std::bind` will be destroyed, releasing the
-        `new_semaphore_acq_t`. */
+        `new_semaphore_in_line_t`. */
     }
 
     cache_conn_t *cache;
@@ -75,7 +78,7 @@ private:
     will stop the `flush()` coroutines. Then we have to destroy `unflushed_sem_acq`
     before `semaphore` because `unflushed_sem_acq` references `semaphore`. */
     new_semaphore_t semaphore;
-    scoped_ptr_t<new_semaphore_acq_t> unflushed_sem_acq;
+    scoped_ptr_t<new_semaphore_in_line_t> unflushed_sem_acq;
     auto_drainer_t drainer;
 };
 
@@ -123,7 +126,7 @@ public:
     }
 
     receive_backfill_info_t *info;
-    new_semaphore_acq_t sem_acq;
+    new_semaphore_in_line_t sem_acq;
     fifo_enforcer_write_token_t write_token;
     auto_drainer_t::lock_t keepalive;
 
@@ -298,6 +301,13 @@ void apply_multi_key_item(
             tokens.info->limiter->prepare_for_changes(
                 MAX_CHANGES_PER_TXN, tokens.keepalive.get_drain_signal());
 
+            /* We must not throw within the transaction. So we check the
+            drain signal now. */
+            if (tokens.keepalive.get_drain_signal()->is_pulsed()) {
+                throw interrupted_exc_t();
+            }
+            cond_t non_interruptor;
+
             /* Acquire the superblock. */
             scoped_ptr_t<txn_t> txn;
             scoped_ptr_t<real_superblock_t> superblock;
@@ -314,7 +324,7 @@ void apply_multi_key_item(
                 rdb_value_sizer_t sizer(superblock->cache()->max_block_size());
                 btree_receive_backfill_item_update_deletion_timestamps(
                     superblock.get(), release_superblock_t::KEEP, &sizer, item,
-                    tokens.keepalive.get_drain_signal());
+                    &non_interruptor);
                 is_first = false;
             }
 
@@ -337,7 +347,7 @@ void apply_multi_key_item(
             rdb_live_deletion_context_t deletion_context;
             continue_bool_t res = rdb_erase_small_range(tokens.info->slice, &key_tester,
                 range_to_delete, superblock.get(), &deletion_context,
-                tokens.keepalive.get_drain_signal(), MAX_CHANGES_PER_TXN / 2,
+                &non_interruptor, MAX_CHANGES_PER_TXN / 2,
                 &mod_reports, &range_deleted);
             guarantee(range_deleted.right == range_to_delete.right
                 || res == continue_bool_t::CONTINUE);
@@ -373,11 +383,11 @@ void apply_multi_key_item(
 }
 
 continue_bool_t store_t::receive_backfill(
-        const region_t &region,
+        const region_t &_region,
         backfill_item_producer_t *item_producer,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t) {
-    guarantee(region.beg == get_region().beg && region.end == get_region().end);
+    guarantee(_region.beg == get_region().beg && _region.end == get_region().end);
 
     unsaved_data_limiter_t unsaved_data_limiter(general_cache_conn.get());
     receive_backfill_info_t info(
@@ -388,16 +398,16 @@ continue_bool_t store_t::receive_backfill(
     superblock. `commit_threshold` is the point up to which we've called
     `item_producer->on_commit()`. These all increase monotonically to the right. */
     key_range_t::right_bound_t
-        spawn_threshold(region.inner.left),
-        metainfo_threshold(region.inner.left),
-        commit_threshold(region.inner.left);
+        spawn_threshold(_region.inner.left),
+        metainfo_threshold(_region.inner.left),
+        commit_threshold(_region.inner.left);
 
     /* We'll set `result` to `false` to record if `item_producer` returns `ABORT`. */
     continue_bool_t result = continue_bool_t::CONTINUE;
 
     /* Repeatedly request items from `item_producer` and spawn coroutines to handle them,
     but limit the number of simultaneously active coroutines. */
-    while (spawn_threshold != region.inner.right) {
+    while (spawn_threshold != _region.inner.right) {
         bool is_item;
         backfill_item_t item;
         key_range_t::right_bound_t empty_range;
@@ -424,7 +434,7 @@ continue_bool_t store_t::receive_backfill(
         /* The `apply_*()` functions will call back to `update_metainfo_cb` when they
         want to apply the metainfo to the superblock. They may make multiple calls, but
         the last call will have `progress` equal to `item.get_range().right`. */
-        tokens.update_metainfo_cb = [this, &region, &metainfo_threshold, &item_producer,
+        tokens.update_metainfo_cb = [this, &_region, &metainfo_threshold, &item_producer,
                     &spawn_threshold](
                 const key_range_t::right_bound_t &progress,
                 real_superblock_t *superblock) {
@@ -435,7 +445,7 @@ continue_bool_t store_t::receive_backfill(
                 /* This is a no-op */
                 return;
             }
-            region_t mask = region;
+            region_t mask = _region;
             mask.inner.left = metainfo_threshold.key();
             mask.inner.right = progress;
             metainfo_threshold = progress;
@@ -460,6 +470,7 @@ continue_bool_t store_t::receive_backfill(
             }
 
             /* End the transaction and notify that we've made progress */
+            txn->commit();
             txn.reset();
             guarantee(progress >= commit_threshold);
             guarantee(progress <= metainfo_threshold);
@@ -492,9 +503,9 @@ continue_bool_t store_t::receive_backfill(
     wait_interruptible(&exiter, interruptor);
 
     if (result == continue_bool_t::CONTINUE) {
-        guarantee(spawn_threshold == region.inner.right);
-        guarantee(metainfo_threshold == region.inner.right);
-        guarantee(commit_threshold == region.inner.right);
+        guarantee(spawn_threshold == _region.inner.right);
+        guarantee(metainfo_threshold == _region.inner.right);
+        guarantee(commit_threshold == _region.inner.right);
     }
 
     /* Flush remaining data to disk. This serves two purposes. The first reason is
@@ -516,5 +527,10 @@ void store_t::wait_until_ok_to_receive_backfill(signal_t *interruptor)
     // this store by acquiring a read lock on `backfill_postcon_lock`.
     rwlock_in_line_t lock_acq(&backfill_postcon_lock, access_t::read);
     wait_interruptible(lock_acq.read_signal(), interruptor);
+}
+
+bool store_t::check_ok_to_receive_backfill() THROWS_NOTHING {
+    rwlock_in_line_t lock_acq(&backfill_postcon_lock, access_t::read);
+    return lock_acq.read_signal()->is_pulsed();
 }
 

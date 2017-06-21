@@ -12,7 +12,7 @@ namespace unittest {
 
 mock_file_t::mock_file_t(mode_t mode, std::vector<char> *data) : mode_(mode), data_(data) {
     guarantee(mode != 0);
-    guarantee(data_ != NULL);
+    guarantee(data_ != nullptr);
 }
 mock_file_t::~mock_file_t() { }
 
@@ -23,7 +23,7 @@ void mock_file_t::set_file_size(int64_t size) {
     data_->resize(size, 0);
 }
 
-void mock_file_t::set_file_size_at_least(int64_t size) {
+void mock_file_t::set_file_size_at_least(int64_t size, UNUSED int64_t extent_size) {
     guarantee(0 <= size && static_cast<uint64_t>(size) <= SIZE_MAX);
     if (data_->size() < static_cast<uint64_t>(size)) {
         data_->resize(size, 0);
@@ -63,7 +63,7 @@ void mock_file_t::write_async(int64_t offset, size_t length, const void *buf,
 
 void mock_file_t::writev_async(int64_t offset, size_t length, scoped_array_t<iovec> &&bufs,
                                file_account_t *account, linux_iocallback_t *cb) {
-    scoped_malloc_t<char> buf(malloc_aligned(length, DEVICE_BLOCK_SIZE));
+    scoped_device_block_aligned_ptr_t<char> buf(length);
 
     iovec bufvec[1] = { { buf.get(), length } };
     fill_bufs_from_source(bufvec, 1, bufs.data(), bufs.size(), 0);
@@ -74,22 +74,6 @@ void mock_file_t::writev_async(int64_t offset, size_t length, scoped_array_t<iov
 bool mock_file_t::coop_lock_and_check() {
     // We don't actually implement the locking behavior.
     return true;
-}
-
-size_t mock_semantic_checking_file_t::semantic_blocking_read(void *buf, size_t length) {
-    size_t length_to_read = std::min(data_->size() - pos_, length);
-    memcpy(buf, data_->data() + pos_, length_to_read);
-    pos_ += length_to_read;
-    return length_to_read;
-}
-
-size_t mock_semantic_checking_file_t::semantic_blocking_write(const void *buf, size_t length) {
-    if (data_->size() < pos_ + length) {
-        data_->resize(pos_ + length);
-    }
-    memcpy(data_->data() + pos_, buf, length);
-    pos_ += length;
-    return length;
 }
 
 
@@ -117,11 +101,5 @@ void mock_file_opener_t::unlink_serializer_file() {
     ASSERT_TRUE(file_existence_state_ == temporary_file || file_existence_state_ == permanent_file);
     file_existence_state_ = unlinked_file;
 }
-
-#ifdef SEMANTIC_SERIALIZER_CHECK
-void mock_file_opener_t::open_semantic_checking_file(scoped_ptr_t<semantic_checking_file_t> *file_out) {
-    file_out->init(new mock_semantic_checking_file_t(&semantic_checking_file_));
-}
-#endif
 
 }  // namespace unittest

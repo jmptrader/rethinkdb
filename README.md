@@ -1,65 +1,101 @@
-[RethinkDB](http://www.rethinkdb.com)
-=================
+<img style="width:100%;" src="/github-banner.png">
 
-<img align="right" src="/thinker-standing-computer.png">
+[RethinkDB](https://www.rethinkdb.com)
+======================================
+
+
+What is RethinkDB?
+------------------
+
+* **Open-source** database for building realtime web applications
+* **NoSQL** database that stores schemaless JSON documents
+* **Distributed** database that is easy to scale
+* **High availability** database with automatic failover and robust fault tolerance
 
 RethinkDB is the first open-source scalable database built for realtime applications. It exposes a new database access model -- instead of polling for changes, the developer can tell the database to continuously push updated query results to applications in realtime. RethinkDB allows developers to build scalable realtime apps in a fraction of the time with less effort.
 
-To learn more, check out [rethinkdb.com](http://rethinkdb.com).
+To learn more, check out [rethinkdb.com](https://rethinkdb.com).
 
 Not sure what types of projects RethinkDB can help you build? Here are a few examples:
 
-* Build a [realtime liveblog](http://rethinkdb.com/blog/rethinkdb-pubnub/) with RethinkDB and PubNub
+* Build a [realtime liveblog](https://rethinkdb.com/blog/rethinkdb-pubnub/) with RethinkDB and PubNub
 * Create a [collaborative photo sharing whiteboard](https://www.youtube.com/watch?v=pdPRp3UxL_s)
-* Build an [IRC bot in Go](http://rethinkdb.com/blog/go-irc-bot/) with RethinkDB changefeeds
-* Look at [cats on Instagram in realtime](http://rethinkdb.com/blog/cats-of-instagram/)
+* Build an [IRC bot in Go](https://rethinkdb.com/blog/go-irc-bot/) with RethinkDB changefeeds
+* Look at [cats on Instagram in realtime](https://rethinkdb.com/blog/cats-of-instagram/)
 * Watch [how Platzi uses RethinkDB](https://www.youtube.com/watch?v=Nb_UzRYDB40) to educate
 
 
 Quickstart
------------
+----------
 
-For a thirty-second RethinkDB quickstart, check out  [rethinkdb.com/docs/quickstart](http://www.rethinkdb.com/docs/quickstart).
+For a thirty-second RethinkDB quickstart, check out  [rethinkdb.com/docs/quickstart](https://www.rethinkdb.com/docs/quickstart).
 
 Or, get started right away with our ten-minute guide in these languages:
 
-* [**JavaScript**](http://rethinkdb.com/docs/guide/javascript/)
-* [**Python**](http://rethinkdb.com/docs/guide/python/)
-* [**Ruby**](http://rethinkdb.com/docs/guide/ruby/)
+* [**JavaScript**](https://rethinkdb.com/docs/guide/javascript/)
+* [**Python**](https://rethinkdb.com/docs/guide/python/)
+* [**Ruby**](https://rethinkdb.com/docs/guide/ruby/)
+* [**Java**](https://rethinkdb.com/docs/guide/java/) 
 
-Besides our three official drivers, we also have many [third-party drivers](http://rethinkdb.com/docs/install-drivers/) supported by the RethinkDB community. Here's a few:
+Besides our four official drivers, we also have many [third-party drivers](https://rethinkdb.com/docs/install-drivers/) supported by the RethinkDB community. Here's a few:
 
-* **C#/.NET:** [rethinkdb-net](https://github.com/mfenniak/rethinkdb-net)
+* **C#/.NET:** [RethinkDb.Driver](https://github.com/bchavez/RethinkDb.Driver), [rethinkdb-net](https://github.com/mfenniak/rethinkdb-net)
 * **Clojure:** [clj-rethinkdb](https://github.com/apa512/clj-rethinkdb)
 * **Elixir:** [rethinkdb-elixir](https://github.com/hamiltop/rethinkdb-elixir)
 * **Go:** [GoRethink](https://github.com/dancannon/gorethink)
-* **Haskell:** [haskeel-rethinkdb](https://github.com/atnnn/haskell-rethinkdb)
-* **PHP:** [php-rql](https://github.com/danielmewes/php-rql) 
-* **Scala:** [rethink-scala](https://github.com/kclay/rethink-scala) 
+* **Haskell:** [haskell-rethinkdb](https://github.com/atnnn/haskell-rethinkdb)
+* **PHP:** [php-rql](https://github.com/danielmewes/php-rql)
+* **Rust:** [reql](https://github.com/rust-rethinkdb/reql)
+* **Scala:** [rethink-scala](https://github.com/kclay/rethink-scala)
 
-Looking to explore what else RethinkDB offers or the specifics of ReQL? Check out [our RethinkDB docs](http://rethinkdb.com/docs/) and [ReQL API](http://rethinkdb.com/api/).
+Looking to explore what else RethinkDB offers or the specifics of ReQL? Check out [our RethinkDB docs](https://rethinkdb.com/docs/) and [ReQL API](https://rethinkdb.com/api/).
+
+Building
+--------
+
+First install some dependencies.  For example, on Ubuntu or Debian:
+
+    sudo apt-get install build-essential protobuf-compiler python \
+        libprotobuf-dev libcurl4-openssl-dev libboost-all-dev \
+        libncurses5-dev libjemalloc-dev wget m4 g++
+
+Generally, you will need
+
+* GCC or Clang
+* Protocol Buffers
+* jemalloc
+* Ncurses
+* Boost
+* Python 2
+* libcurl
+* libcrypto (OpenSSL)
+
+Then, to build:
+
+    ./configure --allow-fetch
+    # or run ./configure --allow-fetch CXX=clang++
+
+    make -j4
+    # or run make -j4 DEBUG=1
+
+    sudo make install
+    # or run ./build/debug_clang/rethinkdb
 
 
 Need help?
---------
+----------
 
-A great place to start is [rethinkdb.com/community](http://rethinkdb.com/community). Here you can find out how to ask us questions, reach out to us, or [report an issue](https://github.com/rethinkdb/rethinkdb/issues). You'll be able to find all the places we frequent online and at which conference or meetups you might be able to meet us next.
+A great place to start is [rethinkdb.com/community](https://rethinkdb.com/community). Here you can find out how to ask us questions, reach out to us, or [report an issue](https://github.com/rethinkdb/rethinkdb/issues). You'll be able to find all the places we frequent online and at which conference or meetups you might be able to meet us next.
 
-If you need help right now, you can also find us [on Twitter](https://twitter.com/rethinkdb), via IRC at [#rethinkdb](irc://chat.freenode.net/#rethinkdb) on Freenode, or at [gitter.im/rethinkdb/rethinkdb](https://gitter.im/rethinkdb/rethinkdb).
+If you need help right now, you can also find us [on Slack](http://slack.rethinkdb.com/), [Twitter](https://twitter.com/rethinkdb), or IRC at [#rethinkdb](irc://chat.freenode.net/#rethinkdb) on Freenode.
 
-[![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/rethinkdb/rethinkdb?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
-
-Need help with something serious like _"production"_? We also offer training and on-demand support in our [support services](http://rethinkdb.com/services/) as provided by the core RethinkDB team (and the Thinker too).
-
-Do you use RethinkDB? Send us a story!
------------------
- We love hearing all the awesome ways people are using RethinkDB. And we want to hear from you too. [Send us your story](http://rethinkdb.com/community/shirts-for-stories) and we'll send a package your way with RethinkDB swag.
+**Join us now:** <a href="http://slack.rethinkdb.com/"><img valign="middle"  src="http://slack.rethinkdb.com/badge.svg"></a>
 
 Contributing
------------------
+------------
 
 RethinkDB was built by a dedicated team, but it wouldn't have been possible without the support and contributions of hundreds of people from all over the world. We could use your help too! Check out our [contributing guidelines](CONTRIBUTING.md) to get started.
 
 Where's the changelog?
------------------
+----------------------
 We keep [a list of changes and feature explanations here](NOTES.md).

@@ -25,16 +25,20 @@
 /* JSON parser in C. */
 
 #include "cjson/cJSON.hpp"
+
 #include <ctype.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <cmath>
+
 #include "errors.hpp"
-#include "utils.hpp"
+#include "memory_utils.hpp"
+#include "math.hpp"
 
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Wunreachable-code"
@@ -46,7 +50,8 @@ const char *cJSON_GetErrorPtr() {return ep;}
 
 static int cJSON_strcasecmp(const char *s1,const char *s2)
 {
-        if (!s1) return (s1==s2)?0:1;if (!s2) return 1;
+        if (!s1) return (s1==s2)?0:1;
+        if (!s2) return 1;
         for (; tolower(*s1) == tolower(*s2); ++s1, ++s2)        if (*s1 == 0)        return 0;
         return tolower(*(const unsigned char *)s1) - tolower(*(const unsigned char *)s2);
 }
@@ -126,19 +131,39 @@ static const char *parse_number(cJSON *item, const char *num) {
     return num + offset;
 }
 
+int ATTR_FORMAT(printf, 2, 3) cJSON_asprintf(char **out, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int ret;
+#ifdef _WIN32
+    char dummy;
+    int size = vsnprintf(&dummy, 1, format, ap);
+    if (size < 0) {
+        ret = size;
+    } else {
+        *out = reinterpret_cast<char*>(cJSON_malloc(size + 1));
+        ret = vsnprintf(*out, size + 1, format, ap);
+        rassert(ret == size);
+    }
+#else
+    ret = vasprintf(out, format, ap);
+#endif
+    va_end(ap);
+    return ret;
+}
+
 /* Render the number nicely from the given item into a string. */
 static char *print_number(cJSON *item) {
-    char *str;
     double d = item->valuedouble;
     guarantee(risfinite(d));
-    int ret;
     if (d == 0.0 && std::signbit(d)) {
-        ret = asprintf(&str, "-0.0");
+        return cJSON_strdup("-0.0");
     } else {
-        ret = asprintf(&str, "%.20g", d);
+        char *str;
+        int ret = cJSON_asprintf(&str, "%.20g", d);
+        guarantee(ret);
+        return str;
     }
-    guarantee(ret);
-    return str;
 }
 
 static unsigned parse_hex4(const char *str)
@@ -587,7 +612,8 @@ static char *print_object(cJSON *item,int depth,int fmt)
                 *ptr++=':';if (fmt) *ptr++='\t';
                 strcpy(ptr,entries[i]);ptr+=strlen(entries[i]);
                 if (i!=numentries-1) *ptr++=',';
-                if (fmt) *ptr++='\n';*ptr=0;
+                if (fmt) *ptr++='\n';
+                *ptr=0;
                 cJSON_free(names[i]);cJSON_free(entries[i]);
         }
 

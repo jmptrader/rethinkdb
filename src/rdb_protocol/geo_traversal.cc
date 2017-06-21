@@ -1,10 +1,7 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2016 RethinkDB, all rights reserved.
 #include "rdb_protocol/geo_traversal.hpp"
 
 #include <cmath>
-
-#include "errors.hpp"
-#include <boost/variant/get.hpp>
 
 #include "rdb_protocol/batching.hpp"
 #include "rdb_protocol/configured_limits.hpp"
@@ -19,7 +16,7 @@
 #include "rdb_protocol/geo/primitives.hpp"
 #include "rdb_protocol/geo/s2/s2.h"
 #include "rdb_protocol/geo/s2/s2latlng.h"
-#include "rdb_protocol/lazy_json.hpp"
+#include "rdb_protocol/lazy_btree_val.hpp"
 #include "rdb_protocol/profile.hpp"
 
 using geo::S2Point;
@@ -30,10 +27,9 @@ using geo::S2LatLng;
 const size_t MAX_PROCESSED_SET_SIZE = 10000;
 
 // How many grid cells to use for querying a secondary index.
-// It typically makes sense to use more grid cells (i.e. finer covering) here
-// than it does for inserting data into a geo index, since there is no disk
-// overhead involved here and a finer grid avoids unnecessary post-filtering.
-const int QUERYING_GOAL_GRID_CELLS = GEO_INDEX_GOAL_GRID_CELLS * 2;
+// More cells result in better index traversal granularity, but also increase
+// the CPU overhead for computing the grid covering.
+const int QUERYING_GOAL_GRID_CELLS = 16;
 
 // The radius used for the first batch of a get_nearest traversal.
 // As a fraction of the equator's radius.
@@ -51,14 +47,28 @@ const double NEAREST_GOAL_BATCH_SIZE = 100.0;
 const unsigned int NEAREST_NUM_VERTICES = 8;
 
 
-geo_job_data_t::geo_job_data_t(ql::env_t *_env, const ql::batchspec_t &batchspec,
-        const std::vector<ql::transform_variant_t> &_transforms,
-        const boost::optional<ql::terminal_variant_t> &_terminal)
+geo_job_data_t::geo_job_data_t(
+    ql::env_t *_env,
+    region_t region,
+    store_key_t last_key,
+    const ql::batchspec_t &batchspec,
+    const std::vector<ql::transform_variant_t> &_transforms,
+    const optional<ql::terminal_variant_t> &_terminal,
+    is_stamp_read_t is_stamp_read)
     : env(_env),
-      batcher(batchspec.to_batcher()),
-      accumulator(_terminal
+      batcher(make_scoped<ql::batcher_t>(batchspec.to_batcher())),
+      accumulator(_terminal.has_value()
                   ? ql::make_terminal(*_terminal)
-                  : ql::make_append(sorting_t::UNORDERED, &batcher)) {
+                  : ql::make_append(std::move(region),
+                                    std::move(last_key),
+                                    // This causes the accumulator to include sindex_val
+                                    // in the result, which we need for post-filtering in
+                                    // reads for getIntersecting changefeeds.
+                                    is_stamp_read == is_stamp_read_t::YES
+                                        ? sorting_t::ASCENDING
+                                        : sorting_t::UNORDERED,
+                                    batcher.get(),
+                                    require_sindexes_t::NO)) {
     for (size_t i = 0; i < _transforms.size(); ++i) {
         transformers.push_back(ql::make_op(_transforms[i]));
     }
@@ -70,7 +80,8 @@ geo_intersecting_cb_t::geo_intersecting_cb_t(
         btree_slice_t *_slice,
         geo_sindex_data_t &&_sindex,
         ql::env_t *_env,
-        std::set<store_key_t> *_distinct_emitted_in_out)
+        std::set<std::pair<store_key_t, optional<uint64_t> > >
+            *_distinct_emitted_in_out)
     : geo_index_traversal_helper_t(
         ql::skey_version_from_reql_version(_sindex.func_reql_version),
         _env->interruptor),
@@ -89,12 +100,16 @@ geo_intersecting_cb_t::geo_intersecting_cb_t(
 
 void geo_intersecting_cb_t::init_query(const ql::datum_t &_query_geometry) {
     query_geometry = _query_geometry;
+    std::vector<geo::S2CellId> covering(
+        compute_cell_covering(query_geometry, QUERYING_GOAL_GRID_CELLS));
     geo_index_traversal_helper_t::init_query(
-        compute_index_grid_keys(_query_geometry, QUERYING_GOAL_GRID_CELLS));
+        covering, compute_interior_cell_covering(query_geometry, covering));
 }
 
-continue_bool_t geo_intersecting_cb_t::on_candidate(scoped_key_value_t &&keyvalue,
-        concurrent_traversal_fifo_enforcer_signal_t waiter)
+continue_bool_t geo_intersecting_cb_t::on_candidate(
+        scoped_key_value_t &&keyvalue,
+        concurrent_traversal_fifo_enforcer_signal_t waiter,
+        bool definitely_intersects_if_point)
         THROWS_ONLY(interrupted_exc_t) {
     guarantee(query_geometry.has());
     sampler->new_sample();
@@ -107,16 +122,18 @@ continue_bool_t geo_intersecting_cb_t::on_candidate(scoped_key_value_t &&keyvalu
     }
 
     // Check if this document has already been processed (lower bound).
-    if (already_processed.count(primary_key) > 0) {
+    optional<uint64_t> tag = ql::datum_t::extract_tag(store_key);
+    std::pair<store_key_t, optional<uint64_t> > primary_and_tag(primary_key, tag);
+    if (already_processed.count(primary_and_tag) > 0) {
         return continue_bool_t::CONTINUE;
     }
     // Check if this document has already been emitted.
-    if (distinct_emitted->count(primary_key) > 0) {
+    if (distinct_emitted->count(primary_and_tag) > 0) {
         return continue_bool_t::CONTINUE;
     }
 
-    lazy_json_t row(static_cast<const rdb_value_t *>(keyvalue.value()),
-                    keyvalue.expose_buf());
+    lazy_btree_val_t row(static_cast<const rdb_value_t *>(keyvalue.value()),
+                         keyvalue.expose_buf());
     ql::datum_t val = row.get();
     slice->stats.pm_keys_read.record();
     slice->stats.pm_total_keys_read += 1;
@@ -129,7 +146,7 @@ continue_bool_t geo_intersecting_cb_t::on_candidate(scoped_key_value_t &&keyvalu
     // row.get() or waiter.wait_interruptible() might have blocked, and another
     // coroutine could have found the document in the meantime. Re-check
     // distinct_emitted, so we don't emit the same document twice.
-    if (distinct_emitted->count(primary_key) > 0) {
+    if (distinct_emitted->count(primary_and_tag) > 0) {
         return continue_bool_t::CONTINUE;
     }
 
@@ -143,14 +160,23 @@ continue_bool_t geo_intersecting_cb_t::on_candidate(scoped_key_value_t &&keyvalu
             sindex.func->call(&sindex_env, val)->as_datum();
         if (sindex.multi == sindex_multi_bool_t::MULTI
             && sindex_val.get_type() == ql::datum_t::R_ARRAY) {
-            boost::optional<uint64_t> tag = *ql::datum_t::extract_tag(store_key);
-            guarantee(tag);
-            sindex_val = sindex_val.get(*tag, ql::NOTHROW);
+            sindex_val = sindex_val.get(tag.get(), ql::NOTHROW);
             guarantee(sindex_val.has());
         }
+
+        // Check if the index value is a point, so we can use
+        // definitely_intersects_if_point
+        bool definitely_intersects = false;
+        if (definitely_intersects_if_point) {
+            bool is_point = sindex_val.get_field("type").as_str() == "Point";
+            if (is_point) {
+                definitely_intersects = true;
+            }
+        }
+
         // TODO (daniel): This is a little inefficient because we re-parse
         // the query_geometry for each test.
-        if (geo_does_intersect(query_geometry, sindex_val)
+        if ((definitely_intersects || geo_does_intersect(query_geometry, sindex_val))
             && post_filter(sindex_val, val)) {
             if (distinct_emitted->size() >= env->limits().array_size_limit()) {
                 emit_error(ql::exc_t(ql::base_exc_t::RESOURCE,
@@ -158,7 +184,7 @@ continue_bool_t geo_intersecting_cb_t::on_candidate(scoped_key_value_t &&keyvalu
                     ql::backtrace_id_t::empty()));
                 return continue_bool_t::ABORT;
             }
-            distinct_emitted->insert(primary_key);
+            distinct_emitted->insert(primary_and_tag);
             return emit_result(std::move(sindex_val),
                                std::move(store_key),
                                std::move(val));
@@ -168,7 +194,7 @@ continue_bool_t geo_intersecting_cb_t::on_candidate(scoped_key_value_t &&keyvalu
             // encountered multiple times in the index.
             if (already_processed.size() < MAX_PROCESSED_SET_SIZE
                 && sindex_val.get_field("type").as_str() != "Point") {
-                already_processed.insert(primary_key);
+                already_processed.insert(primary_and_tag);
             }
             return continue_bool_t::CONTINUE;
         }
@@ -192,20 +218,16 @@ collect_all_geo_intersecting_cb_t::collect_all_geo_intersecting_cb_t(
         geo_job_data_t &&_job,
         geo_sindex_data_t &&_sindex,
         const ql::datum_t &_query_geometry,
-        const key_range_t &_sindex_range,
         rget_read_response_t *_resp_out)
     : geo_intersecting_cb_t(_slice, std::move(_sindex), _job.env, &distinct_emitted),
       job(std::move(_job)), response(_resp_out) {
     guarantee(response != NULL);
-    response->last_key = _sindex_range.left;
     init_query(_query_geometry);
 }
 
-void collect_all_geo_intersecting_cb_t::finish() THROWS_ONLY(interrupted_exc_t) {
-    job.accumulator->finish(&response->result);
-    if (job.accumulator->should_send_batch()) {
-        response->truncated = true;
-    }
+void collect_all_geo_intersecting_cb_t::finish(
+    continue_bool_t last_cb) THROWS_ONLY(interrupted_exc_t) {
+    job.accumulator->finish(last_cb, &response->result);
 }
 
 bool collect_all_geo_intersecting_cb_t::post_filter(
@@ -220,20 +242,16 @@ continue_bool_t collect_all_geo_intersecting_cb_t::emit_result(
         store_key_t &&key,
         ql::datum_t &&val)
         THROWS_ONLY(interrupted_exc_t, ql::base_exc_t, geo_exception_t) {
-    // Update the last considered key.
-    rassert(response->last_key <= key);
-    response->last_key = key;
-
     ql::groups_t data;
     data = {{ql::datum_t(), ql::datums_t{std::move(val)}}};
 
     for (auto it = job.transformers.begin(); it != job.transformers.end(); ++it) {
-        (**it)(job.env, &data, sindex_val);
+        (**it)(job.env, &data, [&]() { return sindex_val; });
     }
     return (*job.accumulator)(job.env,
                               &data,
                               std::move(key),
-                              std::move(sindex_val)); // NULL if no sindex
+                              [&]() { return sindex_val; });
 }
 
 void collect_all_geo_intersecting_cb_t::emit_error(
@@ -340,9 +358,9 @@ void nearest_traversal_cb_t::init_query_geometry() {
             state->center, state->current_inradius,
             NEAREST_NUM_VERTICES, state->reference_ellipsoid);
 
-        ql::datum_t query_geometry =
+        ql::datum_t _query_geometry =
             construct_geo_polygon(shell, holes, ql::configured_limits_t::unlimited);
-        init_query(query_geometry);
+        init_query(_query_geometry);
     } catch (const geo_range_exception_t &e) {
         // The radius has become too large for constructing the query geometry.
         // Abort.
@@ -386,7 +404,7 @@ continue_bool_t nearest_traversal_cb_t::emit_result(
 void nearest_traversal_cb_t::emit_error(
         const ql::exc_t &_error)
         THROWS_ONLY(interrupted_exc_t) {
-    error = _error;
+    error.set(_error);
 }
 
 bool nearest_pairs_less(

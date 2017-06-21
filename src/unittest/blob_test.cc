@@ -8,7 +8,7 @@
 #include "unittest/gtest.hpp"
 #include "unittest/mock_file.hpp"
 #include "unittest/unittest_utils.hpp"
-#include "serializer/config.hpp"
+#include "serializer/log/log_serializer.hpp"
 
 namespace unittest {
 
@@ -161,6 +161,8 @@ void small_value_test(cache_t *cache) {
     tk.unappend(&txn, 250);
     tk.unappend(&txn, 0);
     tk.append(&txn, "");
+
+    txn.commit();
 }
 
 void small_value_boundary_test(cache_t *cache) {
@@ -214,6 +216,8 @@ void small_value_boundary_test(cache_t *cache) {
     ASSERT_EQ(2u, tk.refsize(block_size));
     tk.unappend(&txn, 1);
     ASSERT_EQ(1u, tk.refsize(block_size));
+
+    txn.commit();
 }
 
 void general_journey_test(cache_t *cache, const std::vector<int64_t>& steps) {
@@ -237,6 +241,8 @@ void general_journey_test(cache_t *cache, const std::vector<int64_t>& steps) {
         v = (v == 'z' ? 'A' : v == 'Z' ? 'a' : v + 1);
     }
     tk.unappend(&txn, size);
+
+    txn.commit();
 }
 
 void combinations_test(cache_t *cache) {
@@ -278,13 +284,13 @@ void run_tests(cache_t *cache) {
     combinations_test(cache);
 }
 
-TPTEST(BlobTest, all_tests) {
+TPTEST(BlobTest, AllTests) {
     mock_file_opener_t file_opener;
-    standard_serializer_t::create(
+    log_serializer_t::create(
             &file_opener,
-            standard_serializer_t::static_config_t());
-    standard_serializer_t log_serializer(
-            standard_serializer_t::dynamic_config_t(),
+            log_serializer_t::static_config_t());
+    log_serializer_t log_serializer(
+            log_serializer_t::dynamic_config_t(),
             &file_opener,
             &get_global_perfmon_collection());
 

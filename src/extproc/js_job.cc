@@ -2,19 +2,19 @@
 #include "extproc/js_job.hpp"
 
 #include <v8.h>
+#include <libplatform/libplatform.h>
 
 #include <stdint.h>
-#include <libplatform/libplatform.h>
+
 #include <limits>
 
 #include "containers/archive/boost_types.hpp"
 #include "containers/archive/stl_types.hpp"
 #include "extproc/extproc_job.hpp"
+#include "math.hpp"
 #include "rdb_protocol/pseudo_time.hpp"
 #include "rdb_protocol/configured_limits.hpp"
 #include "utils.hpp"
-
-#include "debug.hpp"
 
 const js_id_t MIN_ID = 1;
 const js_id_t MAX_ID = std::numeric_limits<js_id_t>::max();
@@ -27,9 +27,26 @@ ql::datum_t js_to_datum(const v8::Handle<v8::Value> &value,
                         const ql::configured_limits_t &limits,
                         std::string *err_out);
 
-// Should never error.
+// Returns an empty handle on error and sets `err_out` accordingly.
 v8::Handle<v8::Value> js_from_datum(const ql::datum_t &datum,
                                     std::string *err_out);
+
+#ifdef V8_NEEDS_BUFFER_ALLOCATOR
+class array_buffer_allocator_t : public v8::ArrayBuffer::Allocator {
+public:
+    void *Allocate(size_t length) {
+        void *data = rmalloc(length);
+        memset(data, 0, length);
+        return data;
+    }
+    void *AllocateUninitialized(size_t length) {
+        return rmalloc(length);
+    }
+    void Free(void *data, UNUSED size_t length) {
+        free(data);
+    }
+};
+#endif
 
 // Each worker process should have a single instance of this class before using the v8 API
 class js_instance_t {
@@ -47,16 +64,25 @@ private:
     v8::Isolate *isolate_;
 
     scoped_ptr_t<v8::Platform> platform;
+#ifdef V8_NEEDS_BUFFER_ALLOCATOR
+    array_buffer_allocator_t array_buffer_allocator;
+#endif
 };
 
-js_instance_t *js_instance_t::instance = NULL;
+js_instance_t *js_instance_t::instance = nullptr;
 
 js_instance_t::js_instance_t() {
     v8::V8::InitializeICU();
     platform.init(v8::platform::CreateDefaultPlatform());
     v8::V8::InitializePlatform(platform.get());
     v8::V8::Initialize();
+#ifdef V8_NEEDS_BUFFER_ALLOCATOR
+    v8::Isolate::CreateParams params;
+    params.array_buffer_allocator = &array_buffer_allocator;
+    isolate_ = v8::Isolate::New(params);
+#else
     isolate_ = v8::Isolate::New();
+#endif
     isolate_->Enter();
 }
 
@@ -76,16 +102,24 @@ v8::Isolate *js_instance_t::isolate() {
 }
 
 void js_instance_t::maybe_initialize_v8() {
-    if (instance == NULL) {
+    if (instance == nullptr) {
         instance = new js_instance_t;
     }
 }
+
+// Wrapper around `v8::Persistent<v8::Value> >` that calls `Reset()` on destruction
+class persistent_value_t {
+public:
+    ~persistent_value_t() {
+        value.Reset();
+    }
+    v8::Persistent<v8::Value> value;
+};
 
 // Worker-side JS evaluation environment.
 class js_env_t {
 public:
     js_env_t();
-    ~js_env_t();
 
     js_result_t eval(const std::string &source, const ql::configured_limits_t &limits);
     js_result_t call(js_id_t id, const std::vector<ql::datum_t> &args,
@@ -95,10 +129,10 @@ public:
 
 private:
     js_id_t remember_value(const v8::Handle<v8::Value> &value);
-    const boost::shared_ptr<v8::Persistent<v8::Value> > find_value(js_id_t id);
+    const std::shared_ptr<persistent_value_t> find_value(js_id_t id);
 
     js_id_t next_id;
-    std::map<js_id_t, boost::shared_ptr<v8::Persistent<v8::Value> > > values;
+    std::map<js_id_t, std::shared_ptr<persistent_value_t> > values;
 };
 
 // Cleans the worker process's environment when instantiated
@@ -370,20 +404,13 @@ static void append_caught_error(std::string *err_out, const v8::TryCatch &try_ca
 
     v8::String::Utf8Value exception(try_catch.Exception());
     const char *message = *exception;
-    guarantee(message != NULL);
+    guarantee(message != nullptr);
     err_out->append(message, strlen(message));
 }
 
 // The env_t runs in the context of the worker process
 js_env_t::js_env_t() :
     next_id(MIN_ID) { }
-
-js_env_t::~js_env_t() {
-    // Clean up handles.
-    for (auto it = values.begin(); it != values.end(); ++it) {
-        it->second->Reset();
-    }
-}
 
 js_result_t js_env_t::eval(const std::string &source,
                            const ql::configured_limits_t &limits) {
@@ -446,15 +473,15 @@ js_id_t js_env_t::remember_value(const v8::Handle<v8::Value> &value) {
     // Save this value in a persistent handle so it isn't deallocated when
     // its scope is destructed.
 
-    boost::shared_ptr<v8::Persistent<v8::Value> > persistent_handle(new v8::Persistent<v8::Value>());
-    persistent_handle->Reset(js_instance_t::isolate(), value);
+    std::shared_ptr<persistent_value_t> persistent_handle(new persistent_value_t());
+    persistent_handle->value.Reset(js_instance_t::isolate(), value);
 
     values.insert(std::make_pair(id, persistent_handle));
     return id;
 }
 
-const boost::shared_ptr<v8::Persistent<v8::Value> > js_env_t::find_value(js_id_t id) {
-    std::map<js_id_t, boost::shared_ptr<v8::Persistent<v8::Value> > >::iterator it = values.find(id);
+const std::shared_ptr<persistent_value_t> js_env_t::find_value(js_id_t id) {
+    std::map<js_id_t, std::shared_ptr<persistent_value_t> >::iterator it = values.find(id);
     guarantee(it != values.end());
     return it->second;
 }
@@ -495,15 +522,16 @@ js_result_t js_env_t::call(js_id_t id,
     js_result_t result("");
     std::string *err_out = boost::get<std::string>(&result);
 
-    const boost::shared_ptr<v8::Persistent<v8::Value> > found_value = find_value(id);
-    guarantee(!found_value->IsEmpty());
+    const std::shared_ptr<persistent_value_t> found_value = find_value(id);
+    guarantee(!found_value->value.IsEmpty());
 
     v8::Isolate *isolate = js_instance_t::isolate();
 
     v8::HandleScope handle_scope(isolate);
 
     // Construct local handle from persistent handle
-    v8::Local<v8::Value> local_handle = v8::Local<v8::Value>::New(isolate, *found_value);
+    v8::Local<v8::Value> local_handle =
+        v8::Local<v8::Value>::New(isolate, found_value->value);
     v8::Local<v8::Function> fn = v8::Local<v8::Function>::Cast(local_handle);
     v8::Handle<v8::Value> value = run_js_func(fn, args, err_out);
 
@@ -643,7 +671,7 @@ ql::datum_t js_to_datum(const v8::Handle<v8::Value> &value,
                         const ql::configured_limits_t &limits,
                         std::string *err_out) {
     guarantee(!value.IsEmpty());
-    guarantee(err_out != NULL);
+    guarantee(err_out != nullptr);
 
     v8::HandleScope handle_scope(js_instance_t::isolate());
     err_out->assign("Unknown error when converting to ql::datum_t.");
@@ -687,7 +715,11 @@ v8::Handle<v8::Value> js_from_datum(const ql::datum_t &datum,
         for (size_t i = 0; i < datum.arr_size(); ++i) {
             v8::HandleScope scope(isolate);
             v8::Handle<v8::Value> val = js_from_datum(datum.get(i), err_out);
-            guarantee(!val.IsEmpty());
+            if (val.IsEmpty()) {
+                // The recursive call to `js_from_datum` should have set `err_out`
+                guarantee(!err_out->empty());
+                return v8::Handle<v8::Value>();
+            }
             array->Set(i, val);
         }
 
@@ -706,6 +738,11 @@ v8::Handle<v8::Value> js_from_datum(const ql::datum_t &datum,
                 v8::HandleScope scope(isolate);
                 v8::Handle<v8::Value> key = v8::String::NewFromUtf8(isolate, pair.first.to_std().c_str());
                 v8::Handle<v8::Value> val = js_from_datum(pair.second, err_out);
+                if (val.IsEmpty()) {
+                    // The recursive call to `js_from_datum` should have set `err_out`
+                    guarantee(!err_out->empty());
+                    return v8::Handle<v8::Value>();
+                }
                 guarantee(!key.IsEmpty() && !val.IsEmpty());
                 obj->Set(key, val);
             }

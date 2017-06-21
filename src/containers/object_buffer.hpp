@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "errors.hpp"
+#include "arch/compiler.hpp"
 
 // Caveat: do not use this template with an object that has a blocking destructor, if
 //  you are going to allocate multiple times using a single object_buffer_t.  This object
@@ -29,6 +30,7 @@ public:
     };
 
     object_buffer_t() : state(EMPTY) { }
+
     ~object_buffer_t() {
         // The buffer cannot be destroyed while an object is in the middle of
         //  constructing or destructing
@@ -41,7 +43,7 @@ public:
 
     template <class... Args>
     T *create(Args &&... args) {
-        rassert(state == EMPTY);
+        rassert(state == EMPTY, "state is %s", state_string());
         state = CONSTRUCTING;
         try {
             new (&object_data[0]) T(std::forward<Args>(args)...);
@@ -88,7 +90,7 @@ public:
 private:
     // Force alignment of the data to the alignment of the templatized type,
     // this avoids some optimization errors, see github issue #3300 for an example.
-    char object_data[sizeof(T)] __attribute__((aligned(alignof(T))));
+    ATTR_ALIGNED(alignof(T)) char object_data[sizeof(T)];
 
     enum buffer_state_t {
         EMPTY,
@@ -96,6 +98,16 @@ private:
         INSTANTIATED,
         DESTRUCTING
     } state;
+
+    const char *state_string() {
+        switch (state) {
+        case buffer_state_t::EMPTY: return "EMPTY";
+        case buffer_state_t::CONSTRUCTING: return "CONSTRUCTING";
+        case buffer_state_t::INSTANTIATED: return "INSTANTIATED";
+        case buffer_state_t::DESTRUCTING: return "DESTRUCTING";
+        default: return "corrupted!";
+        }
+    }
 
     DISABLE_COPYING(object_buffer_t);
 };

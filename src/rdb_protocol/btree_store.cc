@@ -11,6 +11,7 @@
 #include "btree/secondary_operations.hpp"
 #include "buffer_cache/alt.hpp"
 #include "buffer_cache/cache_balancer.hpp"
+#include "clustering/administration/issues/outdated_index.hpp"
 #include "concurrency/wait_any.hpp"
 #include "containers/archive/buffer_stream.hpp"
 #include "containers/archive/vector_stream.hpp"
@@ -21,7 +22,6 @@
 #include "rdb_protocol/btree.hpp"
 #include "rdb_protocol/erase_range.hpp"
 #include "rdb_protocol/protocol.hpp"
-#include "serializer/config.hpp"
 #include "stl_utils.hpp"
 
 // The maximal number of writes that can be in line for a superblock acquisition
@@ -62,7 +62,7 @@ sindex_not_ready_exc_t::sindex_not_ready_exc_t(
                          sindex_name.c_str(),
                          table_name.c_str());
     } else {
-        rassert(!sindex.post_construction_complete);
+        rassert(!sindex.post_construction_complete());
         info = strprintf("Index `%s` on table `%s` "
                          "was accessed before its construction was finished.",
                          sindex_name.c_str(),
@@ -76,7 +76,7 @@ const char* sindex_not_ready_exc_t::what() const throw() {
 
 sindex_not_ready_exc_t::~sindex_not_ready_exc_t() throw() { }
 
-store_t::store_t(const region_t &region,
+store_t::store_t(const region_t &_region,
                  serializer_t *serializer,
                  cache_balancer_t *balancer,
                  const std::string &perfmon_name,
@@ -85,16 +85,13 @@ store_t::store_t(const region_t &region,
                  rdb_context_t *_ctx,
                  io_backender_t *io_backender,
                  const base_path_t &base_path,
-                 /* TODO: We should track outdated indexes by looking at the Raft state,
-                 not by looking at the `store_t`. */
-                 scoped_ptr_t<outdated_index_report_t> &&_index_report,
-                 namespace_id_t _table_id)
-    : store_view_t(region),
+                 namespace_id_t _table_id,
+                 update_sindexes_t _update_sindexes)
+    : store_view_t(_region),
       perfmon_collection(),
       io_backender_(io_backender), base_path_(base_path),
       perfmon_collection_membership(parent_perfmon_collection, &perfmon_collection, perfmon_name),
       ctx(_ctx),
-      index_report(std::move(_index_report)),
       table_id(_table_id),
       write_superblock_acq_semaphore(WRITE_SUPERBLOCK_ACQ_WAITERS_LIMIT)
 {
@@ -115,9 +112,13 @@ store_t::store_t(const region_t &region,
         guarantee(!res);
 
         txn_t txn(general_cache_conn.get(), write_durability_t::HARD, 1);
-        buf_lock_t sb_lock(&txn, SUPERBLOCK_ID, alt_create_t::create);
-        real_superblock_t superblock(std::move(sb_lock));
-        btree_slice_t::init_real_superblock(&superblock, key.vector(), binary_blob_t());
+        {
+            buf_lock_t sb_lock(&txn, SUPERBLOCK_ID, alt_create_t::create);
+            real_superblock_t superblock(std::move(sb_lock));
+            btree_slice_t::init_real_superblock(
+                &superblock, key.vector(), binary_blob_t());
+        }
+        txn.commit();
     }
 
     btree.init(new btree_slice_t(cache.get(),
@@ -131,22 +132,21 @@ store_t::store_t(const region_t &region,
         // things yet, so this should work fairly quickly and does not need a real
         // interruptor.
         cond_t dummy_interruptor;
-        write_token_t token;
-        new_write_token(&token);
+        read_token_t token;
+        new_read_token(&token);
         scoped_ptr_t<txn_t> txn;
         scoped_ptr_t<real_superblock_t> superblock;
-        acquire_superblock_for_write(1,
-                                     write_durability_t::SOFT,
-                                     &token,
-                                     &txn,
-                                     &superblock,
-                                     &dummy_interruptor);
+        acquire_superblock_for_read(&token,
+                                    &txn,
+                                    &superblock,
+                                    &dummy_interruptor,
+                                    false /* don't use snapshot */ );
 
         metainfo.init(new store_metainfo_manager_t(superblock.get()));
 
         buf_lock_t sindex_block(superblock->expose_buf(),
                                 superblock->get_sindex_block_id(),
-                                access_t::write);
+                                access_t::read);
 
         std::map<sindex_name_t, secondary_index_t> sindexes;
         get_secondary_indexes(&sindex_block, &sindexes);
@@ -164,11 +164,17 @@ store_t::store_t(const region_t &region,
             secondary_index_slices.insert(std::make_pair(it->second.id,
                                                          std::move(slice)));
         }
-
-        update_outdated_sindex_list(&sindex_block);
     }
 
-    help_construct_bring_sindexes_up_to_date();
+    switch (_update_sindexes) {
+    case update_sindexes_t::UPDATE:
+        help_construct_bring_sindexes_up_to_date();
+        break;
+    case update_sindexes_t::LEAVE_ALONE:
+        break;
+    default:
+        unreachable();
+    }
 }
 
 store_t::~store_t() {
@@ -178,7 +184,7 @@ store_t::~store_t() {
 
 void store_t::read(
         DEBUG_ONLY(const metainfo_checker_t& metainfo_checker, )
-        const read_t &read,
+        const read_t &_read,
         read_response_t *response,
         read_token_t *token,
         signal_t *interruptor)
@@ -189,16 +195,16 @@ void store_t::read(
 
     acquire_superblock_for_read(token, &txn, &superblock,
                                 interruptor,
-                                read.use_snapshot());
+                                _read.use_snapshot());
     DEBUG_ONLY_CODE(metainfo->visit(
         superblock.get(), metainfo_checker.region, metainfo_checker.callback));
-    protocol_read(read, response, superblock.get(), interruptor);
+    protocol_read(_read, response, superblock.get(), interruptor);
 }
 
 void store_t::write(
         DEBUG_ONLY(const metainfo_checker_t& metainfo_checker, )
         const region_map_t<binary_blob_t>& new_metainfo,
-        const write_t &write,
+        const write_t &_write,
         write_response_t *response,
         const write_durability_t durability,
         state_timestamp_t timestamp,
@@ -211,13 +217,25 @@ void store_t::write(
     scoped_ptr_t<txn_t> txn;
     scoped_ptr_t<real_superblock_t> real_superblock;
     // We assume one block per document, plus changes to the stats block and superblock.
-    const int expected_change_count = 2 + write.expected_document_changes();
+    const int expected_change_count = 2 + _write.expected_document_changes();
     acquire_superblock_for_write(expected_change_count, durability, token,
                                  &txn, &real_superblock, interruptor);
     DEBUG_ONLY_CODE(metainfo->visit(
         real_superblock.get(), metainfo_checker.region, metainfo_checker.callback));
     metainfo->update(real_superblock.get(), new_metainfo);
-    protocol_write(write, response, timestamp, &real_superblock, interruptor);
+    try {
+        protocol_write(_write, response, timestamp, &real_superblock, interruptor);
+    } catch (const interrupted_exc_t &) {
+        // We hope that the operation itself is interruption-safe (i.e. always
+        // either completes all necessary changes that are part of the
+        // transaction, or doesn't perform any changes at all).
+        // Hence it should be save to commit here even when interrupted.
+        real_superblock.reset();
+        txn->commit();
+        throw;
+    }
+    real_superblock.reset();
+    txn->commit();
 }
 
 void store_t::reset_data(
@@ -277,6 +295,9 @@ void store_t::reset_data(
         if (!mod_reports.empty()) {
             update_sindexes(txn.get(), &sindex_block, mod_reports, true);
         }
+
+        sindex_block.reset_buf_lock();
+        txn->commit();
     }
 }
 
@@ -305,7 +326,7 @@ std::map<std::string, std::pair<sindex_config_t, sindex_status_t> > store_t::sin
         std::pair<sindex_config_t, sindex_status_t> *res = &results[pair.first.name];
         sindex_disk_info_t disk_info;
         try {
-            deserialize_sindex_info(pair.second.opaque_definition, &disk_info);
+            deserialize_sindex_info_or_crash(pair.second.opaque_definition, &disk_info);
         } catch (const archive_exc_t &) {
             crash("corrupted sindex definition");
         }
@@ -316,22 +337,19 @@ std::map<std::string, std::pair<sindex_config_t, sindex_status_t> > store_t::sin
         res->first.geo = disk_info.geo;
 
         res->second.outdated =
-            disk_info.mapping_version_info.latest_compatible_reql_version !=
-                reql_version_t::LATEST;
+            (disk_info.mapping_version_info.latest_compatible_reql_version !=
+             reql_version_t::LATEST)
+            && !outdated_index_issue_tracker_t::is_acceptable_outdated(res->first);
+
         if (pair.second.is_ready()) {
             res->second.ready = true;
-            res->second.blocks_processed = res->second.blocks_total = 0;
+            res->second.progress_numerator = 0.0;
+            res->second.progress_denominator = 0.0;
             res->second.start_time = -1;
         } else {
             res->second.ready = false;
-            progress_completion_fraction_t frac = get_sindex_progress(pair.second.id);
-            if (frac.estimate_of_total_nodes == -1) {
-                res->second.blocks_processed = 0;
-                res->second.blocks_total = 1;
-            } else {
-                res->second.blocks_processed = frac.estimate_of_released_nodes;
-                res->second.blocks_total = frac.estimate_of_total_nodes;
-            }
+            res->second.progress_numerator = get_sindex_progress(pair.second.id);
+            res->second.progress_denominator = 1.0;
             res->second.start_time = get_sindex_start_time(pair.second.id);
         }
     }
@@ -373,11 +391,19 @@ void store_t::sindex_create(
     guarantee(write_res == 0);
 
     sindex_name_t sindex_name(name);
-    bool success = add_sindex_internal(sindex_name, stream.vector(), &sindex_block);
-    guarantee(success, "sindex_create() called with a sindex name that exists");
+    optional<uuid_u> sindex_id = add_sindex_internal(
+        sindex_name, stream.vector(), &sindex_block);
+    guarantee(sindex_id, "sindex_create() called with a sindex name that exists");
 
-    rdb_protocol::bring_sindexes_up_to_date(
-        std::set<sindex_name_t>{sindex_name}, this, &sindex_block);
+    // Kick off index post construction
+    coro_t::spawn_sometime(std::bind(&rdb_protocol::resume_construct_sindex,
+                                     *sindex_id,
+                                     key_range_t::universe(),
+                                     this,
+                                     drainer.lock()));
+
+    sindex_block.reset_buf_lock();
+    txn->commit();
 }
 
 void store_t::sindex_rename_multi(
@@ -423,9 +449,8 @@ void store_t::sindex_rename_multi(
         pair.second.second->rename(&perfmon_collection, "index-" + pair.first);
     }
 
-    if (index_report.has()) {
-        index_report->indexes_renamed(name_changes);
-    }
+    sindex_block.reset_buf_lock();
+    txn->commit();
 }
 
 void store_t::sindex_drop(
@@ -452,14 +477,13 @@ void store_t::sindex_drop(
 
     /* Clear the sindex later. It starts its own transaction and we don't
     want to deadlock because we're still holding locks. */
-    coro_t::spawn_sometime(std::bind(&store_t::delayed_clear_sindex,
+    coro_t::spawn_sometime(std::bind(&store_t::delayed_clear_and_drop_sindex,
                                      this,
                                      sindex,
                                      drainer.lock()));
 
-    if (index_report.has()) {
-        index_report->index_dropped(name);
-    }
+    sindex_block.reset_buf_lock();
+    txn->commit();
 }
 
 new_mutex_in_line_t store_t::get_in_line_for_sindex_queue(buf_lock_t *sindex_block) {
@@ -472,13 +496,8 @@ new_mutex_in_line_t store_t::get_in_line_for_sindex_queue(buf_lock_t *sindex_blo
     // other transactions while we are doing that.
 
     guarantee(!sindex_block->empty());
-    if (sindex_block->access() == access_t::write) {
-        sindex_block->write_acq_signal()->wait();
-    } else {
-        // `bring_sindexes_up_to_date()` calls `lock_sindex_queue()` with only a read
-        // acquisition. It is ok in that context, and we have to handle it here.
-        sindex_block->read_acq_signal()->wait();
-    }
+    guarantee(sindex_block->access() == access_t::write);
+    sindex_block->write_acq_signal()->wait();
     return new_mutex_in_line_t(&sindex_queue_mutex);
 }
 
@@ -488,35 +507,36 @@ rwlock_in_line_t store_t::get_in_line_for_cfeed_stamp(access_t access) {
 
 
 void store_t::register_sindex_queue(
-            internal_disk_backed_queue_t *disk_backed_queue,
+            disk_backed_queue_wrapper_t<rdb_modification_report_t> *disk_backed_queue,
+            const key_range_t &construction_range,
             const new_mutex_in_line_t *acq) {
     assert_thread();
     acq->acq_signal()->wait_lazily_unordered();
 
-    for (std::vector<internal_disk_backed_queue_t *>::iterator it = sindex_queues.begin();
-            it != sindex_queues.end(); ++it) {
-        guarantee(*it != disk_backed_queue);
+    for (const auto &q : sindex_queues) {
+        guarantee(q.queue != disk_backed_queue);
     }
-    sindex_queues.push_back(disk_backed_queue);
+    sindex_queues.push_back(ranged_sindex_queue_t{construction_range,
+                                                  disk_backed_queue});
 }
 
 void store_t::deregister_sindex_queue(
-            internal_disk_backed_queue_t *disk_backed_queue,
+            disk_backed_queue_wrapper_t<rdb_modification_report_t> *disk_backed_queue,
             const new_mutex_in_line_t *acq) {
     assert_thread();
     acq->acq_signal()->wait_lazily_unordered();
 
-    for (std::vector<internal_disk_backed_queue_t *>::iterator it = sindex_queues.begin();
-            it != sindex_queues.end(); ++it) {
-        if (*it == disk_backed_queue) {
+    for (auto it = sindex_queues.begin(); it != sindex_queues.end(); ++it) {
+        if (it->queue == disk_backed_queue) {
             sindex_queues.erase(it);
             return;
         }
     }
+    unreachable();
 }
 
 void store_t::emergency_deregister_sindex_queue(
-    internal_disk_backed_queue_t *disk_backed_queue) {
+    disk_backed_queue_wrapper_t<rdb_modification_report_t> *disk_backed_queue) {
     assert_thread();
     drainer.assert_draining();
     new_mutex_in_line_t acq(&sindex_queue_mutex);
@@ -533,8 +553,7 @@ void store_t::update_sindexes(
     new_mutex_in_line_t acq = get_in_line_for_sindex_queue(sindex_block);
     {
         sindex_access_vector_t sindexes;
-        acquire_post_constructed_sindex_superblocks_for_write(
-                sindex_block, &sindexes);
+        acquire_all_sindex_superblocks_for_write(sindex_block, &sindexes);
         if (release_sindex_block) {
             sindex_block->reset_buf_lock();
         }
@@ -562,15 +581,9 @@ void store_t::sindex_queue_push(const rdb_modification_report_t &mod_report,
     assert_thread();
     acq->acq_signal()->wait_lazily_unordered();
 
-    if (!sindex_queues.empty()) {
-        // This is for a disk backed queue so there's no versioning issues.
-        // (deserializating_viewer_t in disk_backed_queue.hpp also uses the
-        // LATEST_DISK version, and such queues are ephemeral).
-        write_message_t wm;
-        serialize<cluster_version_t::LATEST_DISK>(&wm, mod_report);
-
-        for (auto it = sindex_queues.begin(); it != sindex_queues.end(); ++it) {
-            (*it)->push(wm);
+    for (auto it = sindex_queues.begin(); it != sindex_queues.end(); ++it) {
+        if (it->construction_range.contains_key(mod_report.primary_key)) {
+            it->queue->push(mod_report);
         }
     }
 }
@@ -581,25 +594,21 @@ void store_t::sindex_queue_push(
     assert_thread();
     acq->acq_signal()->wait_lazily_unordered();
 
-    if (!sindex_queues.empty()) {
-        scoped_array_t<write_message_t> wms(mod_reports.size());
-        for (size_t i = 0; i < mod_reports.size(); ++i) {
-            // This is for a disk backed queue so there are no versioning issues.
-            serialize<cluster_version_t::LATEST_DISK>(&wms[i], mod_reports[i]);
-        }
-
+    for (size_t i = 0; i < mod_reports.size(); ++i) {
         for (auto it = sindex_queues.begin(); it != sindex_queues.end(); ++it) {
-            (*it)->push(wms);
+            if (it->construction_range.contains_key(mod_reports[i].primary_key)) {
+                it->queue->push(mod_reports[i]);
+            }
         }
     }
 }
 
-progress_completion_fraction_t store_t::get_sindex_progress(uuid_u const &id) {
+double store_t::get_sindex_progress(uuid_u const &id) {
     auto iterator = sindex_context.find(id);
     if (iterator == sindex_context.end()) {
-        return progress_completion_fraction_t();
+        return 0.0;
     } else {
-        return iterator->second.second->guess_completion();
+        return *iterator->second.second;
     }
 }
 
@@ -612,13 +621,13 @@ microtime_t store_t::get_sindex_start_time(uuid_u const &id) {
     }
 }
 
-bool store_t::add_sindex_internal(
+optional<uuid_u> store_t::add_sindex_internal(
         const sindex_name_t &name,
         const std::vector<char> &opaque_definition,
         buf_lock_t *sindex_block) {
     secondary_index_t sindex;
     if (::get_secondary_index(sindex_block, name, &sindex)) {
-        return false; // sindex was already created
+        return r_nullopt; // sindex was already created
     } else {
         {
             buf_lock_t sb_lock(sindex_block, alt_create_t::create);
@@ -636,10 +645,10 @@ bool store_t::add_sindex_internal(
                                                           name.name,
                                                           index_type_t::SECONDARY)));
 
-        sindex.post_construction_complete = false;
+        sindex.needs_post_construction_range = key_range_t::universe();
 
         ::set_secondary_index(sindex_block, name, sindex);
-        return true;
+        return make_optional(sindex.id);
     }
 }
 
@@ -652,12 +661,29 @@ sindex_name_t compute_sindex_deletion_name(uuid_u sindex_uuid) {
 class clear_sindex_traversal_cb_t
         : public depth_first_traversal_callback_t {
 public:
-    clear_sindex_traversal_cb_t() {
+    explicit clear_sindex_traversal_cb_t(const key_range_t &pkey_rng)
+        : pkey_range(pkey_rng),
+          num_traversed(0),
+          last_traversed_key(store_key_t::min()) {
         collected_keys.reserve(CHUNK_SIZE);
     }
     continue_bool_t handle_pair(scoped_key_value_t &&keyvalue, signal_t *) {
-        collected_keys.push_back(store_key_t(keyvalue.key()));
-        if (collected_keys.size() >= CHUNK_SIZE) {
+        store_key_t key(keyvalue.key());
+        // Skip keys that are not in the given primary key range.
+        // As a special case, we skip calling `extract_primary` if the range
+        // is `universe`. This avoids issues such as
+        // https://github.com/rethinkdb/rethinkdb/issues/5158 where we are unable
+        // to parse the keys of deleted indexes because they are in a deprecated
+        // format.
+        if (pkey_range == key_range_t::universe()
+            || pkey_range.contains_key(
+                   ql::datum_t::extract_primary(key))) {
+            collected_keys.push_back(store_key_t(keyvalue.key()));
+        }
+        ++num_traversed;
+        rassert(key > last_traversed_key);
+        last_traversed_key = key;
+        if (num_traversed >= CHUNK_SIZE) {
             return continue_bool_t::ABORT;
         } else {
             return continue_bool_t::CONTINUE;
@@ -666,22 +692,31 @@ public:
     const std::vector<store_key_t> &get_keys() const {
         return collected_keys;
     }
+    store_key_t get_last_traversed_key() const {
+        return last_traversed_key;
+    }
     static const size_t CHUNK_SIZE = 32;
 private:
+    key_range_t pkey_range;
     std::vector<store_key_t> collected_keys;
+    size_t num_traversed;
+    store_key_t last_traversed_key;
 };
 
-void store_t::clear_sindex(
-        secondary_index_t sindex,
+void store_t::clear_sindex_data(
+        uuid_u sindex_id,
         value_sizer_t *sizer,
         const deletion_context_t *deletion_context,
+        const key_range_t &pkey_range_to_clear,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t) {
-
     /* Delete one piece of the secondary index at a time */
+    key_range_t remaining_range = key_range_t::universe();
     for (bool reached_end = false; !reached_end;)
     {
-        /* Start a transaction (1). */
+        coro_t::yield();
+
+        /* Start a write transaction. */
         write_token_t token;
         new_write_token(&token);
         scoped_ptr_t<txn_t> txn;
@@ -695,11 +730,19 @@ void store_t::clear_sindex(
             &superblock,
             interruptor);
 
-        /* Get the sindex block (1). */
+        /* Get the sindex block. */
         buf_lock_t sindex_block(superblock->expose_buf(),
                                 superblock->get_sindex_block_id(),
                                 access_t::write);
         superblock->release();
+
+        secondary_index_t sindex;
+        bool found = get_secondary_index(&sindex_block, sindex_id, &sindex);
+        if (!found) {
+            // The index got dropped by someone else. That's ok, there's nothing left
+            // to do for us.
+            return;
+        }
 
         /* Clear part of the index data */
         buf_lock_t sindex_superblock_lock(buf_parent_t(&sindex_block),
@@ -709,15 +752,30 @@ void store_t::clear_sindex(
             = make_scoped<sindex_superblock_t>(std::move(sindex_superblock_lock));
 
         /* 1. Collect a bunch of keys to delete */
-        clear_sindex_traversal_cb_t traversal_cb;
-        reached_end = (continue_bool_t::CONTINUE == btree_depth_first_traversal(
-            sindex_superblock.get(),
-            key_range_t::universe(),
-            &traversal_cb,
-            access_t::read,
-            direction_t::FORWARD,
-            release_superblock_t::KEEP,
-            interruptor));
+        clear_sindex_traversal_cb_t traversal_cb(pkey_range_to_clear);
+        try {
+            reached_end =
+                (continue_bool_t::CONTINUE == btree_depth_first_traversal(
+                    sindex_superblock.get(),
+                    remaining_range,
+                    &traversal_cb,
+                    access_t::read,
+                    direction_t::FORWARD,
+                    release_superblock_t::KEEP,
+                    interruptor));
+        } catch (const interrupted_exc_t &) {
+            // It's safe to interrupt in the middle of clearing the index.
+            sindex_superblock.reset();
+            txn->commit();
+            throw;
+        }
+
+        /* Update the traversal range so we don't traverse the same range again */
+        remaining_range = key_range_t(
+            key_range_t::open,
+            traversal_cb.get_last_traversed_key(),
+            key_range_t::none,
+            store_key_t());
 
         /* 2. Actually delete them */
         const std::vector<store_key_t> &keys = traversal_cb.get_keys();
@@ -731,12 +789,13 @@ void store_t::clear_sindex(
                         &kv_location, NULL /* trace */,
                         &superblock_promise);
 
-                deletion_context->in_tree_deleter()->delete_value(
-                    buf_parent_t(&kv_location.buf), kv_location.value.get());
-                kv_location.value.reset();
                 if (kv_location.there_originally_was_value) {
-                    buf_write_t write(&kv_location.buf);
-                    auto leaf_node = static_cast<leaf_node_t *>(write.get_data_write());
+                    deletion_context->in_tree_deleter()->delete_value(
+                        buf_parent_t(&kv_location.buf), kv_location.value.get());
+                    kv_location.value.reset();
+
+                    buf_write_t buf_write(&kv_location.buf);
+                    auto leaf_node = static_cast<leaf_node_t *>(buf_write.get_data_write());
                     leaf::remove(sizer,
                                  leaf_node,
                                  keys[i].btree_key(),
@@ -756,99 +815,115 @@ void store_t::clear_sindex(
             sindex_superblock.init(static_cast<sindex_superblock_t *>(
                 superblock_promise.wait()));
         }
+
+        sindex_superblock.reset();
+        txn->commit();
+    }
+}
+
+void store_t::drop_sindex(uuid_u sindex_id) THROWS_NOTHING {
+    /* Start a transaction. */
+    write_token_t token;
+    new_write_token(&token);
+    scoped_ptr_t<txn_t> txn;
+    scoped_ptr_t<real_superblock_t> superblock;
+    cond_t non_interruptor;
+    acquire_superblock_for_write(
+        2,
+        write_durability_t::SOFT,
+        &token,
+        &txn,
+        &superblock,
+        &non_interruptor);
+
+    /* Get the sindex block. */
+    buf_lock_t sindex_block(superblock->expose_buf(),
+                            superblock->get_sindex_block_id(),
+                            access_t::write);
+    superblock->release();
+
+    secondary_index_t sindex;
+    bool found = get_secondary_index(&sindex_block, sindex_id, &sindex);
+    if (!found) {
+        // The index got dropped by someone else. That's ok, there's nothing left for us
+        // to do.
+        return;
     }
 
+    /* The root node should have been emptied at this point. Delete it */
     {
-        /* Start a transaction (2). */
-        write_token_t token;
-        new_write_token(&token);
-        scoped_ptr_t<txn_t> txn;
-        scoped_ptr_t<real_superblock_t> superblock;
-        acquire_superblock_for_write(
-            2,
-            write_durability_t::SOFT,
-            &token,
-            &txn,
-            &superblock,
-            interruptor);
-
-        /* Get the sindex block (2). */
-        buf_lock_t sindex_block(superblock->expose_buf(),
-                                superblock->get_sindex_block_id(),
-                                access_t::write);
-        superblock->release();
-
-        /* The root node should have been emptied at this point. Delete it */
-        {
-            buf_lock_t sindex_superblock_lock(buf_parent_t(&sindex_block),
-                                              sindex.superblock, access_t::write);
-            sindex_superblock_t sindex_superblock(std::move(sindex_superblock_lock));
-            if (sindex_superblock.get_root_block_id() != NULL_BLOCK_ID) {
-                buf_lock_t root_node(sindex_superblock.expose_buf(),
-                                     sindex_superblock.get_root_block_id(),
-                                     access_t::write);
-                {
-                    /* Guarantee that the root is actually empty. */
-                    buf_read_t rread(&root_node);
-                    const node_t *node = static_cast<const node_t *>(
-                            rread.get_data_read());
-                    if (node::is_internal(node)) {
-                        const internal_node_t *root_int_node
-                            = static_cast<const internal_node_t *>(
-                                rread.get_data_read());
-                        /* This just prints a warning in release mode for now,
-                        because leaking a few blocks is probably better than
-                        making the database inaccessible. */
-                        rassert(root_int_node->npairs == 0);
-                        if (root_int_node->npairs != 0) {
-                            logWRN("The secondary index tree was not empty after "
-                                   "clearing it. We are leaking some data blocks. "
-                                   "Please report this issue at "
-                                   "https://github.com/rethinkdb/rethinkdb/issues/");
-                        }
-                    }
-                    /* If the root is a leaf we are good */
-                }
-                /* Delete the root */
-                root_node.write_acq_signal()->wait_lazily_unordered();
-                root_node.mark_deleted();
-            }
-            /* Under normal circumstances, sindex superblocks do not have stat or sindex
-            blocks. However, we used to create stat and sindex blocks, so some very old
-            secondary indexes may still have them. Here we check for them and delete them
-            if they are present. */
-            if (sindex_superblock.get_stat_block_id() != NULL_BLOCK_ID) {
-                buf_lock_t stat_block(sindex_superblock.expose_buf(),
-                                      sindex_superblock.get_stat_block_id(),
-                                      access_t::write);
-                stat_block.write_acq_signal()->wait_lazily_unordered();
-                stat_block.mark_deleted();
-            }
-            if (sindex_superblock.get_sindex_block_id() != NULL_BLOCK_ID) {
-                buf_lock_t sind_block(sindex_superblock.expose_buf(),
-                                      sindex_superblock.get_sindex_block_id(),
-                                      access_t::write);
-                sind_block.write_acq_signal()->wait_lazily_unordered();
-                sind_block.mark_deleted();
-            }
-        }
-        /* Now it's safe to completely delete the index */
         buf_lock_t sindex_superblock_lock(buf_parent_t(&sindex_block),
                                           sindex.superblock, access_t::write);
-        sindex_superblock_lock.write_acq_signal()->wait_lazily_unordered();
-        sindex_superblock_lock.mark_deleted();
-        ::delete_secondary_index(&sindex_block, compute_sindex_deletion_name(sindex.id));
-        size_t num_erased = secondary_index_slices.erase(sindex.id);
-        guarantee(num_erased == 1);
+        sindex_superblock_t sindex_superblock(std::move(sindex_superblock_lock));
+        if (sindex_superblock.get_root_block_id() != NULL_BLOCK_ID) {
+            buf_lock_t root_node(sindex_superblock.expose_buf(),
+                                 sindex_superblock.get_root_block_id(),
+                                 access_t::write);
+            {
+                /* Guarantee that the root is actually empty. */
+                buf_read_t rread(&root_node);
+                const node_t *node = static_cast<const node_t *>(
+                        rread.get_data_read());
+                if (node::is_internal(node)) {
+                    const internal_node_t *root_int_node
+                        = static_cast<const internal_node_t *>(
+                            rread.get_data_read());
+                    /* This just prints a warning in release mode for now,
+                    because leaking a few blocks is probably better than
+                    making the database inaccessible. */
+                    rassert(root_int_node->npairs == 0);
+                    if (root_int_node->npairs != 0) {
+                        logWRN("The secondary index tree was not empty after "
+                               "clearing it. We are leaking some data blocks. "
+                               "Please report this issue at "
+                               "https://github.com/rethinkdb/rethinkdb/issues/");
+                    }
+                }
+                /* If the root is a leaf we are good */
+            }
+            /* Delete the root */
+            root_node.write_acq_signal()->wait_lazily_unordered();
+            root_node.mark_deleted();
+        }
+        /* Under normal circumstances, sindex superblocks do not have stat or sindex
+        blocks. However, we used to create stat and sindex blocks, so some very old
+        secondary indexes may still have them. Here we check for them and delete them
+        if they are present. */
+        if (sindex_superblock.get_stat_block_id() != NULL_BLOCK_ID) {
+            buf_lock_t stat_block(sindex_superblock.expose_buf(),
+                                  sindex_superblock.get_stat_block_id(),
+                                  access_t::write);
+            stat_block.write_acq_signal()->wait_lazily_unordered();
+            stat_block.mark_deleted();
+        }
+        if (sindex_superblock.get_sindex_block_id() != NULL_BLOCK_ID) {
+            buf_lock_t sind_block(sindex_superblock.expose_buf(),
+                                  sindex_superblock.get_sindex_block_id(),
+                                  access_t::write);
+            sind_block.write_acq_signal()->wait_lazily_unordered();
+            sind_block.mark_deleted();
+        }
     }
+    /* Now it's safe to completely delete the index */
+    buf_lock_t sindex_superblock_lock(buf_parent_t(&sindex_block),
+                                      sindex.superblock, access_t::write);
+    sindex_superblock_lock.write_acq_signal()->wait_lazily_unordered();
+    sindex_superblock_lock.mark_deleted();
+    ::delete_secondary_index(&sindex_block, compute_sindex_deletion_name(sindex.id));
+    size_t num_erased = secondary_index_slices.erase(sindex.id);
+    guarantee(num_erased == 1);
+
+    sindex_superblock_lock.reset_buf_lock();
+    sindex_block.reset_buf_lock();
+    txn->commit();
 }
 
 bool secondary_indexes_are_equivalent(const std::vector<char> &left,
                                       const std::vector<char> &right) {
     sindex_disk_info_t sindex_info_left;
     sindex_disk_info_t sindex_info_right;
-    deserialize_sindex_info(left, &sindex_info_left);
-    deserialize_sindex_info(right, &sindex_info_right);
+    deserialize_sindex_info_or_crash(left, &sindex_info_left);
+    deserialize_sindex_info_or_crash(right, &sindex_info_right);
 
     if (sindex_info_left.multi == sindex_info_right.multi &&
         sindex_info_left.geo == sindex_info_right.geo &&
@@ -894,29 +969,15 @@ std::map<sindex_name_t, secondary_index_t> store_t::get_sindexes() const {
     return sindexes;
 }
 
-bool store_t::mark_index_up_to_date(const sindex_name_t &name,
-                                    buf_lock_t *sindex_block)
-    THROWS_NOTHING {
-    secondary_index_t sindex;
-    bool found = ::get_secondary_index(sindex_block, name, &sindex);
-
-    if (found) {
-        sindex.post_construction_complete = true;
-
-        ::set_secondary_index(sindex_block, name, sindex);
-    }
-
-    return found;
-}
-
 bool store_t::mark_index_up_to_date(uuid_u id,
-                                    buf_lock_t *sindex_block)
+                                    buf_lock_t *sindex_block,
+                                    const key_range_t &except_for_remaining_range)
     THROWS_NOTHING {
     secondary_index_t sindex;
     bool found = ::get_secondary_index(sindex_block, id, &sindex);
 
     if (found) {
-        sindex.post_construction_complete = true;
+        sindex.needs_post_construction_range = except_for_remaining_range;
 
         ::set_secondary_index(sindex_block, id, sindex);
     }
@@ -1054,71 +1115,13 @@ void store_t::acquire_all_sindex_superblocks_for_write(
         sindex_access_vector_t *sindex_sbs_out)
     THROWS_ONLY(sindex_not_ready_exc_t) {
     acquire_sindex_superblocks_for_write(
-            boost::optional<std::set<sindex_name_t> >(),
+            r_nullopt,
             sindex_block,
             sindex_sbs_out);
 }
 
-void store_t::acquire_post_constructed_sindex_superblocks_for_write(
-        buf_lock_t *sindex_block,
-        sindex_access_vector_t *sindex_sbs_out)
-    THROWS_NOTHING {
-    assert_thread();
-    std::set<sindex_name_t> sindexes_to_acquire;
-    std::map<sindex_name_t, secondary_index_t> sindexes;
-    ::get_secondary_indexes(sindex_block, &sindexes);
-
-    for (auto it = sindexes.begin(); it != sindexes.end(); ++it) {
-        /* Note that this can include indexes currently being deleted.
-        In fact it must include those indexes if they had been post constructed
-        before, since there might still be ongoing transactions traversing the
-        index despite it being under deletion.*/
-        if (it->second.post_construction_complete) {
-            sindexes_to_acquire.insert(it->first);
-        }
-    }
-
-    acquire_sindex_superblocks_for_write(
-            sindexes_to_acquire, sindex_block,
-            sindex_sbs_out);
-}
-
 bool store_t::acquire_sindex_superblocks_for_write(
-            boost::optional<std::set<sindex_name_t> > sindexes_to_acquire, //none means acquire all sindexes
-            buf_lock_t *sindex_block,
-            sindex_access_vector_t *sindex_sbs_out)
-    THROWS_ONLY(sindex_not_ready_exc_t) {
-    assert_thread();
-
-    std::map<sindex_name_t, secondary_index_t> sindexes;
-    ::get_secondary_indexes(sindex_block, &sindexes);
-
-    for (auto it = sindexes.begin(); it != sindexes.end(); ++it) {
-        if (sindexes_to_acquire && !std_contains(*sindexes_to_acquire, it->first)) {
-            continue;
-        }
-
-        /* Getting the slice and asserting we're on the right thread. */
-        btree_slice_t *sindex_slice = secondary_index_slices.at(it->second.id).get();
-        sindex_slice->assert_thread();
-
-        buf_lock_t superblock_lock(
-                sindex_block, it->second.superblock, access_t::write);
-
-        sindex_sbs_out->push_back(
-                make_scoped<sindex_access_t>(
-                        get_sindex_slice(it->second.id),
-                        it->first,
-                        it->second,
-                        make_scoped<sindex_superblock_t>(std::move(superblock_lock))));
-    }
-
-    //return's true if we got all of the sindexes requested.
-    return sindex_sbs_out->size() == sindexes_to_acquire->size();
-}
-
-bool store_t::acquire_sindex_superblocks_for_write(
-            boost::optional<std::set<uuid_u> > sindexes_to_acquire, //none means acquire all sindexes
+            optional<std::set<uuid_u> > sindexes_to_acquire, //none means acquire all sindexes
             buf_lock_t *sindex_block,
             sindex_access_vector_t *sindex_sbs_out)
     THROWS_ONLY(sindex_not_ready_exc_t) {
@@ -1147,14 +1150,14 @@ bool store_t::acquire_sindex_superblocks_for_write(
                         make_scoped<sindex_superblock_t>(std::move(superblock_lock))));
     }
 
-    //return's true if we got all of the sindexes requested.
-    return sindex_sbs_out->size() == sindexes_to_acquire->size();
+    // return's true if we got all of the sindexes requested.
+    return !sindexes_to_acquire || sindex_sbs_out->size() == sindexes_to_acquire->size();
 }
 
 region_map_t<binary_blob_t> store_t::get_metainfo(
         UNUSED order_token_t order_token,  // TODO
         read_token_t *token,
-        const region_t &region,
+        const region_t &_region,
         signal_t *interruptor)
     THROWS_ONLY(interrupted_exc_t) {
     assert_thread();
@@ -1164,7 +1167,7 @@ region_map_t<binary_blob_t> store_t::get_metainfo(
                                 &txn, &superblock,
                                 interruptor,
                                 false /* KSI: christ */);
-    return metainfo->get(superblock.get(), region);
+    return metainfo->get(superblock.get(), _region);
 }
 
 void store_t::set_metainfo(const region_map_t<binary_blob_t> &new_metainfo,
@@ -1175,14 +1178,18 @@ void store_t::set_metainfo(const region_map_t<binary_blob_t> &new_metainfo,
     assert_thread();
 
     scoped_ptr_t<txn_t> txn;
-    scoped_ptr_t<real_superblock_t> superblock;
-    acquire_superblock_for_write(1,
-                                 durability,
-                                 token,
-                                 &txn,
-                                 &superblock,
-                                 interruptor);
-    metainfo->update(superblock.get(), new_metainfo);
+    {
+        scoped_ptr_t<real_superblock_t> superblock;
+        acquire_superblock_for_write(
+            1,
+            durability,
+            token,
+            &txn,
+            &superblock,
+            interruptor);
+        metainfo->update(superblock.get(), new_metainfo);
+    }
+    txn->commit();
 }
 
 cluster_version_t store_t::metainfo_version(read_token_t *token,
@@ -1202,19 +1209,23 @@ void store_t::migrate_metainfo(
         write_token_t *token,
         cluster_version_t from,
         cluster_version_t to,
-        const std::function<binary_blob_t(const binary_blob_t &)> &cb,
+        const std::function<binary_blob_t(const region_t &, const binary_blob_t &)> &cb,
         signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) {
     assert_thread();
 
     scoped_ptr_t<txn_t> txn;
-    scoped_ptr_t<real_superblock_t> superblock;
-    acquire_superblock_for_write(1,
-                                 write_durability_t::HARD,
-                                 token,
-                                 &txn,
-                                 &superblock,
-                                 interruptor);
-    metainfo->migrate(superblock.get(), from, to, get_region(), cb);
+    {
+        scoped_ptr_t<real_superblock_t> superblock;
+        acquire_superblock_for_write(
+            1,
+            write_durability_t::HARD,
+            token,
+            &txn,
+            &superblock,
+            interruptor);
+        metainfo->migrate(superblock.get(), from, to, get_region(), cb);
+    }
+    txn->commit();
 }
 
 void store_t::acquire_superblock_for_read(

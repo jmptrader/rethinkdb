@@ -2,9 +2,6 @@
 #ifndef CLUSTERING_TABLE_MANAGER_TABLE_METADATA_HPP_
 #define CLUSTERING_TABLE_MANAGER_TABLE_METADATA_HPP_
 
-#include "errors.hpp"
-#include <boost/optional.hpp>
-
 #include "clustering/administration/persist/file.hpp"
 #include "clustering/generic/minidir.hpp"
 #include "clustering/generic/raft_core.hpp"
@@ -12,6 +9,7 @@
 #include "clustering/table_contract/contract_metadata.hpp"
 #include "clustering/table_contract/cpu_sharding.hpp"
 #include "clustering/table_contract/executor/exec.hpp"
+#include "containers/optional.hpp"
 #include "rpc/mailbox/typed.hpp"
 
 /* Every message to the `action_mailbox` has an `multi_table_manager_timestamp_t`
@@ -20,40 +18,22 @@ class multi_table_manager_timestamp_t {
 public:
     class epoch_t {
     public:
-        static epoch_t min() {
-            epoch_t e;
-            e.id = nil_uuid();
-            e.timestamp = 0;
-            return e;
-        }
+        static epoch_t min();
+        static epoch_t deletion();
+        static epoch_t migrate(time_t ts);
+        static epoch_t make(const epoch_t &prev);
 
-        static epoch_t deletion() {
-            epoch_t e;
-            e.id = nil_uuid();
-            e.timestamp = std::numeric_limits<microtime_t>::max();
-            return e;
-        }
+        ql::datum_t to_datum() const;
 
-        bool is_deletion() const {
-            return id.is_nil();
-        }
-
-        bool operator==(const epoch_t &other) const {
-            return timestamp == other.timestamp && id == other.id;
-        }
-        bool operator!=(const epoch_t &other) const {
-            return !(*this == other);
-        }
-
-        bool supersedes(const epoch_t &other) const {
-            if (timestamp > other.timestamp) {
-                return true;
-            } else if (timestamp < other.timestamp) {
-                return false;
-            } else {
-                return other.id < id;
-            }
-        }
+        bool is_unset() const;
+        bool is_deletion() const;
+        bool operator==(const epoch_t &other) const;
+        bool operator!=(const epoch_t &other) const;
+        bool supersedes(const epoch_t &other) const;
+    private:
+        // Workaround for issue #4668 - invalid timestamps that were migrated
+        // These timestamps should never supercede any other timestamps
+        static const microtime_t special_timestamp;
 
         /* Every table's lifetime is divided into "epochs". Each epoch corresponds to
         one Raft instance. Normally tables only have one epoch; a new epoch is created
@@ -67,6 +47,9 @@ public:
         example. */
         microtime_t timestamp;
         uuid_u id;
+
+        // Keep the class keyword here to satisfy VC++
+        RDB_DECLARE_ME_SERIALIZABLE(class epoch_t);
     };
 
     static multi_table_manager_timestamp_t min() {
@@ -103,12 +86,12 @@ public:
         return log_index > other.log_index;
     }
 
+    // TODO: make the data members private and strictly control how they may be changed
     epoch_t epoch;
 
     /* Within each epoch, Raft log indices provide a monotonically increasing clock. */
     raft_log_index_t log_index;
 };
-RDB_DECLARE_SERIALIZABLE(multi_table_manager_timestamp_t::epoch_t);
 RDB_DECLARE_SERIALIZABLE(multi_table_manager_timestamp_t);
 
 /* In VERIFIED mode, the all replicas ready check makes sure that the leader
@@ -151,14 +134,14 @@ public:
     table_status_response_t() : all_replicas_ready(false) { }
 
     /* `config` is controlled by `want_config`. */
-    boost::optional<table_config_and_shards_t> config;
+    optional<table_config_and_shards_t> config;
 
     /* `sindexes` is controlled by `want_sindexes`. */
     std::map<std::string, std::pair<sindex_config_t, sindex_status_t> > sindexes;
 
     /* `raft_state` and `raft_state_timestamp` are controlled by `want_raft_state` */
-    boost::optional<table_raft_state_t> raft_state;
-    boost::optional<multi_table_manager_timestamp_t> raft_state_timestamp;
+    optional<table_raft_state_t> raft_state;
+    optional<multi_table_manager_timestamp_t> raft_state_timestamp;
 
     /* `contract_acks` is controlled by `want_contract_acks` */
     std::map<contract_id_t, contract_ack_t> contract_acks;
@@ -194,27 +177,29 @@ public:
     - `MAYBE_ACTIVE` means the sender doesn't know if the receiver is supposed to be
         hosting the table or not. `basic_config` will be present but `member_id` and
         `initial_state` will be empty. */
-    typedef mailbox_t<void(
-        namespace_id_t table_id,
-        multi_table_manager_timestamp_t timestamp,
-        status_t status,
-        boost::optional<table_basic_config_t> basic_config,
-        boost::optional<raft_member_id_t> raft_member_id,
-        boost::optional<raft_persistent_state_t<table_raft_state_t> > initial_raft_state,
-        mailbox_t<void()>::address_t ack_addr
-        )> action_mailbox_t;
+    struct action_message_t {
+        namespace_id_t table_id;
+        multi_table_manager_timestamp_t timestamp;
+        status_t status;
+        optional<table_basic_config_t> basic_config;
+        optional<raft_member_id_t> raft_member_id;
+        optional<raft_persistent_state_t<table_raft_state_t> > initial_raft_state;
+        optional<raft_start_election_immediately_t> start_election_immediately;
+        mailbox_t<>::address_t ack_addr;
+    };
+
+    typedef mailbox_t<action_message_t> action_mailbox_t;
     action_mailbox_t::address_t action_mailbox;
 
     /* `get_status_mailbox` retrieves configurations, current statuses, etc. for one or
     more tables. Many different types of status queries are combined into one mailbox in
     order to allow more code to be re-used. */
-    typedef mailbox_t<void(
-        std::set<namespace_id_t> table_ids,
-        table_status_request_t request,
-        mailbox_t<void(
-            std::map<namespace_id_t, table_status_response_t>
-            )>::address_t reply_addr
-        )> get_status_mailbox_t;
+    struct get_status_message_t {
+        std::set<namespace_id_t> table_ids;
+        table_status_request_t request;
+        mailbox_t<std::map<namespace_id_t, table_status_response_t>>::address_t reply_addr;
+    };
+    typedef mailbox_t<get_status_message_t> get_status_mailbox_t;
     get_status_mailbox_t::address_t get_status_mailbox;
 
     /* The server ID of the server sending this business card. In theory you could figure
@@ -227,6 +212,8 @@ ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(
     int8_t,
     multi_table_manager_bcard_t::status_t::ACTIVE,
     multi_table_manager_bcard_t::status_t::MAYBE_ACTIVE);
+RDB_DECLARE_SERIALIZABLE(multi_table_manager_bcard_t::action_message_t);
+RDB_DECLARE_SERIALIZABLE(multi_table_manager_bcard_t::get_status_message_t);
 RDB_DECLARE_SERIALIZABLE(multi_table_manager_bcard_t);
 
 class table_manager_bcard_t {
@@ -249,13 +236,12 @@ public:
         initial config change message will trigger subsequent action messages to add and
         remove the servers. If the change was committed, it returns the action timestamp
         for the commit; the client can use this to determine which servers have seen the
-        commit. If something goes wrong, it returns an empty `boost::optional`, in which
+        commit. If something goes wrong, it returns an empty `optional`, in which
         case the change may or may not eventually be committed. */
-        typedef mailbox_t<void(
-            table_config_and_shards_t new_config_and_shards,
-            mailbox_t<void(boost::optional<multi_table_manager_timestamp_t>
-                )>::address_t reply_addr
-            )> set_config_mailbox_t;
+        typedef mailbox_t<
+            table_config_and_shards_change_t,
+            mailbox_addr_t<optional<multi_table_manager_timestamp_t>, bool>
+            > set_config_mailbox_t;
         set_config_mailbox_t::address_t set_config_mailbox;
 
         /* `contract_executor_t`s for this table on other servers send contract acks to
@@ -263,7 +249,7 @@ public:
         minidir_bcard_t<std::pair<server_id_t, contract_id_t>, contract_ack_t>
             contract_ack_minidir_bcard;
     };
-    boost::optional<leader_bcard_t> leader;
+    optional<leader_bcard_t> leader;
 
     /* This timestamp contains a `raft_log_index_t`. It would be expensive to update the
     directory every time a Raft commit happened. Therefore, this timestamp is only
@@ -342,20 +328,17 @@ public:
         const namespace_id_t &table_id,
         const table_active_persistent_state_t &state,
         const raft_persistent_state_t<table_raft_state_t> &raft_state,
-        signal_t *interruptor,
         raft_storage_interface_t<table_raft_state_t> **raft_storage_out) = 0;
 
     /* `write_metadata_inactive()` sets the stored metadata for the table to be the given
     `state`, which is inactive. */
     virtual void write_metadata_inactive(
         const namespace_id_t &table_id,
-        const table_inactive_persistent_state_t &state,
-        signal_t *interruptor) = 0;
+        const table_inactive_persistent_state_t &state) = 0;
 
     /* `delete_metadata()` deletes all metadata for the table. */
     virtual void delete_metadata(
-        const namespace_id_t &table_id,
-        signal_t *interruptor) = 0;
+        const namespace_id_t &table_id) = 0;
 
     virtual void load_multistore(
         const namespace_id_t &table_id,
@@ -370,8 +353,7 @@ public:
         perfmon_collection_t *perfmon_collection_serializers) = 0;
     virtual void destroy_multistore(
         const namespace_id_t &table_id,
-        scoped_ptr_t<multistore_ptr_t> *multistore_ptr_in,
-        signal_t *interruptor) = 0;
+        scoped_ptr_t<multistore_ptr_t> *multistore_ptr_in) = 0;
 
 protected:
     virtual ~table_persistence_interface_t() { }

@@ -58,6 +58,12 @@ public:
         "modification may or may not have taken place.") { }
 };
 
+class config_change_exc_t : public std::runtime_error {
+public:
+    config_change_exc_t() : std::runtime_error("The change could not be applied to the "
+        "table's configuration.") { }
+};
+
 /* `table_meta_client_t` is responsible for submitting client requests over the network
 to the `multi_table_manager_t`. It doesn't have any real state of its own; it's just a
 convenient way of bundling together all of the objects that are necessary for submitting
@@ -91,8 +97,7 @@ public:
     bool exists(const database_id_t &database, const name_string_t &name);
 
     /* `get_name()` determines the name, database, and primary key of the table with the
-    given ID; it's the reverse of `find()`. It returns `false` if there is no existing
-    table with that ID. `get_name()` will not block. */
+    given ID; it's the reverse of `find()`. It will not block. */
     void get_name(
         const namespace_id_t &table_id,
         table_basic_config_t *basic_config_out)
@@ -141,6 +146,14 @@ public:
         bool *all_replicas_ready_out)
         THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t);
 
+    /* `get_raft_leader()` fetches raft leader from the table directory.
+    This is for displaying raft information in `rethinkdb.table_status`. */
+    void get_raft_leader(
+        const namespace_id_t &table_id,
+        signal_t *interruptor,
+        optional<server_id_t> *raft_leader_out)
+        THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t);
+
     /* `get_debug_status()` fetches all status information from all servers. This is for
     displaying in `rethinkdb._debug_table_status`. */
     void get_debug_status(
@@ -171,10 +184,10 @@ public:
     block. If it returns successfully, the change will be visible in `find()`, etc. */
     void set_config(
         const namespace_id_t &table_id,
-        const table_config_and_shards_t &new_config,
+        const table_config_and_shards_change_t &table_config_and_shards_change,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t, no_such_table_exc_t, failed_table_op_exc_t,
-            maybe_failed_table_op_exc_t);
+            maybe_failed_table_op_exc_t, config_change_exc_t);
 
     /* `emergency_repair()` performs an emergency repair operation on the given table,
     creating a new table epoch. If all of the replicas for a given shard are missing, it
@@ -185,7 +198,7 @@ public:
     detected. */
     void emergency_repair(
         const namespace_id_t &table_id,
-        bool allow_erase,
+        emergency_repair_mode_t mode,
         bool dry_run,
         signal_t *interruptor,
         table_config_and_shards_t *new_config_out,
@@ -203,7 +216,7 @@ private:
     void create_or_emergency_repair(
         const namespace_id_t &table_id,
         const table_raft_state_t &raft_state,
-        microtime_t epoch_timestamp,
+        const multi_table_manager_timestamp_t::epoch_t &epoch,
         signal_t *interruptor)
         THROWS_ONLY(interrupted_exc_t, failed_table_op_exc_t,
             maybe_failed_table_op_exc_t);
@@ -216,7 +229,7 @@ private:
     a particular table and that table doesn't exist, it throws `no_such_table_exc_t`. */
     enum class server_selector_t { EVERY_SERVER, BEST_SERVER_ONLY };
     void get_status(
-        const boost::optional<namespace_id_t> &table,
+        const optional<namespace_id_t> &table,
         const table_status_request_t &request,
         server_selector_t servers,
         signal_t *interruptor,

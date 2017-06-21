@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "utils.hpp"
 #include "containers/archive/stl_types.hpp"
 #include "containers/range_map.hpp"
 #include "region/region.hpp"
@@ -198,7 +199,7 @@ public:
         rassert(region_is_superset(get_domain(), r));
         inner.visit_mutable(key_edge_t(r.inner.left), r.inner.right,
             [&](const key_edge_t &, const key_edge_t &, hash_range_map_t *cur) {
-                cur->update(r.beg, r.end, value_t(v));
+                cur->update(r.beg, r.end, clone(v));
             });
     }
 
@@ -266,7 +267,8 @@ void debug_print(printf_buffer_t *buf, const region_map_t<V> &map) {
 
 template<cluster_version_t W, class V>
 void serialize(write_message_t *wm, const region_map_t<V> &map) {
-    static_assert(W == cluster_version_t::v2_1_is_latest,
+    static_assert(W == cluster_version_t::LATEST_DISK
+                  || W == cluster_version_t::CLUSTER,
         "serialize() is only supported for the latest version");
     serialize<W>(wm, map.inner);
     serialize<W>(wm, map.hash_beg);
@@ -276,7 +278,11 @@ void serialize(write_message_t *wm, const region_map_t<V> &map) {
 template<cluster_version_t W, class V>
 MUST_USE archive_result_t deserialize(read_stream_t *s, region_map_t<V> *map) {
     switch (W) {
-        case cluster_version_t::v2_1_is_latest: {
+        case cluster_version_t::v2_5_is_latest:
+        case cluster_version_t::v2_4:
+        case cluster_version_t::v2_3:
+        case cluster_version_t::v2_2:
+        case cluster_version_t::v2_1: {
             archive_result_t res;
             res = deserialize<W>(s, &map->inner);
             if (bad(res)) { return res; }
@@ -303,6 +309,8 @@ MUST_USE archive_result_t deserialize(read_stream_t *s, region_map_t<V> *map) {
                 std::move(regions), std::move(values));
             return archive_result_t::SUCCESS;
         }
+    default:
+        unreachable();
     }
 }
 

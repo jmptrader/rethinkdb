@@ -1,6 +1,8 @@
 // Copyright 2010-2015 RethinkDB, all rights reserved
 #include "clustering/table_manager/sindex_manager.hpp"
 
+#include "clustering/administration/issues/outdated_index.hpp"
+
 #include "concurrency/cross_thread_signal.hpp"
 #include "concurrency/pmap.hpp"
 #include "rdb_protocol/store.hpp"
@@ -31,7 +33,8 @@ sindex_manager_t::get_status(signal_t *interruptor) const {
                 std::make_pair(pair.first, std::make_pair(pair.second,
                                                           sindex_status_t()))).first;
             it->second.second.outdated =
-                (pair.second.func_version != reql_version_t::LATEST);
+                (pair.second.func_version != reql_version_t::LATEST)
+                && !outdated_index_issue_tracker_t::is_acceptable_outdated(pair.second);
         }
     });
 
@@ -127,6 +130,9 @@ void sindex_manager_t::update_blocking(signal_t *interruptor) {
         }
         store->sindex_rename_multi(to_rename, &ct_interruptor);
         for (const auto &pair : to_create) {
+            /* Note that this crashes if the index already exists. Luckily we are running
+            in a `pump_coro_t`, and we should be the only thing that's creating indexes
+            on the store so this shouldn't be an issue. */
             store->sindex_create(pair.first, pair.second, &ct_interruptor);
         }
     }

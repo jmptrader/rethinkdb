@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 
+#include "arch/io/openssl.hpp"
 #include "clustering/administration/metadata.hpp"
 #include "clustering/administration/namespace_interface_repository.hpp"
 #include "http/http.hpp"
@@ -14,7 +15,6 @@
 class http_server_t;
 class routing_http_app_t;
 class file_http_app_t;
-class me_http_app_t;
 class cyanide_http_app_t;
 
 class real_reql_cluster_interface_t;
@@ -25,16 +25,15 @@ public:
     administrative_http_server_manager_t(
         const std::set<ip_address_t> &local_addresses,
         int port,
-        const server_id_t &my_server_id,
         http_app_t *reql_app,
-        std::string _path);
+        std::string _path,
+        tls_ctx_t *tls_ctx);
     ~administrative_http_server_manager_t();
 
     int get_port() const;
 private:
 
     scoped_ptr_t<file_http_app_t> file_app;
-    scoped_ptr_t<me_http_app_t> me_app;
 #ifndef NDEBUG
     scoped_ptr_t<cyanide_http_app_t> cyanide_app;
 #endif

@@ -1,10 +1,12 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/terms/terms.hpp"
 
 #include <map>
 #include <string>
 
 #include "clustering/administration/admin_op_exc.hpp"
+#include "clustering/administration/auth/permissions.hpp"
+#include "clustering/administration/auth/username.hpp"
 #include "containers/name_string.hpp"
 #include "rdb_protocol/datum_string.hpp"
 #include "rdb_protocol/op.hpp"
@@ -99,17 +101,17 @@ void get_replicas_and_primary(const scoped_ptr_t<val_t> &replicas,
 // Meta operations (BUT NOT TABLE TERMS) should inherit from this.
 class meta_op_term_t : public op_term_t {
 public:
-    meta_op_term_t(compile_env_t *env, const protob_t<const Term> term,
+    meta_op_term_t(compile_env_t *env, const raw_term_t &term,
                    argspec_t argspec, optargspec_t optargspec = optargspec_t({}))
         : op_term_t(env, term, std::move(argspec), std::move(optargspec)) { }
 
 private:
-    virtual bool is_deterministic() const { return false; }
+    virtual deterministic_t is_deterministic() const { return deterministic_t::no; }
 };
 
 class db_term_t : public meta_op_term_t {
 public:
-    db_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -127,18 +129,28 @@ private:
 
 class db_create_term_t : public meta_op_term_t {
 public:
-    db_create_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_create_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
             scope_env_t *env, args_t *args, eval_flags_t) const {
         name_string_t db_name = get_name(args->arg(env, 0), "Database");
-        admin_err_t error;
+
         ql::datum_t result;
-        if (!env->env->reql_cluster_interface()->db_create(db_name,
-                env->env->interruptor, &result, &error)) {
-            REQL_RETHROW(error);
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->db_create(
+                    env->env->get_user_context(),
+                    db_name,
+                    env->env->interruptor,
+                    &result,
+                    &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
+
         return new_val(result);
     }
     virtual const char *name() const { return "db_create"; }
@@ -146,7 +158,7 @@ private:
 
 class table_create_term_t : public meta_op_term_t {
 public:
-    table_create_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_create_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 2),
             optargspec_t({"primary_key", "shards", "replicas",
                           "nonvoting_replica_tags", "primary_replica_tag",
@@ -195,13 +207,25 @@ private:
         }
 
         /* Create the table */
-        admin_err_t error;
         ql::datum_t result;
-        if (!env->env->reql_cluster_interface()->table_create(tbl_name, db,
-                config_params, primary_key, durability,
-                env->env->interruptor, &result, &error)) {
-            REQL_RETHROW(error);
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->table_create(
+                    env->env->get_user_context(),
+                    tbl_name,
+                    db,
+                    config_params,
+                    primary_key,
+                    durability,
+                    env->env->interruptor,
+                    &result,
+                    &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
+
         return new_val(result);
     }
     virtual const char *name() const { return "table_create"; }
@@ -209,18 +233,26 @@ private:
 
 class db_drop_term_t : public meta_op_term_t {
 public:
-    db_drop_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_drop_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
             scope_env_t *env, args_t *args, eval_flags_t) const {
         name_string_t db_name = get_name(args->arg(env, 0), "Database");
 
-        admin_err_t error;
         ql::datum_t result;
-        if (!env->env->reql_cluster_interface()->db_drop(db_name,
-                env->env->interruptor, &result, &error)) {
-            REQL_RETHROW(error);
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->db_drop(
+                    env->env->get_user_context(),
+                    db_name,
+                    env->env->interruptor,
+                    &result,
+                    &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
 
         return new_val(result);
@@ -230,7 +262,7 @@ private:
 
 class table_drop_term_t : public meta_op_term_t {
 public:
-    table_drop_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_drop_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -247,11 +279,20 @@ private:
             tbl_name = get_name(args->arg(env, 1), "Table");
         }
 
-        admin_err_t error;
         ql::datum_t result;
-        if (!env->env->reql_cluster_interface()->table_drop(tbl_name, db,
-                env->env->interruptor, &result, &error)) {
-            REQL_RETHROW(error);
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->table_drop(
+                    env->env->get_user_context(),
+                    tbl_name,
+                    db,
+                    env->env->interruptor,
+                    &result,
+                    &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
 
         return new_val(result);
@@ -261,7 +302,7 @@ private:
 
 class db_list_term_t : public meta_op_term_t {
 public:
-    db_list_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_list_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(0)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *, eval_flags_t) const {
@@ -285,7 +326,7 @@ private:
 
 class table_list_term_t : public meta_op_term_t {
 public:
-    table_list_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_list_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(0, 1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -317,7 +358,7 @@ private:
 
 class config_term_t : public meta_op_term_t {
 public:
-    config_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    config_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 1), optargspec_t({})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -325,22 +366,37 @@ private:
         scoped_ptr_t<val_t> selection;
         bool success;
         admin_err_t error;
-        /* Note that we always require an argument; we never take a default `db`
-        argument. So `r.config()` is an error rather than the configuration for the
-        current database. This is why we don't subclass from `table_or_db_meta_term_t`.
-        */
-        if (target->get_type().is_convertible(val_t::type_t::DB)) {
-            success = env->env->reql_cluster_interface()->db_config(
-                    target->as_db(), backtrace(), env->env, &selection, &error);
-        } else {
-            counted_t<table_t> table = target->as_table();
-            name_string_t name = name_string_t::guarantee_valid(table->name.c_str());
-            success = env->env->reql_cluster_interface()->table_config(
-                    table->db, name, backtrace(), env->env, &selection, &error);
+        try {
+            /* Note that we always require an argument; we never take a default `db`
+            argument. So `r.config()` is an error rather than the configuration for the
+            current database. This is why we don't subclass from `table_or_db_meta_term_t`.
+            */
+            if (target->get_type().is_convertible(val_t::type_t::DB)) {
+                success = env->env->reql_cluster_interface()->db_config(
+                        env->env->get_user_context(),
+                        target->as_db(),
+                        backtrace(),
+                        env->env,
+                        &selection,
+                        &error);
+            } else {
+                counted_t<table_t> table = target->as_table();
+                name_string_t table_name = name_string_t::guarantee_valid(table->name.c_str());
+                success = env->env->reql_cluster_interface()->table_config(
+                        env->env->get_user_context(),
+                        table->db,
+                        table_name, backtrace(),
+                        env->env,
+                        &selection,
+                        &error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
         if (!success) {
             REQL_RETHROW(error);
         }
+
         return selection;
     }
     virtual const char *name() const { return "config"; }
@@ -348,18 +404,24 @@ private:
 
 class status_term_t : public meta_op_term_t {
 public:
-    status_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    status_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 1), optargspec_t({})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
         counted_t<table_t> table = args->arg(env, 0)->as_table();
-        name_string_t name = name_string_t::guarantee_valid(table->name.c_str());
-        admin_err_t error;
+        name_string_t table_name = name_string_t::guarantee_valid(table->name.c_str());
+
         scoped_ptr_t<val_t> selection;
-        if (!env->env->reql_cluster_interface()->table_status(
-                table->db, name, backtrace(), env->env, &selection, &error)) {
-            REQL_RETHROW(error);
+        try {
+            admin_err_t error;
+            if (!env->env->reql_cluster_interface()->table_status(
+                    table->db, table_name, backtrace(), env->env, &selection, &error)) {
+                REQL_RETHROW(error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
+
         return selection;
     }
     virtual const char *name() const { return "status"; }
@@ -369,10 +431,10 @@ private:
 `reconfigure`, and `rebalance`. */
 class table_or_db_meta_term_t : public meta_op_term_t {
 public:
-    table_or_db_meta_term_t(compile_env_t *env, const protob_t<const Term> &term,
-                            optargspec_t &&optargs)
+    table_or_db_meta_term_t(compile_env_t *env, const raw_term_t &term,
+                            optargspec_t &&_optargs)
         /* None of the subclasses take positional arguments except for the table/db. */
-        : meta_op_term_t(env, term, argspec_t(0, 1), std::move(optargs)) { }
+        : meta_op_term_t(env, term, argspec_t(0, 1), std::move(_optargs)) { }
 protected:
     /* If the term is called on a table, then `db` and `name_if_table` indicate the
     table's database and name. If the term is called on a database, then `db `indicates
@@ -380,7 +442,7 @@ protected:
     virtual scoped_ptr_t<val_t> eval_impl_on_table_or_db(
             scope_env_t *env, args_t *args, eval_flags_t flags,
             const counted_t<const ql::db_t> &db,
-            const boost::optional<name_string_t> &name_if_table) const = 0;
+            const optional<name_string_t> &name_if_table) const = 0;
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
             scope_env_t *env, args_t *args, eval_flags_t flags) const {
@@ -393,18 +455,19 @@ private:
         }
         if (target->get_type().is_convertible(val_t::type_t::DB)) {
             return eval_impl_on_table_or_db(env, args, flags, target->as_db(),
-                boost::none);
+                r_nullopt);
         } else {
             counted_t<table_t> table = target->as_table();
-            name_string_t name = name_string_t::guarantee_valid(table->name.c_str());
-            return eval_impl_on_table_or_db(env, args, flags, table->db, name);
+            name_string_t table_name = name_string_t::guarantee_valid(table->name.c_str());
+            return eval_impl_on_table_or_db(env, args, flags, table->db,
+                                            make_optional(table_name));
         }
     }
 };
 
 class wait_term_t : public table_or_db_meta_term_t {
 public:
-    wait_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    wait_term_t(compile_env_t *env, const raw_term_t &term)
         : table_or_db_meta_term_t(env, term,
                                   optargspec_t({"timeout", "wait_for"})) { }
 private:
@@ -415,9 +478,14 @@ private:
 
     virtual scoped_ptr_t<val_t> eval_impl_on_table_or_db(
             scope_env_t *env, args_t *args, eval_flags_t,
-            const counted_t<const ql::db_t> &db,
-            const boost::optional<name_string_t> &name_if_table) const {
-        // Handle 'wait_for' optarg
+	    const counted_t<const ql::db_t> &db,
+            const optional<name_string_t> &name_if_table) const {
+      // Don't allow a wait call without explicit database
+      if (args->num_args() == 0) {
+	rfail(base_exc_t::LOGIC, "`wait` can only be called on a table or database.");
+      }
+
+      // Handle 'wait_for' optarg
         table_readiness_t readiness = table_readiness_t::finished;
         if (scoped_ptr_t<val_t> wait_for = args->optarg(env, "wait_for")) {
             if (wait_for->as_str() == wait_outdated_str) {
@@ -480,24 +548,28 @@ char const * const wait_term_t::wait_all_str = "all_replicas_ready";
 
 class reconfigure_term_t : public table_or_db_meta_term_t {
 public:
-    reconfigure_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    reconfigure_term_t(compile_env_t *env, const raw_term_t &term)
         : table_or_db_meta_term_t(env, term,
             optargspec_t({"dry_run", "emergency_repair", "nonvoting_replica_tags",
                 "primary_replica_tag", "replicas", "shards"})) { }
 private:
     scoped_ptr_t<val_t> required_optarg(scope_env_t *env,
                                         args_t *args,
-                                        const char *name) const {
-        scoped_ptr_t<val_t> result = args->optarg(env, name);
+                                        const char *_name) const {
+        scoped_ptr_t<val_t> result = args->optarg(env, _name);
         rcheck(result.has(), base_exc_t::LOGIC,
-               strprintf("Missing required argument `%s`.", name));
+               strprintf("Missing required argument `%s`.", _name));
         return result;
     }
 
     virtual scoped_ptr_t<val_t> eval_impl_on_table_or_db(
             scope_env_t *env, args_t *args, eval_flags_t,
             const counted_t<const ql::db_t> &db,
-            const boost::optional<name_string_t> &name_if_table) const {
+            const optional<name_string_t> &name_if_table) const {
+        // Don't allow a reconfigure call without explicit database
+        if (args->num_args() == 0) {
+	  rfail(base_exc_t::LOGIC, "`reconfigure` can only be called on a table or database.");
+        }
 
         // Parse the 'dry_run' optarg
         bool dry_run = false;
@@ -533,31 +605,48 @@ private:
             bool success;
             datum_t result;
             admin_err_t error;
-            /* Perform the operation */
-            if (static_cast<bool>(name_if_table)) {
-                success = env->env->reql_cluster_interface()->table_reconfigure(
-                        db, *name_if_table, config_params, dry_run,
-                        env->env->interruptor, &result, &error);
-            } else {
-                success = env->env->reql_cluster_interface()->db_reconfigure(
-                        db, config_params, dry_run, env->env->interruptor,
-                        &result, &error);
+            try {
+                /* Perform the operation */
+                if (static_cast<bool>(name_if_table)) {
+                    success = env->env->reql_cluster_interface()->table_reconfigure(
+                        env->env->get_user_context(),
+                        db,
+                        *name_if_table,
+                        config_params,
+                        dry_run,
+                        env->env->interruptor,
+                        &result,
+                        &error);
+                } else {
+                    success = env->env->reql_cluster_interface()->db_reconfigure(
+                        env->env->get_user_context(),
+                        db,
+                        config_params,
+                        dry_run,
+                        env->env->interruptor,
+                        &result,
+                        &error);
+                }
+            } catch (auth::permission_error_t const &permission_error) {
+                rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
             }
             if (!success) {
                 REQL_RETHROW(error);
             }
-            return new_val(result);
 
+            return new_val(result);
         } else {
             /* We're doing an emergency repair */
 
             /* Parse `emergency_repair` to figure out which kind we're doing. */
             datum_string_t emergency_repair_str = emergency_repair->as_str();
-            bool allow_erase;
-            if (emergency_repair_str == "unsafe_rollback") {
-                allow_erase = false;
+            emergency_repair_mode_t mode;
+            if (emergency_repair_str == "_debug_recommit") {
+                mode = emergency_repair_mode_t::DEBUG_RECOMMIT;
+            } else if (emergency_repair_str == "unsafe_rollback") {
+                mode = emergency_repair_mode_t::UNSAFE_ROLLBACK;
             } else if (emergency_repair_str == "unsafe_rollback_or_erase") {
-                allow_erase = true;
+                mode = emergency_repair_mode_t::UNSAFE_ROLLBACK_OR_ERASE;
             } else {
                 rfail_target(emergency_repair.get(), base_exc_t::LOGIC,
                     "`emergency_repair` should be \"unsafe_rollback\" or "
@@ -580,11 +669,22 @@ private:
                     "individually.");
             }
 
+            bool success;
             datum_t result;
             admin_err_t error;
-            bool success = env->env->reql_cluster_interface()->table_emergency_repair(
-                db, *name_if_table, allow_erase, dry_run,
-                env->env->interruptor, &result, &error);
+            try {
+                success = env->env->reql_cluster_interface()->table_emergency_repair(
+                    env->env->get_user_context(),
+                    db,
+                    *name_if_table,
+                    mode,
+                    dry_run,
+                    env->env->interruptor,
+                    &result,
+                    &error);
+            } catch (auth::permission_error_t const &permission_error) {
+                rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
+            }
             if (!success) {
                 REQL_RETHROW(error);
             }
@@ -596,22 +696,40 @@ private:
 
 class rebalance_term_t : public table_or_db_meta_term_t {
 public:
-    rebalance_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    rebalance_term_t(compile_env_t *env, const raw_term_t &term)
         : table_or_db_meta_term_t(env, term, optargspec_t({})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl_on_table_or_db(
-            scope_env_t *env, UNUSED args_t *args, eval_flags_t,
+            scope_env_t *env, args_t *args, eval_flags_t,
             const counted_t<const ql::db_t> &db,
-            const boost::optional<name_string_t> &name_if_table) const {
+            const optional<name_string_t> &name_if_table) const {
+        // Don't allow a rebalance call without explicit database
+        if (args->num_args() == 0) {
+	  rfail(base_exc_t::LOGIC, "`rebalance` can only be called on a table or database.");
+        }
+
         ql::datum_t result;
         bool success;
         admin_err_t error;
-        if (static_cast<bool>(name_if_table)) {
-            success = env->env->reql_cluster_interface()->table_rebalance(
-                db, *name_if_table, env->env->interruptor, &result, &error);
-        } else {
-            success = env->env->reql_cluster_interface()->db_rebalance(
-                db, env->env->interruptor, &result, &error);
+        try {
+            if (static_cast<bool>(name_if_table)) {
+                success = env->env->reql_cluster_interface()->table_rebalance(
+                    env->env->get_user_context(),
+                    db,
+                    *name_if_table,
+                    env->env->interruptor,
+                    &result,
+                    &error);
+            } else {
+                success = env->env->reql_cluster_interface()->db_rebalance(
+                    env->env->get_user_context(),
+                    db,
+                    env->env->interruptor,
+                    &result,
+                    &error);
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
         }
         if (!success) {
             REQL_RETHROW(error);
@@ -623,7 +741,7 @@ private:
 
 class sync_term_t : public meta_op_term_t {
 public:
-    sync_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sync_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 
 private:
@@ -639,9 +757,73 @@ private:
     virtual const char *name() const { return "sync"; }
 };
 
+class grant_term_t : public meta_op_term_t {
+public:
+    grant_term_t(compile_env_t *env, const raw_term_t &term)
+        : meta_op_term_t(env, term, argspec_t(2, 3), optargspec_t({})) { }
+
+private:
+    virtual scoped_ptr_t<val_t> eval_impl(
+            scope_env_t *env, args_t *args, eval_flags_t) const {
+        auth::username_t username(
+            args->arg(env, args->num_args() - 2)->as_str().to_std());
+        ql::datum_t permissions = args->arg(env, args->num_args() - 1)->as_datum();
+
+        bool success = false;
+        ql::datum_t result;
+        admin_err_t error;
+        try {
+            if (args->num_args() == 2) {
+                success = env->env->reql_cluster_interface()->grant_global(
+                    env->env->get_user_context(),
+                    std::move(username),
+                    std::move(permissions),
+                    env->env->interruptor,
+                    &result,
+                    &error);
+            } else {
+                scoped_ptr_t<val_t> scope = args->arg(env, 0);
+                if (scope->get_type().is_convertible(val_t::type_t::DB)) {
+                    success = env->env->reql_cluster_interface()->grant_database(
+                        env->env->get_user_context(),
+                        scope->as_db()->id,
+                        std::move(username),
+                        std::move(permissions),
+                        env->env->interruptor,
+                        &result,
+                        &error);
+                } else {
+                    counted_t<table_t> table = scope->as_table();
+                    success = env->env->reql_cluster_interface()->grant_table(
+                        env->env->get_user_context(),
+                        table->db->id,
+                        table->get_id(),
+                        std::move(username),
+                        std::move(permissions),
+                        env->env->interruptor,
+                        &result,
+                        &error);
+                }
+            }
+        } catch (auth::permission_error_t const &permission_error) {
+            rfail(ql::base_exc_t::PERMISSION_ERROR, "%s", permission_error.what());
+        }
+
+        if (!success) {
+            REQL_RETHROW(error);
+        }
+
+        return new_val(std::move(result));
+    }
+
+    virtual const char *name() const {
+        return "grant";
+    }
+};
+
 class table_term_t : public op_term_t {
 public:
-    table_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1, 2),
                     optargspec_t({"read_mode", "use_outdated", "identifier_format"})) { }
 private:
@@ -669,15 +851,13 @@ private:
             }
         }
 
-        auto identifier_format =
-            boost::make_optional<admin_identifier_format_t>(
-                false, admin_identifier_format_t());
+        optional<admin_identifier_format_t> identifier_format;
         if (scoped_ptr_t<val_t> v = args->optarg(env, "identifier_format")) {
             const datum_string_t &str = v->as_str();
             if (str == "name") {
-                identifier_format = admin_identifier_format_t::name;
+                identifier_format.set(admin_identifier_format_t::name);
             } else if (str == "uuid") {
-                identifier_format = admin_identifier_format_t::uuid;
+                identifier_format.set(admin_identifier_format_t::uuid);
             } else {
                 rfail(base_exc_t::LOGIC, "Identifier format `%s` unrecognized "
                     "(options are \"name\" and \"uuid\").", str.to_std().c_str());
@@ -685,34 +865,34 @@ private:
         }
 
         counted_t<const db_t> db;
-        name_string_t name;
+        name_string_t table_name;
         if (args->num_args() == 1) {
             scoped_ptr_t<val_t> dbv = args->optarg(env, "db");
             r_sanity_check(dbv.has());
             db = dbv->as_db();
-            name = get_name(args->arg(env, 0), "Table");
+            table_name = get_name(args->arg(env, 0), "Table");
         } else {
             r_sanity_check(args->num_args() == 2);
             db = args->arg(env, 0)->as_db();
-            name = get_name(args->arg(env, 1), "Table");
+            table_name = get_name(args->arg(env, 1), "Table");
         }
 
         admin_err_t error;
         counted_t<base_table_t> table;
-        if (!env->env->reql_cluster_interface()->table_find(name, db,
+        if (!env->env->reql_cluster_interface()->table_find(table_name, db,
                 identifier_format, env->env->interruptor, &table, &error)) {
             REQL_RETHROW(error);
         }
         return new_val(make_counted<table_t>(
-            std::move(table), db, name.str(), read_mode, backtrace()));
+            std::move(table), db, table_name.str(), read_mode, backtrace()));
     }
-    virtual bool is_deterministic() const { return false; }
+    virtual deterministic_t is_deterministic() const { return deterministic_t::no; }
     virtual const char *name() const { return "table"; }
 };
 
 class get_term_t : public op_term_t {
 public:
-    get_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    get_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t>
@@ -728,8 +908,8 @@ private:
 
 class get_all_term_t : public op_term_t {
 public:
-    get_all_term_t(compile_env_t *env, const protob_t<const Term> &term)
-        : op_term_t(env, term, argspec_t(2, -1), optargspec_t({ "index" })) { }
+    get_all_term_t(compile_env_t *env, const raw_term_t &term)
+        : op_term_t(env, term, argspec_t(1, -1), optargspec_t({ "index" })) { }
 private:
     datum_t get_key_arg(const scoped_ptr_t<val_t> &arg) const {
         datum_t datum_arg = arg->as_datum();
@@ -739,6 +919,9 @@ private:
                       base_exc_t::LOGIC,
                       "Cannot use a geospatial index with `get_all`. "
                       "Use `get_intersecting` instead.");
+        rcheck_target(arg, datum_arg.get_type() != datum_t::R_NULL,
+                      base_exc_t::NON_EXISTENCE,
+                      "Keys cannot be NULL.");
         return datum_arg;
     }
 
@@ -747,98 +930,107 @@ private:
         counted_t<table_t> table = args->arg(env, 0)->as_table();
         scoped_ptr_t<val_t> index = args->optarg(env, "index");
         std::string index_str = index ? index->as_str().to_std() : table->get_pkey();
-        std::vector<counted_t<datum_stream_t> > streams;
+
+        std::map<datum_t, uint64_t> keys;
         for (size_t i = 1; i < args->num_args(); ++i) {
-            datum_t key = get_key_arg(args->arg(env, i));
-            counted_t<datum_stream_t> seq =
-                table->get_all(env->env, key, index_str, backtrace());
-            streams.push_back(seq);
+            auto key = get_key_arg(args->arg(env, i));
+            keys.insert(std::make_pair(std::move(key), 0)).first->second += 1;
         }
-        counted_t<datum_stream_t> stream = make_counted<union_datum_stream_t>(
-            env->env, std::move(streams), backtrace());
-        return new_val(make_counted<selection_t>(table, stream));
+
+        return new_val(
+            make_counted<selection_t>(
+                table,
+                table->get_all(env->env,
+                               datumspec_t(std::move(keys)),
+                               index_str,
+                               backtrace())));
     }
     virtual const char *name() const { return "get_all"; }
 };
 
 counted_t<term_t> make_db_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_term_t>(env, term);
 }
 
 counted_t<term_t> make_get_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<get_term_t>(env, term);
 }
 
 counted_t<term_t> make_get_all_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<get_all_term_t>(env, term);
 }
 
 counted_t<term_t> make_db_create_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_create_term_t>(env, term);
 }
 
 counted_t<term_t> make_db_drop_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_drop_term_t>(env, term);
 }
 
 counted_t<term_t> make_db_list_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_list_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_create_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_create_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_drop_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_drop_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_list_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_list_term_t>(env, term);
 }
 
 counted_t<term_t> make_config_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<config_term_t>(env, term);
 }
 
 counted_t<term_t> make_status_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<status_term_t>(env, term);
 }
 
 counted_t<term_t> make_wait_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<wait_term_t>(env, term);
 }
 
 counted_t<term_t> make_reconfigure_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<reconfigure_term_t>(env, term);
 }
 
 counted_t<term_t> make_rebalance_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<rebalance_term_t>(env, term);
 }
 
 counted_t<term_t> make_sync_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sync_term_t>(env, term);
+}
+
+counted_t<term_t> make_grant_term(
+        compile_env_t *env, const raw_term_t &term) {
+    return make_counted<grant_term_t>(env, term);
 }
 
 } // namespace ql

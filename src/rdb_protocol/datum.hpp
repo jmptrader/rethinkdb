@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef RDB_PROTOCOL_DATUM_HPP_
 #define RDB_PROTOCOL_DATUM_HPP_
 
@@ -11,13 +11,10 @@
 #include <utility>
 #include <vector>
 
-#include "errors.hpp"
-#include <boost/optional.hpp>
-
-#include "btree/keys.hpp"
 #include "cjson/json.hpp"
 #include "containers/archive/archive.hpp"
 #include "containers/counted.hpp"
+#include "containers/optional.hpp"
 #include "rdb_protocol/datum_string.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
@@ -34,6 +31,8 @@
 class Datum;
 
 RDB_DECLARE_SERIALIZABLE(Datum);
+
+struct store_key_t;
 
 namespace ql {
 
@@ -64,22 +63,34 @@ enum throw_bool_t { NOTHROW = 0, THROW = 1 };
 // CLOBBER: Overwrite existing values.
 enum clobber_bool_t { NOCLOBBER = 0, CLOBBER = 1 };
 
-enum class use_json_t { NO = 0, YES = 1 };
-
 // When getting the typename of a datum, this should be YES if the name will be
 // used for sorting datums by type, and NO if the name is to be given to a user.
-enum class name_for_sorting_t { NO = 0, YES = 1};
+enum class name_for_sorting_t { NO = 0, YES = 1 };
+
+// `r.minval` and `r.maxval` were encoded in keys differently before 2.3. Determines
+// which encoding should be used.
+enum class extrema_encoding_t { PRE_v2_3, LATEST };
+extrema_encoding_t extrema_encoding_from_reql_version_for_sindex(reql_version_t rv);
 
 // When constructing a secondary index key, extremas should not be used.  They
 // may be used when constructing secondary index ranges (i.e. for `between`).
 enum class extrema_ok_t { NOT_OK = 0, OK = 1 };
+
+// When printing keys, nulls in strings can be escaped or disallowed. Primary
+// keys always disallow nulls, and the most recent secondary indexes escape them.
+//
+// Use escape_nulls_from_reql_version_for_sindex to get a value appropriate for
+// sindexes created using a given reql_version_t.
+enum class escape_nulls_t { NO = 0, YES = 1 };
+escape_nulls_t escape_nulls_from_reql_version_for_sindex(reql_version_t rv);
 
 void debug_print(printf_buffer_t *, const datum_t &);
 
 // The serialization for this is defined in `protocol.cc` and needs to be
 // updated if more versions are added.
 enum class skey_version_t {
-    pre_1_16 = 0,
+    // We used to distinguish between pre 1.16 and post 1.16 secondary index keys.
+    // At the moment we only have one format.
     post_1_16 = 1
 };
 skey_version_t skey_version_from_reql_version(reql_version_t rv);
@@ -88,7 +99,7 @@ struct components_t {
     skey_version_t skey_version;
     std::string secondary;
     std::string primary;
-    boost::optional<uint64_t> tag_num;
+    optional<uint64_t> tag_num;
 };
 
 // A `datum_t` is basically a JSON value, with some special handling for
@@ -135,6 +146,8 @@ public:
     static datum_t binary(datum_string_t &&value);
     static datum_t binary(const datum_string_t &value);
 
+    static datum_t utf8(datum_string_t _data);
+
     static datum_t minval();
     static datum_t maxval();
 
@@ -178,6 +191,7 @@ public:
 
     explicit datum_t(double _num);
     explicit datum_t(datum_string_t _str);
+    explicit datum_t(const std::string &string);
     explicit datum_t(const char *cstr);
     explicit datum_t(std::vector<datum_t> &&_array,
                      const configured_limits_t &limits);
@@ -206,8 +220,6 @@ public:
     bool has() const;
     void reset();
 
-    void write_to_protobuf(Datum *out, use_json_t use_json) const;
-
     type_t get_type() const;
     bool is_ptype() const;
     bool is_ptype(const std::string &reql_type) const;
@@ -224,7 +236,7 @@ public:
     static std::string compose_secondary(skey_version_t skey_version,
                                          const std::string &secondary_key,
                                          const store_key_t &primary_key,
-                                         boost::optional<uint64_t> tag_num);
+                                         optional<uint64_t> tag_num);
     static std::string mangle_secondary(
         skey_version_t skey_version,
         const std::string &secondary,
@@ -232,24 +244,24 @@ public:
         const std::string &tag);
     static std::string encode_tag_num(uint64_t tag_num);
     // tag_num is used for multi-indexes.
-    std::string print_secondary(skey_version_t reql_version,
+    std::string print_secondary(reql_version_t reql_version,
                                 const store_key_t &primary_key,
-                                boost::optional<uint64_t> tag_num) const;
+                                optional<uint64_t> tag_num) const;
     /* An inverse to print_secondary. Returns the primary key. */
     static std::string extract_primary(const std::string &secondary_and_primary);
     static store_key_t extract_primary(const store_key_t &secondary_key);
     static std::string extract_truncated_secondary(
         const std::string &secondary_and_primary);
     static std::string extract_secondary(const std::string &secondary_and_primary);
-    static boost::optional<uint64_t> extract_tag(
+    static optional<uint64_t> extract_tag(
         const std::string &secondary_and_primary);
-    static boost::optional<uint64_t> extract_tag(const store_key_t &key);
+    static optional<uint64_t> extract_tag(const store_key_t &key);
     static components_t extract_all(const std::string &secondary_and_primary);
     store_key_t truncated_secondary(
-        skey_version_t skey_version,
+        reql_version_t reql_version,
         extrema_ok_t extrema_ok = extrema_ok_t::NOT_OK) const;
     void check_type(type_t desired, const char *msg = NULL) const;
-    void type_error(const std::string &msg) const NORETURN;
+    NORETURN void type_error(const std::string &msg) const;
 
     bool as_bool() const;
     double as_num() const;
@@ -292,6 +304,7 @@ public:
     // json_writer_t can be rapidjson::Writer<rapidjson::StringBuffer>
     // or rapidjson::PrettyWriter<rapidjson::StringBuffer>
     template <class json_writer_t> void write_json(json_writer_t *writer) const;
+    rapidjson::Value as_json(rapidjson::Value::AllocatorType *allocator) const;
 
     // DEPRECATED: Used for backwards compatibility with reql_versions before 2.1
     cJSON *as_json_raw() const;
@@ -314,12 +327,12 @@ public:
     bool operator>(const datum_t &rhs) const;
     bool operator>=(const datum_t &rhs) const;
 
-    void runtime_fail(base_exc_t::type_t exc_type,
-                      const char *test, const char *file, int line,
-                      std::string msg) const NORETURN;
+    NORETURN void runtime_fail(base_exc_t::type_t exc_type,
+                               const char *test, const char *file, int line,
+                               std::string msg) const;
 
-    static size_t max_trunc_size(skey_version_t skey_version);
-    static size_t trunc_size(skey_version_t skey_version, size_t primary_key_size);
+    static size_t max_trunc_size();
+    static size_t trunc_size(size_t primary_key_size);
     /* Note key_is_truncated returns true if the key is of max size. This gives
      * a false positive if the sum sizes of the keys is exactly the maximum but
      * not over at all. This means that a key of exactly max_trunc_size counts
@@ -333,13 +346,21 @@ public:
                               datum_t orig_key,
                               const datum_string_t &pkey) const;
 
-    static void check_str_validity(const datum_string_t &str);
-
     // Used by skey_version code. Returns a pointer to the buf_ref, if
     // the datum is currently backed by one, or NULL otherwise.
     const shared_buf_ref_t<char> *get_buf_ref() const;
 
 private:
+    // We have a special version of `call_with_enough_stack` for datums that only uses
+    // `call_with_enough_stack` if there a chance of additional recursion (based on
+    // the type of this datum). Since some of the datum functions get called a lot,
+    // this is valuable since we can often save the overhead of the extra function
+    // call.
+    template<class result_t, class callable_t>
+    inline result_t call_with_enough_stack_datum(callable_t &&fun) const;
+    template<class callable_t>
+    inline void call_with_enough_stack_datum(callable_t &&fun) const;
+
     friend void pseudo::sanitize_time(datum_t *time);
     // Must only be used during pseudo type sanitization.
     // The key must already exist.
@@ -348,19 +369,37 @@ private:
     static std::vector<std::pair<datum_string_t, datum_t> > to_sorted_vec(
             std::map<datum_string_t, datum_t> &&map);
 
+    template <class json_writer_t>
+    void write_json_unchecked_stack(json_writer_t *writer) const;
+
     // Same as get_pair() / get(), but don't perform boundary or type checks.
     // For internal use to improve performance.
     std::pair<datum_string_t, datum_t> unchecked_get_pair(size_t index) const;
     datum_t unchecked_get(size_t) const;
 
+    datum_t default_merge_unchecked_stack(const datum_t &rhs) const;
+    datum_t custom_merge_unchecked_stack(const datum_t &rhs,
+                                         merge_resoluter_t f,
+                                         const configured_limits_t &limits,
+                                         std::set<std::string> *conditions) const;
+
     friend void pseudo::time_to_str_key(const datum_t &d, std::string *str_out);
     void pt_to_str_key(std::string *str_out) const;
     void num_to_str_key(std::string *str_out) const;
-    void str_to_str_key(std::string *str_out) const;
+    void str_to_str_key(escape_nulls_t escape_nulls, std::string *str_out) const;
     void bool_to_str_key(std::string *str_out) const;
-    void array_to_str_key(std::string *str_out) const;
+    void array_to_str_key(
+        extrema_encoding_t extrema_encoding,
+        extrema_ok_t extrema_ok,
+        escape_nulls_t escape_nulls,
+        std::string *str_out) const;
     void binary_to_str_key(std::string *str_out) const;
-    void extrema_to_str_key(std::string *str_out) const;
+    void extrema_to_str_key(
+        extrema_encoding_t extrema_encoding,
+        extrema_ok_t extrema_ok,
+        std::string *str_out) const;
+
+    int cmp_unchecked_stack(const datum_t &rhs) const;
 
     int pseudo_cmp(const datum_t &rhs) const;
     bool pseudo_compares_as_obj() const;
@@ -371,6 +410,7 @@ private:
     // Returns a version of this where all `literal` pseudotypes have been omitted.
     // Might return null, if this is a literal without a value.
     datum_t drop_literals(bool *encountered_literal_out) const;
+    datum_t drop_literals_unchecked_stack(bool *encountered_literal_out) const;
 
     // The data_wrapper makes sure we perform proper cleanup when exceptions
     // happen during construction
@@ -423,50 +463,12 @@ public:
     static const datum_string_t reql_type_string;
 };
 
-class datum_range_t {
-public:
-    datum_range_t();
-    datum_range_t(
-        datum_t left_bound,
-        key_range_t::bound_t left_bound_type,
-        datum_t right_bound,
-        key_range_t::bound_t right_bound_type);
-    // Range that includes just one value.
-    explicit datum_range_t(datum_t val);
-    static datum_range_t universe();
-
-    bool contains(datum_t val) const;
-    bool is_empty() const;
-    bool is_universe() const;
-
-    RDB_DECLARE_ME_SERIALIZABLE(datum_range_t);
-
-    // Make sure you know what you're doing if you call these, and think about
-    // truncated sindexes.
-    key_range_t to_primary_keyrange() const;
-    key_range_t to_sindex_keyrange(skey_version_t skey_version) const;
-
-    datum_range_t with_left_bound(datum_t d, key_range_t::bound_t type);
-    datum_range_t with_right_bound(datum_t d, key_range_t::bound_t type);
-
-    std::string print() {
-        return strprintf("%c%s,%s%c",
-                         left_bound_type == key_range_t::open ? '(' : '[',
-                         left_bound.print().c_str(),
-                         right_bound.print().c_str(),
-                         right_bound_type == key_range_t::open ? ')' : ']');
-    }
-private:
-    friend class info_term_t;
-    datum_t left_bound, right_bound;
-    key_range_t::bound_t left_bound_type, right_bound_type;
-};
-
 datum_t to_datum(const Datum *d, const configured_limits_t &, reql_version_t);
 datum_t to_datum(
     const rapidjson::Value &json,
     const configured_limits_t &,
     reql_version_t);
+
 // DEPRECATED: Used in the r.json term for pre 2.1 backwards compatibility
 datum_t to_datum(cJSON *json, const configured_limits_t &, reql_version_t);
 
@@ -480,12 +482,15 @@ bool number_as_integer(double d, int64_t *i_out);
 // Converts a double to int, calling number_as_integer and throwing if it fails.
 int64_t checked_convert_to_int(const rcheckable_t *target, double d);
 
-// Useful for building an object datum and doing mutation operations -- otherwise,
-// you'll have to do check_str_validity checks yourself.
+// Useful for building an object datum and doing mutation operations
 class datum_object_builder_t {
 public:
     datum_object_builder_t() { }
     explicit datum_object_builder_t(const datum_t &copy_from);
+
+    bool empty() const {
+        return map.empty();
+    }
 
     // Returns true if the insertion did _not_ happen because the key was already in
     // the object.

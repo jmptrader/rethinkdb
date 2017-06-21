@@ -19,12 +19,13 @@ table_config_and_shards_t make_table_config_and_shards() {
     table_config_and_shards.config.basic.database = generate_uuid();
     table_config_and_shards.config.basic.primary_key = "id";
     table_config_t::shard_t shard;
-    shard.primary_replica = generate_uuid();
+    shard.primary_replica = server_id_t::generate_server_id();
     shard.all_replicas.insert(shard.primary_replica);
     table_config_and_shards.config.shards.push_back(shard);
     calculate_split_points_for_uuids(1, &table_config_and_shards.shard_scheme);
     table_config_and_shards.config.write_ack_config = write_ack_config_t::MAJORITY;
     table_config_and_shards.config.durability = write_durability_t::HARD;
+    table_config_and_shards.config.user_data = default_user_data();
     table_config_and_shards.server_names.names[shard.primary_replica] =
         std::make_pair(0ul, name_string_t::guarantee_valid("primary"));
 
@@ -40,7 +41,6 @@ raft_persistent_state_t<table_raft_state_t> raft_persistent_state_from_metadata_
     metadata_file_t metadata_file(
         &io_backender,
         temp_dir.path(),
-        false,
         &get_global_perfmon_collection(),
         &non_interruptor);
     metadata_file_t::read_txn_t read_txn(&metadata_file, &non_interruptor);
@@ -76,8 +76,8 @@ TPTEST(ClusteringRaft, StorageRoundtrip) {
             &metadata_file,
             &write_txn,
             table_id,
-            raft_persistent_state,
-            &non_interruptor);
+            raft_persistent_state);
+        write_txn.commit();
     }
 
     EXPECT_EQ(
@@ -112,17 +112,16 @@ TPTEST(ClusteringRaft, StorageErase) {
             &metadata_file,
             &write_txn,
             table_id,
-            raft_persistent_state,
-            &non_interruptor);
+            raft_persistent_state);
 
-        table_raft_storage_interface.erase(&write_txn, table_id, &non_interruptor);
+        table_raft_storage_interface.erase(&write_txn, table_id);
+        write_txn.commit();
     }
 
     {
         metadata_file_t metadata_file(
             &io_backender,
             temp_dir.path(),
-            false,
             &get_global_perfmon_collection(),
             &non_interruptor);
         metadata_file_t::read_txn_t read_txn(&metadata_file, &non_interruptor);
@@ -167,8 +166,8 @@ TPTEST(ClusteringRaft, StorageWriteCurrentTermAndVotedFor) {
                 &metadata_file,
                 &write_txn,
                 table_id,
-                raft_persistent_state,
-                &non_interruptor));
+                raft_persistent_state));
+            write_txn.commit();
         }
 
         table_raft_storage_interface->write_current_term_and_voted_for(
@@ -212,8 +211,8 @@ TPTEST(ClusteringRaft, StorageWriteCommitIndex) {
                 &metadata_file,
                 &write_txn,
                 table_id,
-                raft_persistent_state,
-                &non_interruptor));
+                raft_persistent_state));
+            write_txn.commit();
         }
 
         table_raft_storage_interface->write_commit_index(1);
@@ -246,9 +245,11 @@ TPTEST(ClusteringRaft, StorageWriteLogReplaceTail) {
     raft_log_entry.term = 1;
     table_raft_state_t::change_t::set_table_config_t set_table_config;
     set_table_config.new_config = make_table_config_and_shards();
-    raft_log_entry.change = set_table_config;
+    raft_log_entry.change.set(set_table_config);
 
     raft_log_t<table_raft_state_t> raft_log;
+    raft_log.prev_index = 0;
+    raft_log.prev_term = 0;
     raft_log.append(raft_log_entry);
 
     {
@@ -265,8 +266,8 @@ TPTEST(ClusteringRaft, StorageWriteLogReplaceTail) {
                 &metadata_file,
                 &write_txn,
                 table_id,
-                raft_persistent_state,
-                &non_interruptor));
+                raft_persistent_state));
+            write_txn.commit();
         }
 
         table_raft_storage_interface->write_log_replace_tail(raft_log, 1);
@@ -299,7 +300,7 @@ TPTEST(ClusteringRaft, StorageWriteLogAppendOne) {
     raft_log_entry.term = 1;
     table_raft_state_t::change_t::set_table_config_t set_table_config;
     set_table_config.new_config = make_table_config_and_shards();
-    raft_log_entry.change = set_table_config;
+    raft_log_entry.change.set(set_table_config);
 
     {
         scoped_ptr_t<table_raft_storage_interface_t> table_raft_storage_interface;
@@ -315,8 +316,8 @@ TPTEST(ClusteringRaft, StorageWriteLogAppendOne) {
                 &metadata_file,
                 &write_txn,
                 table_id,
-                raft_persistent_state,
-                &non_interruptor));
+                raft_persistent_state));
+            write_txn.commit();
         }
 
         table_raft_storage_interface->write_log_append_one(raft_log_entry);
@@ -361,8 +362,8 @@ TPTEST(ClusteringRaft, StorageWriteSnapshot) {
                 &metadata_file,
                 &write_txn,
                 table_id,
-                raft_persistent_state,
-                &non_interruptor));
+                raft_persistent_state));
+            write_txn.commit();
         }
 
         table_raft_storage_interface->write_snapshot(

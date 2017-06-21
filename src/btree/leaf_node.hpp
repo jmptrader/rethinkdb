@@ -6,9 +6,10 @@
 #include <utility>
 #include <vector>
 
+#include "arch/compiler.hpp"
 #include "btree/types.hpp"
 #include "buffer_cache/types.hpp"
-#include "errors.hpp"
+#include "containers/optional.hpp"
 
 class value_sizer_t;
 struct btree_key_t;
@@ -37,7 +38,7 @@ class reverse_iterator;
 } //namespace leaf
 
 // The leaf node begins with the following struct layout.
-struct leaf_node_t {
+ATTR_PACKED(struct leaf_node_t {
     // The value-type-specific magic value.  It's a bit of a hack, but
     // it's possible to construct a value_sizer_t based on this value.
     block_magic_t magic;
@@ -62,7 +63,7 @@ struct leaf_node_t {
     //Iteration
     typedef leaf::iterator iterator;
     typedef leaf::reverse_iterator reverse_iterator;
-} __attribute__ ((__packed__));
+});
 
 namespace leaf {
 
@@ -177,9 +178,11 @@ repli_timestamp_t min_deletion_timestamp(
     // the recency of the buf that `node` came from
     repli_timestamp_t maximum_existing_timestamp);
 
-/* Removes all timestamps and deletions earlier than the given timestamp. */
+/* Removes all timestamps and deletions. Optionally: specify a `min_timestamp`
+so that only timestamps and deletions earlier than the given timestamp are removed. */
 void erase_deletions(
-    value_sizer_t *sizer, leaf_node_t *node, repli_timestamp_t min_timestamp);
+    value_sizer_t *sizer, leaf_node_t *node,
+    optional<repli_timestamp_t> min_timestamp);
 
 /* Calls `cb` on every entry in the node, whether a real entry or a deletion. The calls
 will be in order from most recent to least recent. For entries with no timestamp, the

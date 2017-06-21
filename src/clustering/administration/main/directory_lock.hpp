@@ -6,11 +6,14 @@
 #include <exception>
 #include <string>
 
-#include "utils.hpp"
 #include "arch/io/io_utils.hpp"
+#include "paths.hpp"
+#include "utils.hpp"
 
+#ifndef _WIN32
 #define INVALID_GID (static_cast<gid_t>(-1))
 #define INVALID_UID (static_cast<uid_t>(-1))
+#endif
 
 bool check_existence(const base_path_t& base_path);
 bool check_dir_emptiness(const base_path_t& base_path);

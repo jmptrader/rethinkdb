@@ -37,12 +37,10 @@ local_replicator_t::local_replicator_t(
     put the branch in the store's metainfo so that if we crash, the branch will never be
     in the metainfo but not the branch history manager. */
     {
-        cross_thread_signal_t interruptor_on_bhm_thread(interruptor, bhm->home_thread());
         on_thread_t thread_switcher(bhm->home_thread());
         bhm->create_branch(
             primary->get_branch_id(),
-            primary->get_branch_birth_certificate(),
-            &interruptor_on_bhm_thread);
+            primary->get_branch_birth_certificate());
     }
 
     /* Initialize the metainfo to the new branch. Note we use hard durability, to avoid
@@ -69,10 +67,12 @@ local_replicator_t::local_replicator_t(
 }
 
 local_replicator_t::~local_replicator_t() {
+    // This has to happen before `note_reshard` to make sure outstanding reads complete.
+    registration.reset();
     /* Since `local_replicator_t` is the primary dispatchee, changefeeds are always
     routed here. But when the primary changes we need to shut off the changefeed. This
     destructor is a good place to do it. */
-    store->note_reshard();
+    store->note_reshard(store->get_region());
 }
 
 void local_replicator_t::do_read(

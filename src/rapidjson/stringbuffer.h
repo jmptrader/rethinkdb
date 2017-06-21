@@ -21,13 +21,13 @@
 #ifndef RAPIDJSON_STRINGBUFFER_H_
 #define RAPIDJSON_STRINGBUFFER_H_
 
-#include "rapidjson.h"
+#include "rapidjson/rapidjson.h"
 
 #if RAPIDJSON_HAS_CXX11_RVALUE_REFS
 #include <utility> // std::move
 #endif
 
-#include "internal/stack.h"
+#include "rapidjson/internal/stack.h"
 
 RAPIDJSON_NAMESPACE_BEGIN
 
@@ -37,7 +37,7 @@ RAPIDJSON_NAMESPACE_BEGIN
     \tparam Allocator type for allocating memory buffer.
     \note implements Stream concept
 */
-template <typename Encoding, typename Allocator = CrtAllocator>
+template <typename Encoding, typename Allocator = RAllocator>
 class GenericStringBuffer {
 public:
     typedef typename Encoding::Ch Ch;

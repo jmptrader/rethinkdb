@@ -1,9 +1,6 @@
 // Copyright 2010-2012 RethinkDB, all rights reserved.
 #include "concurrency/cond_var.hpp"
 
-#include "errors.hpp"
-#include <boost/bind.hpp>
-
 #include "arch/runtime/coroutines.hpp"
 #include "do_on_thread.hpp"
 
@@ -19,7 +16,7 @@ void one_waiter_cond_t::pulse() {
     pulsed_ = true;
     if (waiter_) {
         coro_t *tmp = waiter_;
-        waiter_ = NULL;
+        waiter_ = nullptr;
         tmp->notify_later_ordered();
     }
 }

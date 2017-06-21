@@ -5,10 +5,10 @@
 # We assemble path directives.
 LDFLAGS ?=
 CXXFLAGS ?=
-RT_LDFLAGS = $(LDFLAGS) $(RE2_LIBS) $(TERMCAP_LIBS) $(Z_LIBS) $(CURL_LIBS) $(CRYPTO_LIBS)
-RT_LDFLAGS += $(V8_LIBS) $(PROTOBUF_LIBS) $(PTHREAD_LIBS) $(MALLOC_LIBS) $(ICUI18N_LIBS) $(ICUUC_LIBS) $(ICUDATA_LIBS)
-RT_CXXFLAGS := $(CXXFLAGS) $(RE2_INCLUDE) $(V8_INCLUDE) $(PROTOBUF_INCLUDE) $(BOOST_INCLUDE) $(Z_INCLUDE) $(CURL_INCLUDE) $(CRYPTO_INCLUDE) $(ICUI18N_INCLUDE)
-ALL_INCLUDE_DEPS := $(RE2_INCLUDE_DEP) $(V8_INCLUDE_DEP) $(PROTOBUF_INCLUDE_DEP) $(BOOST_INCLUDE_DEP) $(Z_INCLUDE_DEP) $(CURL_INCLUDE_DEP) $(CRYPTO_INCLUDE_DEP) $(ICUI18N_INCLUDE_DEP)
+RT_LDFLAGS = $(LDFLAGS) $(RE2_LIBS) $(TERMCAP_LIBS) $(Z_LIBS) $(CURL_LIBS) $(CRYPTO_LIBS) $(SSL_LIBS)
+RT_LDFLAGS += $(V8_LIBS) $(PROTOBUF_LIBS) $(PTHREAD_LIBS) $(MALLOC_LIBS)
+RT_CXXFLAGS := $(CXXFLAGS) $(RE2_INCLUDE) $(V8_INCLUDE) $(PROTOBUF_INCLUDE) $(BOOST_INCLUDE) $(Z_INCLUDE) $(CURL_INCLUDE) $(CRYPTO_INCLUDE)
+ALL_INCLUDE_DEPS := $(RE2_INCLUDE_DEP) $(V8_INCLUDE_DEP) $(PROTOBUF_INCLUDE_DEP) $(BOOST_INCLUDE_DEP) $(Z_INCLUDE_DEP) $(CURL_INCLUDE_DEP) $(CRYPTO_INCLUDE_DEP) $(SSL_INCLUDE_DEP)
 
 ifeq ($(USE_CCACHE),1)
   RT_CXX := ccache $(CXX)
@@ -85,13 +85,14 @@ endif
 
 RT_LDFLAGS += $(LIB_SEARCH_PATHS)
 
-RT_CXXFLAGS?=
 RT_CXXFLAGS += -I$(SOURCE_DIR)
 RT_CXXFLAGS += -pthread
 RT_CXXFLAGS += "-DPRODUCT_NAME=\"$(PRODUCT_NAME)\""
 RT_CXXFLAGS += "-D__STDC_LIMIT_MACROS"
 RT_CXXFLAGS += "-D__STDC_FORMAT_MACROS"
 RT_CXXFLAGS += -Wall -Wextra
+
+RT_CXXFLAGS += -DENABLE_TLS
 
 # Enable RapidJSON std::string functions
 RT_CXXFLAGS += "-DRAPIDJSON_HAS_STDSTRING"
@@ -123,7 +124,7 @@ else ifeq ($(COMPILER), GCC)
   ifeq ($(LEGACY_GCC), 1)
     RT_CXXFLAGS += -Wformat=2 -Wswitch-enum -Wswitch-default
   else
-    RT_CXXFLAGS += -Wformat=2 -Wswitch-enum -Wswitch-default -Wno-array-bounds
+    RT_CXXFLAGS += -Wformat=2 -Wswitch-enum -Wswitch-default -Wno-array-bounds -Wno-maybe-uninitialized
   endif
 endif
 
@@ -134,10 +135,6 @@ ifeq ($(COVERAGE), 1)
   else
     $(error COVERAGE=1 not yet supported for $(COMPILER))
   endif
-endif
-
-ifeq ($(AGRESSIVE_BUF_UNLOADING),1)
-  RT_CXXFLAGS += -DAGRESSIVE_BUF_UNLOADING=1
 endif
 
 # TODO: >() only works on bash >= 4
@@ -188,26 +185,14 @@ endif
 
 ifeq ($(SYMBOLS),1)
   # -rdynamic is necessary so that backtrace_symbols() works properly
-  ifneq ($(OS),Darwin)
+  ifeq ($(OS),Linux)
     RT_LDFLAGS += -rdynamic
   endif
   RT_CXXFLAGS += -g
 endif  # ($(SYMBOLS),1)
 
-ifeq ($(SEMANTIC_SERIALIZER_CHECK),1)
-  RT_CXXFLAGS += -DSEMANTIC_SERIALIZER_CHECK
-endif
-
-ifeq ($(BTREE_DEBUG),1)
-  RT_CXXFLAGS += -DBTREE_DEBUG
-endif
-
 ifeq ($(JSON_SHORTCUTS),1)
   RT_CXXFLAGS += -DJSON_SHORTCUTS
-endif
-
-ifeq ($(SERIALIZER_DEBUG),1)
-  RT_CXXFLAGS += -DSERIALIZER_MARKERS
 endif
 
 ifeq ($(LEGACY_LINUX),1)
@@ -237,10 +222,6 @@ ifeq ($(VALGRIND),1)
   RT_CXXFLAGS += -DVALGRIND
 endif
 
-ifeq ($(LEGACY_PROC_STAT),1)
-  RT_CXXFLAGS += -DLEGACY_PROC_STAT
-endif
-
 ifeq ($(V8_PRE_3_19),1)
   RT_CXXFLAGS += -DV8_PRE_3_19
 endif
@@ -265,7 +246,7 @@ SOURCES := $(shell find $(SOURCE_DIR) -name '*.cc' -not -name '\.*')
 
 SERVER_EXEC_SOURCES := $(filter-out $(SOURCE_DIR)/unittest/%,$(SOURCES))
 
-QL2_PROTO_NAMES := rdb_protocol/ql2 rdb_protocol/ql2_extensions
+QL2_PROTO_NAMES := rdb_protocol/ql2
 QL2_PROTO_SOURCES := $(foreach _,$(QL2_PROTO_NAMES),$(SOURCE_DIR)/$_.proto)
 QL2_PROTO_HEADERS := $(foreach _,$(QL2_PROTO_NAMES),$(PROTO_DIR)/$_.pb.h)
 QL2_PROTO_CODE := $(foreach _,$(QL2_PROTO_NAMES),$(PROTO_DIR)/$_.pb.cc)
@@ -314,24 +295,25 @@ unit: $(BUILD_DIR)/$(SERVER_UNIT_TEST_NAME)
 .PRECIOUS: $(PROTO_DIR)/. $(QL2_PROTO_HEADERS) $(QL2_PROTO_CODE)
 
 $(PROTO_DIR)/%.pb.h $(PROTO_DIR)/%.pb.cc: $(SOURCE_DIR)/%.proto $(PROTOC_BIN_DEP) | $(PROTO_DIR)/.
-	$P PROTOC[CPP] $^
+	$P PROTOC
 
 #	# See issue #2965
 	+rm -f $(PROTO_DIR)/$*.pb.h $(PROTO_DIR)/$*.pb.cc
 
 	$(PROTOC) $(PROTOCFLAGS_CXX) --cpp_out $(PROTO_DIR) $<
 
-rpc/semilattice/joins/macros.hpp: $(TOP)/scripts/generate_join_macros.py
-rpc/serialize_macros.hpp: $(TOP)/scripts/generate_serialize_macros.py
-rpc/mailbox/typed.hpp: $(TOP)/scripts/generate_rpc_templates.py
-rpc/semilattice/joins/macros.hpp rpc/serialize_macros.hpp rpc/mailbox/typed.hpp:
+$(TOP)/src/rpc/semilattice/joins/macros.hpp: $(TOP)/scripts/generate_join_macros.py
+$(TOP)/src/rpc/serialize_macros.hpp: $(TOP)/scripts/generate_serialize_macros.py
+$(TOP)/src/rpc/semilattice/joins/macros.hpp $(TOP)/src/rpc/serialize_macros.hpp:
 	$P GEN $@
 	$< > $@
+
+generate-headers: $(TOP)/src/rpc/semilattice/joins/macros.hpp $(TOP)/src/rpc/serialize_macros.hpp
 
 .PHONY: rethinkdb
 rethinkdb: $(BUILD_DIR)/$(SERVER_EXEC_NAME)
 
-RETHINKDB_DEPENDENCIES_LIBS := $(MALLOC_LIBS_DEP) $(V8_LIBS_DEP) $(PROTOBUF_LIBS_DEP) $(RE2_LIBS_DEP) $(Z_LIBS_DEP) $(CURL_LIBS_DEP) $(CRYPTO_LIBS_DEP) $(ICUI18N_LIBS_DEP)
+RETHINKDB_DEPENDENCIES_LIBS := $(MALLOC_LIBS_DEP) $(V8_LIBS_DEP) $(PROTOBUF_LIBS_DEP) $(RE2_LIBS_DEP) $(Z_LIBS_DEP) $(CURL_LIBS_DEP) $(CRYPTO_LIBS_DEP) $(SSL_LIBS_DEP)
 
 MAYBE_CHECK_STATIC_MALLOC =
 ifeq ($(STATIC_MALLOC),1) # if the allocator is statically linked
@@ -383,11 +365,7 @@ $(BUILD_DIR)/$(GDB_FUNCTIONS_NAME): | $(BUILD_DIR)/.
 	$P CP $@
 	cp $(SCRIPTS_DIR)/$(GDB_FUNCTIONS_NAME) $@
 
-$(BUILD_DIR)/web_assets/web_assets.cc: $(TOP)/scripts/compile-web-assets.py $(ALL_WEB_ASSETS) | $(BUILD_DIR)/web_assets/.
-	$P GENERATE
-	$(TOP)/scripts/compile-web-assets.py $(WEB_ASSETS_BUILD_DIR) > $@
-
-$(OBJ_DIR)/web_assets/web_assets.o: $(BUILD_DIR)/web_assets/web_assets.cc $(MAKEFILE_DEPENDENCY)
+$(OBJ_DIR)/web_assets/web_assets.o: $(BUILD_ROOT_DIR)/bundle_assets/web_assets.cc $(MAKEFILE_DEPENDENCY)
 	mkdir -p $(dir $@)
 	$P CC
 	$(RT_CXX) $(RT_CXXFLAGS) -c -o $@ $<
@@ -395,7 +373,7 @@ $(OBJ_DIR)/web_assets/web_assets.o: $(BUILD_DIR)/web_assets/web_assets.cc $(MAKE
 $(OBJ_DIR)/%.pb.o: $(PROTO_DIR)/%.pb.cc $(MAKEFILE_DEPENDENCY) $(QL2_PROTO_HEADERS)
 	mkdir -p $(dir $@)
 	$P CC
-	$(RT_CXX) $(RT_CXXFLAGS) -c -o $@ $<
+	$(RT_CXX) $(RT_CXXFLAGS) -w -c -o $@ $<
 
 $(OBJ_DIR)/%.o: $(SOURCE_DIR)/%.cc $(MAKEFILE_DEPENDENCY) $(ALL_INCLUDE_DEPS) | $(QL2_PROTO_OBJS)
 	mkdir -p $(dir $@) $(dir $(DEP_DIR)/$*)

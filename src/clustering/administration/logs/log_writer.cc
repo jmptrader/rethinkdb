@@ -8,8 +8,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "errors.hpp"
-#include <boost/bind.hpp>
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 #include "arch/runtime/thread_pool.hpp"
 #include "arch/io/disk/filestat.hpp"
@@ -18,8 +19,61 @@
 #include "containers/scoped.hpp"
 #include "thread_local.hpp"
 
-RDB_IMPL_SERIALIZABLE_2_SINCE_v1_13(struct timespec, tv_sec, tv_nsec);
+
 RDB_IMPL_SERIALIZABLE_4_SINCE_v1_13(log_message_t, timestamp, uptime, level, message);
+
+// `struct timestamp` has platform-dependent integers, which is not good for
+// serialization. We serialize them as fixed types that are compatible with the types
+// we have on AMD64 Linux.
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wtautological-constant-out-of-range-compare"
+#endif
+template <cluster_version_t W>
+void serialize(write_message_t *wm, const struct timespec &ts) {
+    static_assert(
+        std::numeric_limits<decltype(ts.tv_sec)>::min()
+            >= std::numeric_limits<int64_t>::min()
+        && std::numeric_limits<decltype(ts.tv_sec)>::max()
+            <= std::numeric_limits<int64_t>::max(),
+        "incompatible timespec type");
+    serialize<W>(wm, static_cast<int64_t>(ts.tv_sec));
+    static_assert(
+        std::numeric_limits<decltype(ts.tv_nsec)>::min()
+            >= std::numeric_limits<int64_t>::min()
+        && std::numeric_limits<decltype(ts.tv_nsec)>::max()
+            <= std::numeric_limits<int64_t>::max(),
+        "incompatible timespec type");
+    serialize<W>(wm, static_cast<int64_t>(ts.tv_nsec));
+}
+template <cluster_version_t W>
+archive_result_t deserialize(read_stream_t *s, struct timespec *ts_out) {
+    archive_result_t res = archive_result_t::SUCCESS;
+
+    int64_t tv_sec;
+    res = deserialize<W>(s, &tv_sec);
+    if (bad(res)) { return res; }
+    if(!(tv_sec >= std::numeric_limits<decltype(ts_out->tv_sec)>::min()
+         && tv_sec <= std::numeric_limits<decltype(ts_out->tv_sec)>::max())) {
+        return archive_result_t::RANGE_ERROR;
+    }
+    ts_out->tv_sec = tv_sec;
+
+    int64_t tv_nsec;
+    res = deserialize<W>(s, &tv_nsec);
+    if (bad(res)) { return res; }
+    if(!(tv_nsec >= std::numeric_limits<decltype(ts_out->tv_nsec)>::min()
+         && tv_nsec <= std::numeric_limits<decltype(ts_out->tv_nsec)>::max())) {
+        return archive_result_t::RANGE_ERROR;
+    }
+    ts_out->tv_nsec = tv_nsec;
+
+    return res;
+}
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+INSTANTIATE_SERIALIZABLE_SINCE_v1_13(struct timespec);
 
 std::string format_log_level(log_level_t l) {
     switch (l) {
@@ -72,7 +126,7 @@ std::string format_log_message(const log_message_t &m, bool for_console) {
     while (start < static_cast<ssize_t>(message.length()) && message[start] == '\n') {
         ++start;
     }
-    while (end >= 0 && message[end] == '\n') {
+    while (end >= 0 && (message[end] == '\n' || message[end] == '\r')) {
         end--;
     }
     for (int i = start; i <= end; i++) {
@@ -96,10 +150,10 @@ std::string format_log_message(const log_message_t &m, bool for_console) {
                 message_reformatted.append("\\\\");
             }
         } else if (message[i] < ' ' || message[i] > '~') {
-#ifndef NDEBUG
-            crash("We can't have special characters in log messages because then it "
-                "would be difficult to parse the log file. Message: %s",
-                message.c_str());
+#if !defined(NDEBUG)
+             crash("We can't have special characters in log messages because then it "
+                   "would be difficult to parse the log file. Message: %s",
+                   message.c_str());
 #else
             message_reformatted.push_back('?');
 #endif
@@ -279,7 +333,12 @@ private:
     struct timespec uptime_reference;
     struct timespec last_msg_timestamp;
     spinlock_t last_msg_timestamp_lock;
+
+#ifdef _WIN32
+    // TODO WINDOWS: log locking
+#else
     struct flock filelock, fileunlock;
+#endif
     scoped_fd_t fd;
 
     DISABLE_COPYING(fallback_log_writer_t);
@@ -290,6 +349,7 @@ fallback_log_writer_t::fallback_log_writer_t() :
     uptime_reference = clock_monotonic();
     last_msg_timestamp = clock_realtime();
 
+#ifndef _WIN32
     filelock.l_type = F_WRLCK;
     filelock.l_whence = SEEK_SET;
     filelock.l_start = 0;
@@ -301,12 +361,23 @@ fallback_log_writer_t::fallback_log_writer_t() :
     fileunlock.l_start = 0;
     fileunlock.l_len = 0;
     fileunlock.l_pid = getpid();
+#endif
 }
 
 void fallback_log_writer_t::install(const std::string &logfile_name) {
     guarantee(filename.path() == "-", "Attempted to install a fallback_log_writer_t that was already installed.");
     filename = base_path_t(logfile_name);
 
+#ifdef _WIN32
+    HANDLE h = CreateFile(filename.path().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    fd.reset(h);
+
+    if (fd.get() == INVALID_FD) {
+        throw std::runtime_error(strprintf("Failed to open log file '%s': %s",
+                                           logfile_name.c_str(),
+                                           winerr_string(GetLastError()).c_str()).c_str());
+    }
+#else
     int res;
     do {
         res = open(filename.path().c_str(), O_WRONLY|O_APPEND|O_CREAT, 0644);
@@ -319,6 +390,7 @@ void fallback_log_writer_t::install(const std::string &logfile_name) {
                                            logfile_name.c_str(),
                                            errno_string(errno).c_str()).c_str());
     }
+#endif
 
     // Get the absolute path for the log file, so it will still be valid if
     //  the working directory changes
@@ -363,24 +435,25 @@ log_message_t fallback_log_writer_t::assemble_log_message(
     return log_message_t(timestamp, uptime, level, m);
 }
 
+// WINDOWS TODO: this function could benefit from some refactoring
 bool fallback_log_writer_t::write(const log_message_t &msg, std::string *error_out) {
     std::string formatted = format_log_message(msg) + "\n";
 
     FILE* write_stream = nullptr;
-    int fileno = -1;
+    fd_t filefd = INVALID_FD;
     switch (msg.level) {
         case log_level_info:
             // no message on stdout/stderr
             break;
         case log_level_notice:
             write_stream = stdout;
-            fileno = STDOUT_FILENO;
+            filefd = STDOUT_FD;
             break;
         case log_level_debug:
         case log_level_warn:
         case log_level_error:
             write_stream = stderr;
-            fileno = STDERR_FILENO;
+            filefd = STDERR_FD;
             break;
         default:
             unreachable();
@@ -389,15 +462,23 @@ bool fallback_log_writer_t::write(const log_message_t &msg, std::string *error_o
     if (msg.level != log_level_info) {
         // Write to stdout/stderr for all log levels but info (#3040)
         std::string console_formatted = format_log_message(msg, true) + "\n";
+#ifdef _WIN32
+        // WINDOWS TODO
+        (void) write_stream;
+#else
         flockfile(write_stream);
+#endif
 
-        ssize_t write_res = ::write(fileno, console_formatted.data(), console_formatted.length());
-        if (write_res != static_cast<ssize_t>(console_formatted.length())) {
+        size_t write_res = ::fwrite(console_formatted.data(), 1, console_formatted.length(), write_stream);
+        if (write_res != console_formatted.length()) {
             error_out->assign("cannot write to stdout/stderr: " + errno_string(get_errno()));
             return false;
         }
 
-        int fsync_res = fsync(fileno);
+#ifdef _WIN32
+        // WINDOWS TODO
+#else
+        int fsync_res = fsync(filefd);
         if (fsync_res != 0 && !(get_errno() == EROFS || get_errno() == EINVAL ||
                 get_errno() == ENOTSUP)) {
             error_out->assign("cannot flush stdout/stderr: " + errno_string(get_errno()));
@@ -405,30 +486,43 @@ bool fallback_log_writer_t::write(const log_message_t &msg, std::string *error_o
         }
 
         funlockfile(write_stream);
+#endif
     }
 
     if (fd.get() == INVALID_FD) {
-        error_out->assign("cannot open or find log file");
+        error_out->assign("logging module is not yet initialized");
         return false;
     }
-
+#ifndef _WIN32
     int fcntl_res = fcntl(fd.get(), F_SETLKW, &filelock);
     if (fcntl_res != 0) {
         error_out->assign("cannot lock log file: " + errno_string(get_errno()));
         return false;
     }
+#endif
 
+#ifdef _WIN32
+    DWORD bytes_written;
+    BOOL res = WriteFile(fd.get(), formatted.data(), formatted.length(), &bytes_written, nullptr);
+    if (!res) {
+        error_out->assign("cannot write to log file: " + winerr_string(GetLastError()));
+        return false;
+    }
+#else
     ssize_t write_res = ::write(fd.get(), formatted.data(), formatted.length());
     if (write_res != static_cast<ssize_t>(formatted.length())) {
         error_out->assign("cannot write to log file: " + errno_string(get_errno()));
         return false;
     }
+#endif
 
+#ifndef _WIN32
     fcntl_res = fcntl(fd.get(), F_SETLK, &fileunlock);
     if (fcntl_res != 0) {
         error_out->assign("cannot unlock log file: " + errno_string(get_errno()));
         return false;
     }
+#endif
 
     return true;
 }
@@ -441,21 +535,30 @@ void fallback_log_writer_t::initiate_write(log_level_t level, const std::string 
     }
 }
 
+typedef auto_drainer_t * type;
 
-
-TLS_with_init(thread_pool_log_writer_t *, global_log_writer, NULL);
-TLS_with_init(auto_drainer_t *, global_log_drainer, NULL);
+TLS_with_init(thread_pool_log_writer_t *, global_log_writer, nullptr);
+TLS_with_init(auto_drainer_t *, global_log_drainer, nullptr);
 TLS_with_init(int, log_writer_block, 0);
 
-thread_pool_log_writer_t::thread_pool_log_writer_t() {
-    pmap(get_num_threads(), boost::bind(&thread_pool_log_writer_t::install_on_thread, this, _1));
+thread_pool_log_writer_t::thread_pool_log_writer_t()
+        : has_parse_error(false) {
+    pmap(
+        get_num_threads(),
+        std::bind(&thread_pool_log_writer_t::install_on_thread, this, ph::_1));
 }
 
 thread_pool_log_writer_t::~thread_pool_log_writer_t() {
-    pmap(get_num_threads(), boost::bind(&thread_pool_log_writer_t::uninstall_on_thread, this, _1));
+    pmap(get_num_threads(), std::bind(&thread_pool_log_writer_t::uninstall_on_thread, this, ph::_1));
 }
 
-std::vector<log_message_t> thread_pool_log_writer_t::tail(int max_lines, struct timespec min_timestamp, struct timespec max_timestamp, signal_t *interruptor) THROWS_ONLY(log_read_exc_t, interrupted_exc_t) {
+std::vector<log_message_t> thread_pool_log_writer_t::tail(
+        int max_lines,
+        struct timespec min_timestamp,
+        struct timespec max_timestamp,
+        signal_t *interruptor) THROWS_ONLY(log_read_exc_t, interrupted_exc_t) {
+    assert_thread();
+
     volatile bool cancel = false;
     class cancel_subscription_t : public signal_t::subscription_t {
     public:
@@ -472,11 +575,25 @@ std::vector<log_message_t> thread_pool_log_writer_t::tail(int max_lines, struct 
 
 
     bool ok;
-    thread_pool_t::run_in_blocker_pool(boost::bind(&thread_pool_log_writer_t::tail_blocking, this, max_lines, min_timestamp, max_timestamp, &cancel, &log_messages, &error_message, &ok));
+    thread_pool_t::run_in_blocker_pool(
+        std::bind(
+            &thread_pool_log_writer_t::tail_blocking,
+            this,
+            max_lines,
+            min_timestamp,
+            max_timestamp,
+            &cancel,
+            &log_messages,
+            &error_message,
+            &ok));
     if (ok) {
         if (cancel) {
             throw interrupted_exc_t();
         } else {
+            if (has_parse_error == false && error_message.empty() == false) {
+                logERR("%s", error_message.c_str());
+                has_parse_error = true;
+            }
             return log_messages;
         }
     } else {
@@ -486,7 +603,7 @@ std::vector<log_message_t> thread_pool_log_writer_t::tail(int max_lines, struct 
 
 void thread_pool_log_writer_t::install_on_thread(int i) {
     on_thread_t thread_switcher((threadnum_t(i)));
-    guarantee(TLS_get_global_log_writer() == NULL);
+    guarantee(TLS_get_global_log_writer() == nullptr);
     TLS_set_global_log_drainer(new auto_drainer_t);
     TLS_set_global_log_writer(this);
 }
@@ -494,16 +611,16 @@ void thread_pool_log_writer_t::install_on_thread(int i) {
 void thread_pool_log_writer_t::uninstall_on_thread(int i) {
     on_thread_t thread_switcher((threadnum_t(i)));
     guarantee(TLS_get_global_log_writer() == this);
-    TLS_set_global_log_writer(NULL);
+    TLS_set_global_log_writer(nullptr);
     delete TLS_get_global_log_drainer();
-    TLS_set_global_log_drainer(NULL);
+    TLS_set_global_log_drainer(nullptr);
 }
 
 void thread_pool_log_writer_t::write(const log_message_t &lm) {
     mutex_t::acq_t write_mutex_acq(&write_mutex);
     std::string error_message;
     bool ok;
-    thread_pool_t::run_in_blocker_pool(boost::bind(&thread_pool_log_writer_t::write_blocking, this, lm, &error_message, &ok));
+    thread_pool_t::run_in_blocker_pool(std::bind(&thread_pool_log_writer_t::write_blocking, this, lm, &error_message, &ok));
     if (ok) {
         log_write_issue_tracker.report_success();
     } else {
@@ -516,29 +633,61 @@ void thread_pool_log_writer_t::write_blocking(const log_message_t &msg, std::str
     return;
 }
 
-void thread_pool_log_writer_t::tail_blocking(int max_lines, struct timespec min_timestamp, struct timespec max_timestamp, volatile bool *cancel, std::vector<log_message_t> *messages_out, std::string *error_out, bool *ok_out) {
+void thread_pool_log_writer_t::tail_blocking(
+        int max_lines,
+        timespec min_timestamp,
+        timespec max_timestamp,
+        volatile bool *cancel,
+        std::vector<log_message_t> *messages_out,
+        std::string *error_out,
+        bool *ok_out) {
     try {
         scoped_fd_t fd;
+#ifdef _WIN32
+        fd.reset(CreateFile(fallback_log_writer.filename.path().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL));
+        if (fd.get() == INVALID_FD) {
+            logWRN("CreateFile failed: %s", winerr_string(GetLastError()).c_str());
+            set_errno(EIO);
+        }
+#else
         do {
             fd.reset(open(fallback_log_writer.filename.path().c_str(), O_RDONLY));
         } while (fd.get() == INVALID_FD && get_errno() == EINTR);
+#endif
         throw_unless(fd.get() != INVALID_FD,
             strprintf("could not open '%s' for reading.",
                 fallback_log_writer.filename.path().c_str()));
+
         file_reverse_reader_t reader(std::move(fd));
         std::string line;
         while (max_lines-- > 0 && reader.get_next(&line) && !*cancel) {
-            if (line == "") {
+            if (line.empty()) {
                 continue;
             }
-            log_message_t lm = parse_log_message(line);
-            if (lm.timestamp > max_timestamp) continue;
-            if (lm.timestamp < min_timestamp) break;
+            log_message_t lm;
+            try {
+                lm = parse_log_message(line);
+            } catch (const log_read_exc_t &exc) {
+                *error_out = strprintf(
+                    "Failed to parse one or more lines from the log file, the contents "
+                    "of the `logs` system table will be incomplete. The following parse "
+                    "error occurred: %s while parsing \"%s\"",
+                    exc.what(),
+                    line.c_str());
+                continue;
+            }
+            if (lm.timestamp > max_timestamp) {
+                continue;
+            }
+            if (lm.timestamp < min_timestamp) {
+                break;
+            }
             messages_out->push_back(lm);
         }
         *ok_out = true;
         return;
     } catch (const log_read_exc_t &e) {
+        // Any parse errors are handled above, this is for reader-related failures.
         *error_out = e.what();
         *ok_out = false;
         return;
@@ -567,7 +716,7 @@ void vlog_internal(UNUSED const char *src_file, UNUSED int src_line, log_level_t
         auto_drainer_t::lock_t lock(TLS_get_global_log_drainer());
 
         std::string message = vstrprintf(format, args);
-        coro_t::spawn_sometime(boost::bind(&log_coro, writer, level, message, lock));
+        coro_t::spawn_sometime(std::bind(&log_coro, writer, level, message, lock));
 
     } else {
         std::string message = vstrprintf(format, args);

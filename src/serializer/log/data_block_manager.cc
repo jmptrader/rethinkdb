@@ -23,8 +23,8 @@ const int64_t APPROXIMATE_READ_AHEAD_SIZE = 32 * DEFAULT_BTREE_BLOCK_SIZE;
  * GC Parameters *
  *****************/
 
-// How many GC routines to launch in concurrently, at maximum
-const size_t MAX_CONCURRENT_GCS = 32;
+// How many GC routines to launch concurrently, at maximum
+const size_t MAX_CONCURRENT_GCS = 64;
 
 // Garbage Collection uses its own two IO accounts.
 // There is one low-priority account that is meant to guarantee
@@ -39,12 +39,12 @@ const int GC_IO_PRIORITY_NICE = 8;
 const int GC_IO_PRIORITY_HIGH = 4 * MERGER_BLOCK_WRITE_IO_PRIORITY;
 
 // The ratio at which we start GCing.
-constexpr double GC_START_RATIO = 0.15;
+constexpr double GC_START_RATIO = 0.1;
 // The ratio at which we don't want to keep GC'ing.
-constexpr double GC_STOP_RATIO = 0.1;
+constexpr double GC_STOP_RATIO = 0.05;
 // The ratio at which we start taking more serious measures to get the garbage
 // rate down.
-constexpr double GC_HIGH_RATIO = 0.5;
+constexpr double GC_HIGH_RATIO = 0.3;
 
 // What's the maximum number of "young" extents we can have?
 const size_t GC_YOUNG_EXTENT_MAX_SIZE = 50;
@@ -58,10 +58,12 @@ const microtime_t GC_YOUNG_EXTENT_TIMELIMIT_MICROS = 50000;
 class gc_entry_t : public intrusive_list_node_t<gc_entry_t> {
 private:
     struct block_info_t {
-        uint32_t relative_offset;
+        // 512 * 2^14 = 2^23 = 8MB. Assumes extent size < 8 MB.  Right now extent size
+        // is 2.  ("dblocks" = "device blocks").
+        uint16_t relative_offset_in_dblocks : 14;
+        uint16_t token_referenced : 1;
+        uint16_t index_referenced : 1;
         block_size_t block_size;
-        bool token_referenced;
-        bool index_referenced;
     };
 
 public:
@@ -75,6 +77,7 @@ public:
           garbage_bytes_stat(_parent->static_config->extent_size()),
           num_live_blocks_stat(0),
           extent_offset(extent_ref.offset()) {
+        static_assert(sizeof(block_info_t) == 4, "block_info_t not 4 bytes");
         add_self_to_parent_entries();
     }
 
@@ -100,7 +103,7 @@ public:
     ~gc_entry_t() {
         uint64_t extent_id = parent->static_config->extent_index(extent_offset);
         guarantee(parent->entries.get(extent_id) == this);
-        parent->entries.set(extent_id, NULL);
+        parent->entries.set(extent_id, nullptr);
 
         --parent->stats->pm_serializer_data_extents;
     }
@@ -112,7 +115,7 @@ public:
 
         std::vector<uint32_t> ret;
         for (auto it = block_infos.begin(); it != block_infos.end(); ++it) {
-            ret.push_back(it->relative_offset);
+            ret.push_back(it->relative_offset_in_dblocks * DEVICE_BLOCK_SIZE);
         }
 
         ret.push_back(back_relative_offset());
@@ -124,59 +127,59 @@ public:
     uint32_t back_relative_offset() const {
         return block_infos.empty()
             ? 0
-            : block_infos.back().relative_offset
+            : (block_infos.back().relative_offset_in_dblocks * DEVICE_BLOCK_SIZE)
             + aligned_value(block_infos.back().block_size);
     }
 
     // Returns the ostensible size of the block_index'th block.  Note that
     // block_boundaries[i] + block_size(i) <= block_boundaries[i + 1].
-    block_size_t block_size(unsigned int block_index) const {
+    block_size_t block_size(unsigned int _block_index) const {
         guarantee(state != state_reconstructing);
-        guarantee(block_index < block_infos.size());
-        return block_infos[block_index].block_size;
+        guarantee(_block_index < block_infos.size());
+        return block_infos[_block_index].block_size;
     }
 
     // Returns block_boundaries()[block_index].
-    uint32_t relative_offset(unsigned int block_index) const {
+    uint32_t relative_offset(unsigned int _block_index) const {
         guarantee(state != state_reconstructing);
-        guarantee(block_index < block_infos.size());
-        return block_infos[block_index].relative_offset;
+        guarantee(_block_index < block_infos.size());
+        return block_infos[_block_index].relative_offset_in_dblocks * DEVICE_BLOCK_SIZE;
     }
 
     unsigned int block_index(int64_t offset) const {
         guarantee(state != state_reconstructing);
         guarantee(offset >= extent_ref.offset());
         guarantee(offset < extent_ref.offset() + UINT32_MAX);
-        const uint32_t relative_offset = offset - extent_ref.offset();
+        const uint32_t _relative_offset = offset - extent_ref.offset();
 
-        auto it = find_lower_bound_iter(relative_offset);
+        auto it = find_lower_bound_iter(_relative_offset);
         guarantee(it != block_infos.end());
         return it - block_infos.begin();
     }
 
-    bool new_offset(block_size_t block_size,
+    bool new_offset(block_size_t _block_size,
                     uint32_t *relative_offset_out,
                     unsigned int *block_index_out) {
         // Returns true if there's enough room at the end of the extent for the new
         // block.
         guarantee(state == state_active);
-        guarantee(block_size.ser_value() <= parent->static_config->extent_size());
+        guarantee(_block_size.ser_value() <= parent->static_config->extent_size());
 
         uint32_t offset = back_relative_offset();
         guarantee(offset <= parent->static_config->extent_size());
 
-        if (offset > parent->static_config->extent_size() - block_size.ser_value()) {
+        if (offset > parent->static_config->extent_size() - _block_size.ser_value()) {
             return false;
         } else {
             *relative_offset_out = offset;
             *block_index_out = block_infos.size();
-            block_infos.push_back(block_info_t{offset, block_size, false, false});
-            update_stats(NULL, &block_infos.back());
+            block_infos.push_back(block_info_t{static_cast<uint16_t>(offset / DEVICE_BLOCK_SIZE), false, false, _block_size});
+            update_stats(nullptr, &block_infos.back());
             return true;
         }
     }
 
-    static uint32_t aligned_value(block_size_t bs) {
+    static uint16_t aligned_value(block_size_t bs) {
         return ceil_aligned(bs.ser_value(), DEVICE_BLOCK_SIZE);
     }
 
@@ -195,26 +198,27 @@ public:
         return garbage_bytes_stat;
     }
 
-    bool block_is_garbage(unsigned int block_index) const {
+    bool block_is_garbage(unsigned int _block_index) const {
         guarantee(state != state_reconstructing);
-        guarantee(block_index < block_infos.size());
-        return !block_infos[block_index].token_referenced && !block_infos[block_index].index_referenced;
+        guarantee(_block_index < block_infos.size());
+        return !block_infos[_block_index].token_referenced &&
+            !block_infos[_block_index].index_referenced;
     }
 
-    void mark_live_tokenwise(unsigned int block_index) {
+    void mark_live_tokenwise(unsigned int _block_index) {
         guarantee(state != state_reconstructing);
-        guarantee(block_index < block_infos.size());
-        const block_info_t old_info = block_infos[block_index];
-        block_infos[block_index].token_referenced = true;
-        update_stats(&old_info, &block_infos[block_index]);
+        guarantee(_block_index < block_infos.size());
+        const block_info_t old_info = block_infos[_block_index];
+        block_infos[_block_index].token_referenced = true;
+        update_stats(&old_info, &block_infos[_block_index]);
     }
 
-    void mark_garbage_tokenwise(unsigned int block_index) {
+    void mark_garbage_tokenwise(unsigned int _block_index) {
         guarantee(state != state_reconstructing);
-        guarantee(block_index < block_infos.size());
-        const block_info_t old_info = block_infos[block_index];
-        block_infos[block_index].token_referenced = false;
-        update_stats(&old_info, &block_infos[block_index]);
+        guarantee(_block_index < block_infos.size());
+        const block_info_t old_info = block_infos[_block_index];
+        block_infos[_block_index].token_referenced = false;
+        update_stats(&old_info, &block_infos[_block_index]);
     }
 
     uint32_t token_bytes() const {
@@ -227,47 +231,52 @@ public:
         return b;
     }
 
-    static bool info_less(const block_info_t &info, uint32_t relative_offset) {
-        return info.relative_offset < relative_offset;
+    static bool info_less(const block_info_t &info, uint32_t relative_offset_in_dblocks) {
+        return info.relative_offset_in_dblocks < relative_offset_in_dblocks;
     }
 
-    std::vector<block_info_t>::const_iterator find_lower_bound_iter(uint32_t relative_offset) const {
-        return std::lower_bound(block_infos.begin(), block_infos.end(), relative_offset, &gc_entry_t::info_less);
+    std::vector<block_info_t>::const_iterator
+    find_lower_bound_iter(uint32_t _relative_offset) const {
+        rassert(divides(DEVICE_BLOCK_SIZE, _relative_offset));
+        return std::lower_bound(block_infos.begin(),
+                                block_infos.end(),
+                                _relative_offset / DEVICE_BLOCK_SIZE,
+                                &gc_entry_t::info_less);
     }
 
-    void mark_live_indexwise_with_offset(int64_t offset, block_size_t block_size) {
+    void mark_live_indexwise_with_offset(int64_t offset, block_size_t _block_size) {
         guarantee(offset >= extent_ref.offset() && offset < extent_ref.offset() + UINT32_MAX);
 
-        uint32_t relative_offset = offset - extent_ref.offset();
+        uint32_t _relative_offset = offset - extent_ref.offset();
 
-        auto it = find_lower_bound_iter(relative_offset);
+        auto it = find_lower_bound_iter(_relative_offset);
         if (it == block_infos.end()) {
-            block_infos.push_back(block_info_t{relative_offset, block_size, false, true});
-            update_stats(NULL, &block_infos.back());
-        } else if (it->relative_offset > relative_offset) {
-            guarantee(it->relative_offset >= relative_offset + aligned_value(block_size));
-            auto new_block = block_infos.insert(it, block_info_t{relative_offset, block_size, false, true});
-            update_stats(NULL, &*new_block);
+            block_infos.push_back(block_info_t{static_cast<uint16_t>(_relative_offset / DEVICE_BLOCK_SIZE), false, true, _block_size});
+            update_stats(nullptr, &block_infos.back());
+        } else if (it->relative_offset_in_dblocks * DEVICE_BLOCK_SIZE > _relative_offset) {
+            guarantee(it->relative_offset_in_dblocks * DEVICE_BLOCK_SIZE >= _relative_offset + aligned_value(_block_size));
+            auto new_block = block_infos.insert(it, block_info_t{static_cast<uint16_t>(_relative_offset / DEVICE_BLOCK_SIZE), false, true, _block_size});
+            update_stats(nullptr, &*new_block);
         } else {
-            guarantee(it->relative_offset == relative_offset);
-            guarantee(it->block_size == block_size);
+            guarantee(it->relative_offset_in_dblocks * DEVICE_BLOCK_SIZE == _relative_offset);
+            guarantee(it->block_size == _block_size);
             const block_info_t old_info = *it;
             it->index_referenced = true;
             update_stats(&old_info, &*it);
         }
     }
 
-    void mark_garbage_indexwise(unsigned int block_index) {
+    void mark_garbage_indexwise(unsigned int _block_index) {
         guarantee(state != state_reconstructing);
-        guarantee(block_infos[block_index].index_referenced);
-        const block_info_t old_info = block_infos[block_index];
-        block_infos[block_index].index_referenced = false;
-        update_stats(&old_info, &block_infos[block_index]);
+        guarantee(block_infos[_block_index].index_referenced);
+        const block_info_t old_info = block_infos[_block_index];
+        block_infos[_block_index].index_referenced = false;
+        update_stats(&old_info, &block_infos[_block_index]);
     }
 
-    bool block_referenced_by_index(unsigned int block_index) const {
-        guarantee(block_index < block_infos.size());
-        return block_infos[block_index].index_referenced;
+    bool block_referenced_by_index(unsigned int _block_index) const {
+        guarantee(_block_index < block_infos.size());
+        return block_infos[_block_index].index_referenced;
     }
 
     uint32_t index_bytes() const {
@@ -289,26 +298,35 @@ public:
         const int64_t offset = extent_ref.offset();
         std::string ret;
         for (auto it = block_infos.begin(); it != block_infos.end(); ++it) {
-            ret += strprintf("%s[%" PRIi64 "..+%" PRIu32 ") %c%c",
+            ret += strprintf("%s[%" PRIi64 "..+%" PRIu16 ") %c%c",
                              it == block_infos.begin() ? "" : separator,
-                             offset + it->relative_offset, it->block_size.ser_value(),
+                             offset + it->relative_offset_in_dblocks * DEVICE_BLOCK_SIZE,
+                             it->block_size.ser_value(),
                              it->token_referenced ? 'T' : ' ',
                              it->index_referenced ? 'I' : ' ');
         }
         return ret;
     }
 
+    void shrink_to_fit() {
+        block_infos.shrink_to_fit();
+    }
+
 private:
     // Private because we cannot guarantee that our stats remain consistent if somebody
     // gets a non-const iterator.
-    std::vector<block_info_t>::iterator find_lower_bound_iter(uint32_t relative_offset) {
-        return std::lower_bound(block_infos.begin(), block_infos.end(), relative_offset, &gc_entry_t::info_less);
+    std::vector<block_info_t>::iterator find_lower_bound_iter(uint32_t _relative_offset) {
+        rassert(divides(DEVICE_BLOCK_SIZE, _relative_offset));
+        return std::lower_bound(block_infos.begin(),
+                                block_infos.end(),
+                                _relative_offset / DEVICE_BLOCK_SIZE,
+                                &gc_entry_t::info_less);
     }
 
     // old_block can be NULL if a block_info was freshly added
     void update_stats(const block_info_t *old_block, const block_info_t *new_block) {
-        rassert(new_block != NULL);
-        if (old_block != NULL) {
+        rassert(new_block != nullptr);
+        if (old_block != nullptr) {
             // Undo old_block
             if (old_block->token_referenced || old_block->index_referenced) {
                 // Block is live
@@ -327,7 +345,7 @@ private:
     // Used by constructors.
     void add_self_to_parent_entries() {
         uint64_t extent_id = parent->static_config->extent_index(extent_offset);
-        guarantee(parent->entries.get(extent_id) == NULL);
+        guarantee(parent->entries.get(extent_id) == nullptr);
         parent->entries.set(extent_id, this);
 
         ++parent->stats->pm_serializer_data_extents;
@@ -381,20 +399,26 @@ data_block_manager_t::data_block_manager_t(
         extent_manager_t *em, log_serializer_t *_serializer,
         const log_serializer_on_disk_static_config_t *_static_config,
         log_serializer_stats_t *_stats)
-    : stats(_stats), shutdown_callback(NULL), state(state_unstarted), gc_enabled(true),
-      static_config(_static_config), extent_manager(em), serializer(_serializer),
+    : stats(_stats), shutdown_callback(nullptr), state(state_unstarted),
+      gc_enabled(true), static_config(_static_config), extent_manager(em),
+      serializer(_serializer),
+      gc_index_write_pumper(std::bind(
+          &data_block_manager_t::flush_gc_index_writes, this, std::placeholders::_1)),
+      /* The capacity of the gc_index_write_semaphore will be scaled
+      based on the active number of GC threads. */
+      gc_index_write_semaphore(1),
       gc_stats(stats)
 {
-    rassert(static_config != NULL);
-    rassert(extent_manager != NULL);
-    rassert(serializer != NULL);
+    rassert(static_config != nullptr);
+    rassert(extent_manager != nullptr);
+    rassert(serializer != nullptr);
 }
 
 data_block_manager_t::~data_block_manager_t() {
     guarantee(state == state_unstarted || state == state_shut_down);
 }
 
-void data_block_manager_t::prepare_initial_metablock(data_block_manager::metablock_mixin_t *mb) {
+void data_block_manager_t::prepare_initial_metablock(dbm_metablock_mixin_t *mb) {
     mb->active_extent = NULL_OFFSET;
 }
 
@@ -409,7 +433,7 @@ void data_block_manager_t::start_reconstruct() {
 void data_block_manager_t::mark_live(int64_t offset, block_size_t ser_block_size) {
     uint64_t extent_id = static_config->extent_index(offset);
 
-    if (entries.get(extent_id) == NULL) {
+    if (entries.get(extent_id) == nullptr) {
         guarantee(state == state_unstarted); // This is called at startup.
 
         gc_entry_t *entry = new gc_entry_t(this, extent_id * extent_manager->extent_size);
@@ -424,8 +448,9 @@ void data_block_manager_t::end_reconstruct() {
     guarantee(state == state_unstarted);
 }
 
-void data_block_manager_t::start_existing(file_t *file,
-                                          data_block_manager::metablock_mixin_t *last_metablock) {
+void data_block_manager_t::start_existing(
+        file_t *file,
+        const dbm_metablock_mixin_t *last_metablock) {
     guarantee(state == state_unstarted);
     dbfile = file;
     gc_io_account_nice.init(new file_account_t(file, GC_IO_PRIORITY_NICE));
@@ -438,13 +463,13 @@ void data_block_manager_t::start_existing(file_t *file,
         /* It is (perhaps) possible to have an active data block extent with no
            actual data blocks in it. In this case we would not have created a
            gc_entry_t for the extent yet. */
-        if (entries.get(offset / extent_manager->extent_size) == NULL) {
+        if (entries.get(offset / extent_manager->extent_size) == nullptr) {
             gc_entry_t *e = new gc_entry_t(this, offset);
             reconstructed_extents.push_back(e);
         }
 
         active_extent = entries.get(offset / extent_manager->extent_size);
-        guarantee(active_extent != NULL);
+        guarantee(active_extent != nullptr);
 
         /* Turn the extent from a reconstructing extent into an active extent */
         guarantee(active_extent->state == gc_entry_t::state_reconstructing);
@@ -452,7 +477,7 @@ void data_block_manager_t::start_existing(file_t *file,
 
         active_extent->make_active();
     } else {
-        active_extent = NULL;
+        active_extent = nullptr;
     }
 
     /* Convert any extents that we found live blocks in, but that are not active
@@ -462,6 +487,7 @@ void data_block_manager_t::start_existing(file_t *file,
 
         guarantee(entry->state == gc_entry_t::state_reconstructing);
         entry->state = gc_entry_t::state_old;
+        entry->shrink_to_fit();
 
         entry->our_pq_entry = gc_pq.push(entry);
 
@@ -478,7 +504,7 @@ void data_block_manager_t::start_existing(file_t *file,
 // block_boundaries() value.  Outputs an interval that is _NOT_ fit to device block
 // size boundaries.  This is used by read_ahead_offset_and_size.
 void unaligned_read_ahead_interval(const int64_t block_offset,
-                                   const uint32_t ser_block_size,
+                                   const uint16_t ser_block_size,
                                    const int64_t extent_size,
                                    const int64_t read_ahead_size,
                                    const std::vector<uint32_t> &boundaries,
@@ -525,7 +551,7 @@ void unaligned_read_ahead_interval(const int64_t block_offset,
 // ser_block_size_in) interval.  boundaries is the extent's gc_entry_t's
 // block_boundaries() value.
 void read_ahead_interval(const int64_t block_offset,
-                         const uint32_t ser_block_size,
+                         const uint16_t ser_block_size,
                          const int64_t extent_size,
                          const int64_t read_ahead_size,
                          const int64_t device_block_size,
@@ -543,7 +569,7 @@ void read_ahead_interval(const int64_t block_offset,
 }
 
 void read_ahead_offset_and_size(int64_t off_in,
-                                int64_t ser_block_size_in,
+                                uint16_t ser_block_size_in,
                                 int64_t extent_size,
                                 const std::vector<uint32_t> &boundaries,
                                 int64_t *offset_out, int64_t *size_out) {
@@ -566,14 +592,14 @@ public:
                                                 int64_t off_in) {
         const gc_entry_t *entry
             = parent->entries.get(off_in / parent->static_config->extent_size());
-        guarantee(entry != NULL);
+        guarantee(entry != nullptr);
 
         return entry->block_boundaries();
     }
 
     static void perform_read_ahead(data_block_manager_t *const parent,
                                    const int64_t off_in,
-                                   const uint32_t ser_block_size_in,
+                                   const uint16_t ser_block_size_in,
                                    void *const buf_out,
                                    file_account_t *const io_account,
                                    log_serializer_stats_t *const stats) {
@@ -590,8 +616,7 @@ public:
                                    &read_ahead_offset,
                                    &read_ahead_size);
 
-        scoped_malloc_t<char> read_ahead_buf(
-                malloc_aligned(read_ahead_size, DEVICE_BLOCK_SIZE));
+        scoped_device_block_aligned_ptr_t<char> read_ahead_buf(read_ahead_size);
 
         // Do the disk read!
         co_read(parent->dbfile, read_ahead_offset, read_ahead_size,
@@ -638,18 +663,16 @@ public:
                     continue;
                 }
 
-                const block_size_t block_size = block_size_t::unsafe_make(info.ser_block_size);
+                const block_size_t block_size
+                    = block_size_t::unsafe_make(info.ser_block_size);
                 buf_ptr_t buf = buf_ptr_t::alloc_uninitialized(block_size);
                 memcpy(buf.ser_buffer(), current_buf, info.ser_block_size);
                 buf.fill_padding_zero();
                 guarantee(info.ser_block_size <= *(lower_it + 1) - *lower_it);
 
-                counted_t<ls_block_token_pointee_t> ls_token
+                counted_t<block_token_t> token
                     = parent->serializer->generate_block_token(current_offset,
                                                                block_size);
-
-                counted_t<standard_block_token_t> token
-                    = to_standard_block_token(block_id, std::move(ls_token));
 
                 parent->serializer->offer_buf_to_read_ahead_callbacks(
                         block_id,
@@ -698,8 +721,7 @@ buf_ptr_t data_block_manager_t::read(int64_t off_in, block_size_t block_size,
             int64_t floor_off_in = floor_aligned(off_in, DEVICE_BLOCK_SIZE);
             int64_t ceil_off_end = ceil_aligned(off_in + block_size.ser_value(),
                                                 DEVICE_BLOCK_SIZE);
-            scoped_malloc_t<char> buf(malloc_aligned(ceil_off_end - floor_off_in,
-                                                     DEVICE_BLOCK_SIZE));
+            scoped_device_block_aligned_ptr_t<char> buf(ceil_off_end - floor_off_in);
             co_read(dbfile, floor_off_in, ceil_off_end - floor_off_in,
                     buf.get(), io_account);
 
@@ -714,13 +736,13 @@ buf_ptr_t data_block_manager_t::read(int64_t off_in, block_size_t block_size,
     }
 }
 
-std::vector<counted_t<ls_block_token_pointee_t> >
+std::vector<counted_t<block_token_t>>
 data_block_manager_t::many_writes(const std::vector<buf_write_info_t> &writes,
                                   file_account_t *io_account,
                                   iocallback_t *cb) {
     // These tokens are grouped by extent.  You can do a contiguous write in each
     // extent.
-    std::vector<std::vector<counted_t<ls_block_token_pointee_t> > > token_groups
+    std::vector<std::vector<counted_t<block_token_t>>> token_groups
         = gimme_some_new_offsets(writes);
 
     for (auto it = writes.begin(); it != writes.end(); ++it) {
@@ -793,7 +815,7 @@ data_block_manager_t::many_writes(const std::vector<buf_write_info_t> &writes,
     // earlier).
     intermediate_cb->on_io_complete();
 
-    std::vector<counted_t<ls_block_token_pointee_t> > ret;
+    std::vector<counted_t<block_token_t>> ret;
     ret.reserve(writes.size());
     for (auto it = token_groups.begin(); it != token_groups.end(); ++it) {
         for (auto jt = it->begin(); jt != it->end(); ++jt) {
@@ -805,7 +827,7 @@ data_block_manager_t::many_writes(const std::vector<buf_write_info_t> &writes,
 }
 
 void data_block_manager_t::destroy_entry(gc_entry_t *entry) {
-    rassert(entry != NULL);
+    rassert(entry != nullptr);
     entry->destroy();
 }
 
@@ -840,10 +862,10 @@ void data_block_manager_t::check_and_handle_empty_extent(uint64_t extent_id) {
             case gc_entry_t::state_in_gc: {
                 int num_matched = 0;
                 for (gc_state_t *gc_state = active_gcs.head();
-                     gc_state != NULL;
+                     gc_state != nullptr;
                      gc_state = active_gcs.next(gc_state)) {
                     if (gc_state->current_entry == entry) {
-                        gc_state->current_entry = NULL;
+                        gc_state->current_entry = nullptr;
                         ++num_matched;
 #ifdef NDEBUG
                         // In release mode, terminate the loop as soon
@@ -942,7 +964,7 @@ void data_block_manager_t::mark_garbage(int64_t offset, extent_transaction_t *tx
 void data_block_manager_t::mark_live_tokenwise_with_offset(int64_t offset) {
     uint64_t extent_id = static_config->extent_index(offset);
     gc_entry_t *entry = entries.get(extent_id);
-    rassert(entry != NULL);
+    rassert(entry != nullptr);
     unsigned int block_index = entry->block_index(offset);
 
     entry->mark_live_tokenwise(block_index);
@@ -952,7 +974,7 @@ void data_block_manager_t::mark_garbage_tokenwise_with_offset(int64_t offset) {
     uint64_t extent_id = static_config->extent_index(offset);
     gc_entry_t *entry = entries.get(extent_id);
 
-    rassert(entry != NULL);
+    rassert(entry != nullptr);
 
     unsigned int block_index = entry->block_index(offset);
 
@@ -963,7 +985,8 @@ void data_block_manager_t::mark_garbage_tokenwise_with_offset(int64_t offset) {
     // Add to old garbage count if necessary (works because of the
     // !entry->block_is_garbage(block_index) assertion above).
     if (entry->state == gc_entry_t::state_old && entry->block_is_garbage(block_index)) {
-        gc_stats.old_garbage_block_bytes += gc_entry_t::aligned_value(entry->block_size(block_index));
+        gc_stats.old_garbage_block_bytes
+            += gc_entry_t::aligned_value(entry->block_size(block_index));
     }
 
     check_and_handle_empty_extent(extent_id);
@@ -985,6 +1008,7 @@ void data_block_manager_t::start_gc() {
         coro_t::spawn_sometime(std::bind(&data_block_manager_t::run_gc, this,
                                          new_gc_state));
     }
+    gc_index_write_semaphore.set_capacity(std::max<int64_t>(1, active_gcs.size()));
 }
 
 struct block_write_cond_t : public cond_t, public iocallback_t {
@@ -1001,6 +1025,8 @@ void data_block_manager_t::run_gc(gc_state_t *gc_state) {
 
         if (state == state_shutting_down) {
             active_gcs.remove(gc_state);
+            gc_index_write_semaphore.set_capacity(
+                std::max<int64_t>(1, active_gcs.size()));
             delete gc_state;
             if (active_gcs.empty()) {
                 actually_shutdown();
@@ -1010,12 +1036,13 @@ void data_block_manager_t::run_gc(gc_state_t *gc_state) {
     }
 
     active_gcs.remove(gc_state);
+    gc_index_write_semaphore.set_capacity(std::max<int64_t>(1, active_gcs.size()));
     delete gc_state;
 }
 
 void data_block_manager_t::gc_one_extent(gc_state_t *gc_state) {
     // A buffer for blocks we're transferring.
-    scoped_malloc_t<char> gc_blocks;
+    scoped_device_block_aligned_ptr_t<char> gc_blocks;
     size_t total_bytes_read = 0;
 
     // A helper for waiting for all reads to finish
@@ -1033,6 +1060,14 @@ void data_block_manager_t::gc_one_extent(gc_state_t *gc_state) {
     };
     gc_read_cb_t read_cb;
 
+    // Let the gc_index_write_semaphore "know" that we're planning
+    // to perform an index_write later.
+    // (note that we must NOT BLOCK here, so we only get in line but
+    // don't wait for the acquisition. That's sufficient for what we
+    // want to achieve.)
+    new_semaphore_in_line_t index_write_semaphore_acq(
+        &gc_index_write_semaphore, 1);
+
     // 1: Grab an entry and read the data
     {
         ASSERT_NO_CORO_WAITING;
@@ -1041,9 +1076,9 @@ void data_block_manager_t::gc_one_extent(gc_state_t *gc_state) {
 
         /* grab the entry */
         guarantee (!gc_pq.empty());
-        guarantee(gc_state->current_entry == NULL);
+        guarantee(gc_state->current_entry == nullptr);
         gc_state->current_entry = gc_pq.pop();
-        gc_state->current_entry->our_pq_entry = NULL;
+        gc_state->current_entry->our_pq_entry = nullptr;
 
         guarantee(gc_state->current_entry->state == gc_entry_t::state_old);
         gc_state->current_entry->state = gc_entry_t::state_in_gc;
@@ -1059,7 +1094,7 @@ void data_block_manager_t::gc_one_extent(gc_state_t *gc_state) {
         // once manually when we have issued all reads.
         read_cb.refcount++;
 
-        gc_blocks.init(malloc_aligned(extent_manager->extent_size, DEVICE_BLOCK_SIZE));
+        gc_blocks = scoped_device_block_aligned_ptr_t<char>(extent_manager->extent_size);
 
         // We're going to send as few discrete reads as possible, minimizing
         // disk->CPU bandwidth usage, instead of simply reading the entire
@@ -1124,38 +1159,47 @@ void data_block_manager_t::gc_one_extent(gc_state_t *gc_state) {
     /* If other forces cause all of the blocks in the extent to become
     garbage before we even finish GCing it, they will set current_entry
     to NULL. */
-    if (gc_state->current_entry == NULL) {
+    if (gc_state->current_entry == nullptr) {
         return;
     }
 
     // 2: Rewrite the blocks that are still live
-    std::vector<gc_write_t> gc_writes;
     {
-        ASSERT_NO_CORO_WAITING;
+        std::vector<gc_write_t> gc_writes;
+        {
+            ASSERT_NO_CORO_WAITING;
 
-        const size_t num_writes = gc_state->current_entry->num_live_blocks();
+            const size_t num_writes = gc_state->current_entry->num_live_blocks();
 
-        gc_writes.reserve(num_writes);
-        for (unsigned int i = 0, iend = gc_state->current_entry->num_blocks(); i < iend; ++i) {
+            gc_writes.reserve(num_writes);
+            for (unsigned int i = 0, iend = gc_state->current_entry->num_blocks();
+                 i < iend;
+                 ++i) {
 
-            /* We re-check the bit array here in case a write came in for one
-            of the blocks we are GCing. We wouldn't want to overwrite the new
-            valid data with out-of-date data. */
-            if (gc_state->current_entry->block_is_garbage(i)) {
-                continue;
+                /* We re-check the bit array here in case a write came in for one
+                of the blocks we are GCing. We wouldn't want to overwrite the new
+                valid data with out-of-date data. */
+                if (gc_state->current_entry->block_is_garbage(i)) {
+                    continue;
+                }
+
+                ser_buffer_t *block = reinterpret_cast<ser_buffer_t *>(gc_blocks.get()
+                    + gc_state->current_entry->relative_offset(i));
+                const int64_t block_offset =
+                    gc_state->current_entry->extent_ref.offset()
+                    + gc_state->current_entry->relative_offset(i);
+
+                gc_writes.push_back(gc_write_t(block, block_offset,
+                    gc_state->current_entry->block_size(i)));
             }
-
-            ser_buffer_t *block = reinterpret_cast<ser_buffer_t *>(gc_blocks.get()
-                + gc_state->current_entry->relative_offset(i));
-            const int64_t block_offset = gc_state->current_entry->extent_ref.offset()
-                + gc_state->current_entry->relative_offset(i);
-
-            gc_writes.push_back(gc_write_t(block, block_offset,
-                                           gc_state->current_entry->block_size(i)));
+            guarantee(gc_writes.size() == num_writes);
         }
-        guarantee(gc_writes.size() == num_writes);
+        write_gcs(
+            std::move(gc_writes),
+            gc_state,
+            std::move(gc_blocks),
+            std::move(index_write_semaphore_acq));
     }
-    write_gcs(gc_writes, gc_state);
 
     /* We need to do this here so that we don't
     get stuck on the GC treadmill */
@@ -1164,7 +1208,7 @@ void data_block_manager_t::gc_one_extent(gc_state_t *gc_state) {
     /* Our write should have forced all of the blocks in the extent to
     become garbage, which should have caused the extent to be released
     and gc_state.current_entry to become NULL. */
-    guarantee(gc_state->current_entry == NULL,
+    guarantee(gc_state->current_entry == nullptr,
               "%p: %" PRIu32 " garbage bytes left on the extent, %" PRIu32
               " index-referenced bytes, %" PRIu32
               " token-referenced bytes, at offset %" PRIi64
@@ -1177,23 +1221,27 @@ void data_block_manager_t::gc_one_extent(gc_state_t *gc_state) {
               gc_state->current_entry->format_block_infos("\n").c_str());
 }
 
-void data_block_manager_t::write_gcs(const std::vector<gc_write_t> &writes,
-                                     gc_state_t *gc_state) {
-    guarantee(gc_state->current_entry != NULL);
+// `write_gcs` frees gc_blocks, which invalidates the buffer pointers in
+// `writes`. That's why those two values are passed in as rvalue references.
+void data_block_manager_t::write_gcs(
+        std::vector<gc_write_t> &&writes,
+        gc_state_t *gc_state,
+        scoped_device_block_aligned_ptr_t<char> &&gc_blocks,
+        new_semaphore_in_line_t &&index_write_semaphore_acq) {
+    guarantee(gc_state->current_entry != nullptr);
 
     block_write_cond_t block_write_cond;
 
     // We acquire block tokens for all the blocks before writing new
     // version.  The point of this is to make sure the _new_ block is
     // correctly "alive" when we write it.
-
-    std::vector<counted_t<ls_block_token_pointee_t> > old_block_tokens;
+    std::vector<counted_t<block_token_t>> old_block_tokens;
     old_block_tokens.reserve(writes.size());
 
     // New block tokens, to hold the return value of
     // data_block_manager_t::write() instead of immediately discarding the
     // created token and causing the extent or block to be collected.
-    std::vector<counted_t<ls_block_token_pointee_t> > new_block_tokens;
+    std::vector<counted_t<block_token_t>> new_block_tokens;
 
     {
         // Step 1: Write buffers to disk and assemble index operations
@@ -1202,8 +1250,9 @@ void data_block_manager_t::write_gcs(const std::vector<gc_write_t> &writes,
         std::vector<buf_write_info_t> the_writes;
         the_writes.reserve(writes.size());
         for (size_t i = 0; i < writes.size(); ++i) {
-            old_block_tokens.push_back(serializer->generate_block_token(writes[i].old_offset,
-                                                                        writes[i].block_size));
+            old_block_tokens.push_back(
+                    serializer->generate_block_token(writes[i].old_offset,
+                                                     writes[i].block_size));
 
             the_writes.push_back(buf_write_info_t(writes[i].buf,
                                                   writes[i].block_size,
@@ -1221,66 +1270,111 @@ void data_block_manager_t::write_gcs(const std::vector<gc_write_t> &writes,
 
     // We created block tokens for our blocks we're writing, so
     // there's no way the current entry could have become NULL.
-    guarantee(gc_state->current_entry != NULL);
+    guarantee(gc_state->current_entry != nullptr);
 
-    std::vector<index_write_op_t> index_write_ops;
+    // Step 3: Collect index writes from multiple GC runs to reduce the total
+    // number of index writes, and increase their efficiency.
+    collected_gc_index_writes.push_back(
+        gc_index_write_t(std::move(old_block_tokens),
+                         std::move(new_block_tokens),
+                         std::move(writes),
+                         gc_state,
+                         std::move(gc_blocks)));
 
-    // Step 3: Figure out index ops.  It's important that we do this
+    // We're ready for the index_write. Notify the gc_index_write_pumper
+    // and release our spot in the gc_index_write_semaphore.
+    gc_index_write_pumper.notify();
+    index_write_semaphore_acq.reset();
+
+    cond_t non_interruptor;
+    gc_index_write_pumper.flush(&non_interruptor);
+    // `write_gcs` steps continue in `flush_gc_index_writes`
+}
+
+void data_block_manager_t::flush_gc_index_writes(signal_t *) {
+    // Acquire half the tickets from the `index_write_semaphore`.
+    // This means that if all tickets in the semaphore are currently
+    // acquired, we'll wait until this many GC threads have lined
+    // up for the index_write.
+    // If not all of them have been acquired, we might flush earlier.
+    new_semaphore_in_line_t index_write_semaphore_acq(
+        &gc_index_write_semaphore,
+        std::max<int64_t>(1, gc_index_write_semaphore.capacity() / 2));
+    index_write_semaphore_acq.acquisition_signal()->wait_lazily_unordered();
+    gc_index_write_pumper.include_latest_notifications();
+
+    // WARNING: Nothing in this function from here on must block until
+    // we reach `index_write`!
+
+    // See `write_gcs` for steps 1 and 2.
+
+    // Step 3A: Figure out index ops.  It's important that we do this
     // now, right before the index_write, so that the updates to the
     // index are done atomically.
+    std::vector<index_write_op_t> index_write_ops;
     {
         ASSERT_NO_CORO_WAITING;
 
-        for (size_t i = 0; i < writes.size(); ++i) {
-            unsigned int block_index
-                = gc_state->current_entry->block_index(writes[i].old_offset);
+        for (auto &&iw : collected_gc_index_writes) {
+            for (size_t i = 0; i < iw.writes.size(); ++i) {
+                auto const &write = iw.writes[i];
+                unsigned int block_index
+                    = iw.gc_state->current_entry->block_index(write.old_offset);
 
-            if (gc_state->current_entry->block_referenced_by_index(block_index)) {
-                block_id_t block_id = writes[i].buf->ser_header.block_id;
+                if (iw.gc_state->current_entry->block_referenced_by_index(block_index)) {
+                    block_id_t block_id = write.buf->ser_header.block_id;
 
-                index_write_ops.push_back(
+                    index_write_ops.push_back(
                         index_write_op_t(block_id,
-                                         to_standard_block_token(
-                                                 block_id,
-                                                 new_block_tokens[i])));
+                            make_optional(iw.new_block_tokens[i])));
+                }
+
+                // (If we don't have an i_array entry, the block is referenced
+                // by a non-negative number of tokens only.  These get tokens
+                // remapped later.)
             }
 
-            // (If we don't have an i_array entry, the block is referenced
-            // by a non-negative number of tokens only.  These get tokens
-            // remapped later.)
-        }
+            // Free the buffers to free memory a bit earlier
+            for (auto &&write : iw.writes) {
+                // Null out buffer pointer so we can catch use-after-free bugs
+                // more easily
+                write.buf = nullptr;
+            }
+            iw.gc_blocks.reset();
 
-        // Step 4A: Remap tokens to new offsets.  It is important
-        // that we do this _before_ calling index_write.
-        // Otherwise, the token_offset map would still point to
-        // the extent we're gcing.  Then somebody could do an
-        // index_write after our index_write starts but before it
-        // returns in Step 4 below, resulting in i_array entries
-        // that point to the current entry.  This should empty out
-        // all the t_array bits.
-        for (size_t i = 0; i < writes.size(); ++i) {
-            serializer->remap_block_to_new_offset(writes[i].old_offset,
-                                                  new_block_tokens[i]->offset());
-        }
+            // Step 3B: Remap tokens to new offsets.  It is important
+            // that we do this _just before_ calling index_write.
+            // Otherwise, the token_offset map would still point to
+            // the extent we're gcing.  Then somebody could do an
+            // index_write after our index_write starts but before it
+            // returns in Step 3D below, resulting in i_array entries
+            // that point to the current entry.  This should empty out
+            // all the t_array bits.
+            for (size_t i = 0; i < iw.writes.size(); ++i) {
+                serializer->remap_block_to_new_offset(iw.writes[i].old_offset,
+                    iw.new_block_tokens[i]->offset());
+            }
 
-        // Step 4A-2: Now that the block tokens have been remapped
-        // to a new offset, destroying these tokens will update
-        // the bits in the t_array of the new offset (if they're
-        // the last token).
-        old_block_tokens.clear();
-        new_block_tokens.clear();
+            // Step 3C: Now that the block tokens have been remapped
+            // to a new offset, destroying these tokens will update
+            // the bits in the t_array of the new offset (if they're
+            // the last token).
+            iw.old_block_tokens.clear();
+            iw.new_block_tokens.clear();
+        }
     }
+    collected_gc_index_writes.clear();
 
-    // Step 4B: Commit the transaction to the serializer, emptying
+    // Step 3D: Commit the transaction to the serializer, emptying
     // out all the i_array bits.
     new_mutex_in_line_t dummy_acq;
-    serializer->index_write(&dummy_acq, []{}, index_write_ops);
+    serializer->index_write(&dummy_acq, [] {}, index_write_ops);
 }
 
-void data_block_manager_t::prepare_metablock(data_block_manager::metablock_mixin_t *metablock) {
+void data_block_manager_t::prepare_metablock(dbm_metablock_mixin_t *metablock) {
     guarantee(state == state_ready || state == state_shutting_down);
 
-    if (active_extent != NULL) {
+    if (active_extent != nullptr) {
         metablock->active_extent = active_extent->extent_ref.offset();
     } else {
         metablock->active_extent = NULL_OFFSET;
@@ -1292,7 +1386,7 @@ void data_block_manager_t::disable_gc() {
 }
 
 bool data_block_manager_t::shutdown(data_block_manager::shutdown_callback_t *cb) {
-    rassert(cb != NULL);
+    rassert(cb != nullptr);
     guarantee(state == state_ready);
     state = state_shutting_down;
 
@@ -1300,7 +1394,7 @@ bool data_block_manager_t::shutdown(data_block_manager::shutdown_callback_t *cb)
         shutdown_callback = cb;
         return false;
     } else {
-        shutdown_callback = NULL;
+        shutdown_callback = nullptr;
         actually_shutdown();
         return true;
     }
@@ -1310,12 +1404,12 @@ void data_block_manager_t::actually_shutdown() {
     guarantee(state == state_shutting_down);
     state = state_shut_down;
 
-    guarantee(reconstructed_extents.head() == NULL);
+    guarantee(reconstructed_extents.head() == nullptr);
 
-    if (active_extent != NULL) {
+    if (active_extent != nullptr) {
         UNUSED int64_t extent = active_extent->extent_ref.release();
         delete active_extent;
-        active_extent = NULL;
+        active_extent = nullptr;
     }
 
     while (gc_entry_t *entry = young_extent_queue.head()) {
@@ -1335,12 +1429,12 @@ void data_block_manager_t::actually_shutdown() {
     }
 }
 
-std::vector<std::vector<counted_t<ls_block_token_pointee_t> > >
+std::vector<std::vector<counted_t<block_token_t>>>
 data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t> &writes) {
     ASSERT_NO_CORO_WAITING;
 
     // Start a new extent if necessary.
-    if (active_extent == NULL) {
+    if (active_extent == nullptr) {
         active_extent = new gc_entry_t(this);
         ++stats->pm_serializer_data_extents_allocated;
     }
@@ -1348,9 +1442,9 @@ data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t>
 
     guarantee(active_extent->state == gc_entry_t::state_active);
 
-    std::vector<std::vector<counted_t<ls_block_token_pointee_t> > > ret;
+    std::vector<std::vector<counted_t<block_token_t>>> ret;
 
-    std::vector<counted_t<ls_block_token_pointee_t> > tokens;
+    std::vector<counted_t<block_token_t>> tokens;
     for (auto it = writes.begin(); it != writes.end(); ++it) {
         uint32_t relative_offset = valgrind_undefined<uint32_t>(UINT32_MAX);
         unsigned int block_index = valgrind_undefined<unsigned int>(UINT_MAX);
@@ -1364,6 +1458,7 @@ data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t>
                 destroy_entry(old_active_extent);
             } else {
                 active_extent->state = gc_entry_t::state_young;
+                active_extent->shrink_to_fit();
                 young_extent_queue.push_back(active_extent);
                 mark_unyoung_entries();
                 active_extent = new gc_entry_t(this);
@@ -1375,7 +1470,8 @@ data_block_manager_t::gimme_some_new_offsets(const std::vector<buf_write_info_t>
                                                              &block_index);
             guarantee(succeeded);
 
-            // Push the current group of tokens, if it's nonempty, onto the return vector.
+            // Push the current group of tokens, if it's nonempty, onto the return
+            // vector.
             if (!tokens.empty()) {
                 ret.push_back(std::move(tokens));
                 tokens.clear();

@@ -23,15 +23,24 @@
 
 /*! \file reader.h */
 
-#include "rapidjson.h"
-#include "encodings.h"
-#include "internal/meta.h"
-#include "internal/stack.h"
-#include "internal/strtod.h"
+// RethinkDB modification: For `call_with_enough_stack`
+#include "arch/runtime/coroutines.hpp"
+
+#include "rapidjson/rapidjson.h"
+#include "rapidjson/encodings.h"
+#include "rapidjson/internal/meta.h"
+#include "rapidjson/internal/stack.h"
+#include "rapidjson/internal/strtod.h"
 
 // RethinkDB: Disable -Wswitch-enum in this header file
+#ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wswitch-enum"
+// RethinkDB: Also disable -Wtype-limits.
+// Notably on ARM, GCC complains about code such as `unsigned(e) < 256` always being
+// true when Ch is instantiated as `char`.
+#pragma GCC diagnostic ignored "-Wtype-limits"
+#endif
 
 #if defined(RAPIDJSON_SIMD) && defined(_MSC_VER)
 #include <intrin.h>
@@ -123,7 +132,7 @@ RAPIDJSON_DIAG_OFF(effc++)
     RAPIDJSON_MULTILINEMACRO_END
 #endif
 
-#include "error/error.h" // ParseErrorCode, ParseResult
+#include "rapidjson/error/error.h" // ParseErrorCode, ParseResult
 
 RAPIDJSON_NAMESPACE_BEGIN
 
@@ -380,7 +389,7 @@ template<> inline void SkipWhitespace(StringStream& is) {
     \tparam TargetEncoding Encoding of the parse output.
     \tparam StackAllocator Allocator type for stack.
 */
-template <typename SourceEncoding, typename TargetEncoding, typename StackAllocator = CrtAllocator>
+template <typename SourceEncoding, typename TargetEncoding, typename StackAllocator = RAllocator>
 class GenericReader {
 public:
     typedef typename SourceEncoding::Ch Ch; //!< SourceEncoding character type
@@ -443,7 +452,7 @@ public:
         return Parse<kParseDefaultFlags>(is, handler);
     }
 
-    //! Whether a parse error has occured in the last parsing.
+    //! Whether a parse error has occurred in the last parsing.
     bool HasParseError() const { return parseResult_.IsError(); }
 
     //! Get the \ref ParseErrorCode of last parsing.
@@ -757,7 +766,7 @@ private:
     class NumberStream<InputStream, true> : public NumberStream<InputStream, false> {
         typedef NumberStream<InputStream, false> Base;
     public:
-        NumberStream(GenericReader& reader, InputStream& is) : NumberStream<InputStream, false>(reader, is), stackStream(reader.stack_) {}
+        NumberStream(GenericReader& reader, InputStream& _is) : NumberStream<InputStream, false>(reader, _is), stackStream(reader.stack_) {}
         ~NumberStream() {}
 
         RAPIDJSON_FORCEINLINE Ch TakePush() {
@@ -986,13 +995,23 @@ private:
     // Parse any JSON value
     template<unsigned parseFlags, typename InputStream, typename Handler>
     void ParseValue(InputStream& is, Handler& handler) {
+        // RethinkDB modification: Use `call_with_enough_stack` to avoid stack overflows.
+        const size_t MIN_PARSING_STACK_SPACE = 16 * 1024;
         switch (is.Peek()) {
             case 'n': ParseNull  <parseFlags>(is, handler); break;
             case 't': ParseTrue  <parseFlags>(is, handler); break;
             case 'f': ParseFalse <parseFlags>(is, handler); break;
             case '"': ParseString<parseFlags>(is, handler); break;
-            case '{': ParseObject<parseFlags>(is, handler); break;
-            case '[': ParseArray <parseFlags>(is, handler); break;
+            case '{':
+                call_with_enough_stack([&]() {
+                    ParseObject<parseFlags>(is, handler);
+                }, MIN_PARSING_STACK_SPACE);
+                break;
+            case '[':
+                call_with_enough_stack([&]() {
+                    ParseArray <parseFlags>(is, handler);
+                }, MIN_PARSING_STACK_SPACE);
+                break;
             default : ParseNumber<parseFlags>(is, handler);
         }
     }
@@ -1451,6 +1470,8 @@ RAPIDJSON_DIAG_POP
 #endif
 
 // RethinkDB: Re-enable all warnings
+#ifdef __GNUC__
 #pragma GCC diagnostic pop
+#endif
 
 #endif // RAPIDJSON_READER_H_

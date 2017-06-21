@@ -1,3 +1,4 @@
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef DEBUG_HPP_
 #define DEBUG_HPP_
 
@@ -7,14 +8,14 @@
 #include "time.hpp"
 
 #ifndef NDEBUG
-#define trace_call(fn, args...) do {                                          \
+#define trace_call(fn, ...) do {                                            \
         debugf("%s:%u: %s: entered\n", __FILE__, __LINE__, stringify(fn));  \
-        fn(args);                                                           \
+        fn(__VA_ARGS__);                                                    \
         debugf("%s:%u: %s: returned\n", __FILE__, __LINE__, stringify(fn)); \
     } while (0)
 #define TRACEPOINT debugf("%s:%u reached\n", __FILE__, __LINE__)
 #else
-#define trace_call(fn, args...) fn(args)
+#define trace_call(fn, ...) fn(__VA_ARGS__)
 // TRACEPOINT is not defined in release, so that TRACEPOINTS do not linger in the code unnecessarily
 #endif
 
@@ -47,7 +48,7 @@ std::string debug_str(const T &t) {
 }
 
 #ifndef NDEBUG
-void debugf(const char *msg, ...) __attribute__((format (printf, 1, 2)));
+void debugf(const char *msg, ...) ATTR_FORMAT(printf, 1, 2);
 template <class T>
 void debugf_print(const char *msg, const T &obj) {
     printf_buffer_t buf;
@@ -71,14 +72,11 @@ std::string debug_strprint(const T &obj) {
 
 class debugf_in_dtor_t {
 public:
-    explicit debugf_in_dtor_t(const char *msg, ...) __attribute__((format (printf, 2, 3)));
+    explicit debugf_in_dtor_t(const char *msg, ...) ATTR_FORMAT(printf, 2, 3);
     ~debugf_in_dtor_t();
 private:
     std::string message;
 };
-
-class Term;
-void pb_print(Term *t);
 
 // TODO: make this more efficient (use `clock_monotonic` and use a vector of
 // integers rather than accumulating a string).

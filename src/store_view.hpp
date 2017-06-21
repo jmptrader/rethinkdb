@@ -50,7 +50,7 @@ public:
         return region;
     }
 
-    virtual void note_reshard() = 0;
+    virtual void note_reshard(const region_t &shard_region) = 0;
 
     virtual void new_read_token(read_token_t *token_out) = 0;
     virtual void new_write_token(write_token_t *token_out) = 0;
@@ -236,6 +236,9 @@ public:
     perform a backfill. */
     virtual void wait_until_ok_to_receive_backfill(signal_t *interruptor)
             THROWS_ONLY(interrupted_exc_t) = 0;
+    /* Like `wait_until_ok_to_receive_backfill`, but doesn't block and instead returns
+    `false` if an index is post-constructing. */
+    virtual bool check_ok_to_receive_backfill() THROWS_NOTHING = 0;
 
     /* Deletes every key in the region, and sets the metainfo for that region to
     `zero_version`. */

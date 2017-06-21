@@ -7,7 +7,6 @@
 #include <map>
 
 #include "errors.hpp"
-#include <boost/optional.hpp>
 #include <boost/variant.hpp>
 
 #include "concurrency/auto_drainer.hpp"
@@ -17,7 +16,7 @@
 #include "concurrency/watchable.hpp"
 #include "concurrency/watchable_map.hpp"
 #include "concurrency/watchdog_timer.hpp"
-#include "containers/archive/boost_types.hpp"
+#include "containers/archive/optional.hpp"
 #include "containers/archive/stl_types.hpp"
 #include "containers/empty_value.hpp"
 #include "containers/uuid.hpp"
@@ -64,6 +63,21 @@ is stored in the Raft log, and `state_t` is stored when taking a snapshot.
 code, by making it clearer what the meaning of a particular number is. */
 typedef uint64_t raft_term_t;
 typedef uint64_t raft_log_index_t;
+
+/* `raft_start_election_immediately_t` is used as a hint to the `raft_member_t`
+constructor, and is used to speed up new raft clusters' first elections.
+
+On new clusters, it should be set to YES on precisely one of the raft members. If we're
+joining an existing cluster, it should be set to NO to avoid disposing a running leader. */
+enum class raft_start_election_immediately_t {
+    NO,
+    YES
+};
+ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(
+    raft_start_election_immediately_t,
+    int8_t,
+    raft_start_election_immediately_t::NO,
+    raft_start_election_immediately_t::YES);
 
 /* Every member of the Raft cluster is identified by a `raft_member_id_t`. The Raft paper
 uses integers for this purpose, but we use UUIDs because we have no reliable distributed
@@ -139,7 +153,7 @@ public:
     empty. For a joint consensus configuration, `config` holds the old configuration and
     `new_config` holds the new configuration. */
     raft_config_t config;
-    boost::optional<raft_config_t> new_config;
+    optional<raft_config_t> new_config;
 
     bool is_joint_consensus() const {
         return static_cast<bool>(new_config);
@@ -211,8 +225,8 @@ public:
     raft_log_entry_type_t type;
     raft_term_t term;
     /* Whether `change` and `config` are empty or not depends on the value of `type`. */
-    boost::optional<typename state_t::change_t> change;
-    boost::optional<raft_complex_config_t> config;
+    optional<typename state_t::change_t> change;
+    optional<raft_complex_config_t> config;
 
     /* The equality and inequality operators are for testing. */
     bool operator==(const raft_log_entry_t<state_t> &other) const {
@@ -543,16 +557,16 @@ public:
     messages to all other members. The stream is "virtual" in that it actually consists
     of a single start message and a single stop message rather than repeated actual
     messages. The other members can receive it by looking in `get_connected_members()`.
-    Calling `send_virtual_heartbeats()` with an empty `boost::optional` stops the stream.
+    Calling `send_virtual_heartbeats()` with an empty `optional` stops the stream.
     */
     virtual void send_virtual_heartbeats(
-        const boost::optional<raft_term_t> &term) = 0;
+        const optional<raft_term_t> &term) = 0;
 
     /* `get_connected_members()` has an entry for every Raft member that we think we're
     currently connected to. If the member is sending virtual heartbeats, the values will
     be the term it is sending heartbeats for; otherwise, the values will be empty
-    `boost::optional`s. */
-    virtual watchable_map_t<raft_member_id_t, boost::optional<raft_term_t> >
+    `optional`s. */
+    virtual watchable_map_t<raft_member_id_t, optional<raft_term_t> >
         *get_connected_members() = 0;
 
 protected:
@@ -572,7 +586,8 @@ public:
         raft_network_interface_t<state_t> *network,
         /* We'll print log messages of the form `<log_prefix>: <message>`. If
         `log_prefix` is empty, we won't print any messages. */
-        const std::string &log_prefix);
+        const std::string &log_prefix,
+        const raft_start_election_immediately_t start_election_immediately);
 
     ~raft_member_t();
 
@@ -603,9 +618,32 @@ public:
         return latest_state.get_watchable();
     }
 
+    /* `change_lock_t` freezes the Raft member state, for example in preparation for
+    calling `propose_*()`. Only one `change_lock_t` can exist at a time, and while it
+    exists, the Raft member will not process normal traffic; so don't keep the
+    `change_lock_t` around longer than necessary. However, it is safe to block while
+    holding the `change_lock_t` if you need to.
+
+    The point of `change_lock_t` is that `get_latest_state()` will not change while the
+    `change_lock_t` exists, unless the lock owner calls `propose_*()`. The state reported
+    by `get_latest_state()` is guaranteed to be the state that the proposed change will
+    be applied to. This makes it possible to atomically read the state and issue a change
+    conditional on the state. */
+    class change_lock_t {
+    public:
+        change_lock_t(raft_member_t *parent, signal_t *interruptor);
+    private:
+        friend class raft_member_t;
+        new_mutex_acq_t mutex_acq;
+    };
+
     /* `get_state_for_init()` returns a `raft_persistent_state_t` that could be used to
-    initialize a new member joining the Raft cluster. */
-    raft_persistent_state_t<state_t> get_state_for_init();
+    initialize a new member joining the Raft cluster.
+    A `change_lock_t` must be constructed on this `raft_member_t` before calling this.
+    This is a separate step so that `get_state_for_init()` doesn't need to block in
+    order to obtain a lock internally. */
+    raft_persistent_state_t<state_t> get_state_for_init(
+        const change_lock_t &change_lock_proof);
 
     /* Here's how to perform a Raft transaction:
 
@@ -640,25 +678,6 @@ public:
     clone_ptr_t<watchable_t<bool> > get_readiness_for_config_change() {
         return readiness_for_config_change.get_watchable();
     }
-
-    /* `change_lock_t` freezes the Raft member state in preparation for calling
-    `propose_*()`. Only one `change_lock_t` can exist at a time, and while it exists, the
-    Raft member will not process normal traffic; so don't keep the `change_lock_t` around
-    longer than necessary. However, it is safe to block while holding the `change_lock_t`
-    if you need to.
-
-    The point of `change_lock_t` is that `get_latest_state()` will not change while the
-    `change_lock_t` exists, unless the lock owner calls `propose_*()`. The state reported
-    by `get_latest_state()` is guaranteed to be the state that the proposed change will
-    be applied to. This makes it possible to atomically read the state and issue a change
-    conditional on the state. */
-    class change_lock_t {
-    public:
-        change_lock_t(raft_member_t *parent, signal_t *interruptor);
-    private:
-        friend class raft_member_t;
-        new_mutex_acq_t mutex_acq;
-    };
 
     /* `change_token_t` is a way to track the progress of a change to the Raft cluster.
     It's a promise that will be `true` if the change has been committed, and `false` if
@@ -720,12 +739,17 @@ private:
     paper suggests that a typical election timeout should be somewhere between 10ms and
     500ms. We use somewhat larger numbers to reduce server traffic, at the cost of longer
     periods of unavailability when a master dies. */
-    static const int32_t election_timeout_min_ms = 1000,
-                         election_timeout_max_ms = 2000;
+    const int32_t election_timeout_min_ms = 1000,
+                  election_timeout_max_ms = 2000;
+
+    /* To cope with i/o bottlenecks when many tables are running elections at the same
+    time, we additionally increase the election timeout during repeated retries, up to
+    the maximum value set here: */
+    const int32_t election_retry_timeout_max_ms = 30000;
 
     /* When the number of committed entries in the log exceeds this number, we will take
     a snapshot to compress them. */
-    static const size_t snapshot_threshold = 20;
+    const size_t snapshot_threshold = 20;
 
     /* Note: Methods prefixed with `follower_`, `candidate_`, or `leader_` are methods
     that are only used when in that state. This convention will hopefully make the code
@@ -758,7 +782,7 @@ private:
     heartbeats. */
     void on_connected_members_change(
         const raft_member_id_t &member_id,
-        const boost::optional<raft_term_t> *value);
+        const optional<raft_term_t> *value);
 
     /* `on_rpc_from_leader()` is a helper function that we call in response to
     AppendEntries RPCs, InstallSnapshot RPCs, and virtual heartbeats. It returns `true`
@@ -983,7 +1007,7 @@ private:
 
     /* This calls `update_readiness_for_change()` whenever a peer connects or
     disconnects. */
-    scoped_ptr_t<watchable_map_t<raft_member_id_t, boost::optional<raft_term_t> >
+    scoped_ptr_t<watchable_map_t<raft_member_id_t, optional<raft_term_t> >
         ::all_subs_t> connected_members_subs;
 };
 

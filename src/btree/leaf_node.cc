@@ -111,7 +111,7 @@ const btree_key_t *entry_key(const entry_t *p) {
 
 const void *entry_value(const entry_t *p) {
     if (entry_is_deletion(p)) {
-        return NULL;
+        return nullptr;
     } else {
         return reinterpret_cast<const char *>(p) + entry_key(p)->full_size();
     }
@@ -161,7 +161,7 @@ struct entry_iter_t {
 
     bool done(value_sizer_t *sizer) const {
         int bs = sizer->block_size().value();
-        rassert(offset <= bs, "offset=%d, bs=%d", offset, bs);
+        guarantee(offset <= bs, "offset=%d, bs=%d", offset, bs);
         return offset == bs;
     }
 
@@ -422,14 +422,14 @@ bool fsck(value_sizer_t *sizer, const btree_key_t *left_exclusive_or_null, const
     const btree_key_t *last = left_exclusive_or_null;
     for (int k = 0; k < node->num_pairs; ++k) {
         const btree_key_t *key = entry_key(get_entry(node, node->pair_offsets[k]));
-        if (failed(last == NULL || btree_key_cmp(last, key) < 0,
+        if (failed(last == nullptr || btree_key_cmp(last, key) < 0,
                    "keys out of order")) {
             return false;
         }
         last = key;
     }
 
-    if (failed(last == NULL || right_inclusive_or_null == NULL
+    if (failed(last == nullptr || right_inclusive_or_null == nullptr
                || btree_key_cmp(last, right_inclusive_or_null) <= 0,
                "keys out of order (with right_inclusive key)")) {
         return false;
@@ -443,7 +443,7 @@ void validate(DEBUG_VAR value_sizer_t *sizer, DEBUG_VAR const leaf_node_t *node)
 #ifndef NDEBUG
     do_nothing_fscker_t fits;
     std::string msg;
-    bool fscked_successfully = fsck(sizer, NULL, NULL, node, &fits, &msg);
+    bool fscked_successfully = fsck(sizer, nullptr, nullptr, node, &fits, &msg);
     rassert(fscked_successfully, "%s", msg.c_str());
 #endif
 }
@@ -580,7 +580,12 @@ private:
 };
 
 
-void garbage_collect(value_sizer_t *sizer, leaf_node_t *node, int num_tstamped, int *preserved_index) {
+void garbage_collect(
+        value_sizer_t *sizer,
+        leaf_node_t *node,
+        int num_tstamped,
+        int *preserved_index,
+        optional<int> tstamp_cutoff_upper_bound = optional<int>()) {
     scoped_array_t<uint16_t> indices(node->num_pairs);
 
     for (int i = 0; i < node->num_pairs; ++i) {
@@ -591,6 +596,11 @@ void garbage_collect(value_sizer_t *sizer, leaf_node_t *node, int num_tstamped, 
 
     int mand_offset;
     UNUSED int cost = mandatory_cost(sizer, node, num_tstamped, &mand_offset);
+    if (tstamp_cutoff_upper_bound) {
+        /* If we have an upper bound for the timestamp cutoff point, make sure
+        that we cut off at least that many timestamps. */
+        mand_offset = std::min(*tstamp_cutoff_upper_bound, mand_offset);
+    }
 
     int w = sizer->block_size().value();
     int i = node->num_pairs - 1;
@@ -618,9 +628,11 @@ void garbage_collect(value_sizer_t *sizer, leaf_node_t *node, int num_tstamped, 
 
     for (; i >= 0; --i) {
         int offset = node->pair_offsets[indices[i]];
+        entry_t *ent = get_entry(node, offset);
+        rassert(!entry_is_skip(ent));
 
         // Preserve the timestamp.
-        int sz = sizeof(repli_timestamp_t) + entry_size(sizer, get_entry(node, offset));
+        int sz = sizeof(repli_timestamp_t) + entry_size(sizer, ent);
 
         w -= sz;
 
@@ -728,6 +740,9 @@ void move_elements(value_sizer_t *sizer, leaf_node_t *fro, int beg, int end,
     int adjustable_tow_offsets[MANDATORY_TIMESTAMPS];
     int num_adjustable_tow_offsets = 0;
 
+    // To detect bugs in the code
+    int actually_copied = 0;
+
     // We will gradually compute the live size.
     int livesize = tow->live_size;
 
@@ -786,6 +801,7 @@ void move_elements(value_sizer_t *sizer, leaf_node_t *fro, int beg, int end,
             fro->pair_offsets[beg + tow->pair_offsets[fro_index]] = wri_offset;
 
             wri_offset += sz;
+            actually_copied += sz;
             fro_index++;
 
         } else {
@@ -826,6 +842,8 @@ void move_elements(value_sizer_t *sizer, leaf_node_t *fro, int beg, int end,
 
             wri_offset += sz;
             livesize += sz + sizeof(uint16_t);
+            actually_copied += sz;
+            rassert(wri_offset <= tow_offset);
         } else {
             rassert(entry_is_deletion(ent));
 
@@ -837,6 +855,7 @@ void move_elements(value_sizer_t *sizer, leaf_node_t *fro, int beg, int end,
         }
     }
 
+    guarantee(actually_copied <= fro_copysize);
     rassert(wri_offset <= tow_offset);
 
     // tow may have some timestamped entries that need to become
@@ -878,7 +897,7 @@ void move_elements(value_sizer_t *sizer, leaf_node_t *fro, int beg, int end,
         tow_offset += sizeof(repli_timestamp_t) + sz;
     }
 
-    rassert(wri_offset <= tow_offset);
+    guarantee(wri_offset <= tow_offset);
 
     // If we needed to untimestamp any tow entries, we'll need a skip
     // entry for the open space.
@@ -906,7 +925,7 @@ void move_elements(value_sizer_t *sizer, leaf_node_t *fro, int beg, int end,
 
     fro->live_size += fro_live_size_adjustment;
 
-    if (moved_values_out != NULL) {
+    if (moved_values_out != nullptr) {
         // Collect value pointers of the moved values
         moved_values_out->clear();
         moved_values_out->reserve(end - beg);
@@ -945,7 +964,7 @@ void split(value_sizer_t *sizer, leaf_node_t *node, leaf_node_t *rnode, btree_ke
     int tstamp_back_offset;
     int mandatory = mandatory_cost(sizer, node, MANDATORY_TIMESTAMPS, &tstamp_back_offset);
 
-    rassert(mandatory >= free_space(sizer) - leaf_epsilon(sizer));
+    guarantee(mandatory >= free_space(sizer) - leaf_epsilon(sizer));
 
     // We shall split the mandatory cost of this node as evenly as possible.
 
@@ -983,12 +1002,12 @@ void split(value_sizer_t *sizer, leaf_node_t *node, leaf_node_t *rnode, btree_ke
     }
 
     // Since the mandatory_cost is at least free_space - leaf_epsilon there's no way i can equal num_pairs or zero.
-    rassert(i < node->num_pairs);
-    rassert(i > 0);
+    guarantee(i < node->num_pairs);
+    guarantee(i > 0);
 
     // Now prev_rcost and rcost envelope mandatory / 2.
-    rassert(prev_rcost < mandatory / 2);
-    rassert(rcost >= mandatory / 2, "rcost = %d, mandatory / 2 = %d, i = %d", rcost, mandatory / 2, i);
+    guarantee(prev_rcost < mandatory / 2);
+    guarantee(rcost >= mandatory / 2, "rcost = %d, mandatory / 2 = %d, i = %d", rcost, mandatory / 2, i);
 
     int s;
     int end_rcost;
@@ -1003,8 +1022,8 @@ void split(value_sizer_t *sizer, leaf_node_t *node, leaf_node_t *rnode, btree_ke
 
     // If our math was right, neither node can be underfull just
     // considering the split of the mandatory costs.
-    rassert(end_rcost >= free_space(sizer) / 2 - leaf_epsilon(sizer));
-    rassert(mandatory - end_rcost >= free_space(sizer) / 2 - leaf_epsilon(sizer));
+    guarantee(end_rcost >= free_space(sizer) / 2 - leaf_epsilon(sizer));
+    guarantee(mandatory - end_rcost >= free_space(sizer) / 2 - leaf_epsilon(sizer));
 
     // Now we wish to move the elements at indices [s, num_pairs) to rnode.
 
@@ -1012,7 +1031,7 @@ void split(value_sizer_t *sizer, leaf_node_t *node, leaf_node_t *rnode, btree_ke
 
     int node_copysize = end_rcost - num_mandatories * sizeof(uint16_t);
     move_elements(sizer, node, s, node->num_pairs, 0, rnode, node_copysize,
-                  tstamp_back_offset, NULL);
+                  tstamp_back_offset, nullptr);
 
     keycpy(median_out, entry_key(get_entry(node, node->pair_offsets[s - 1])));
 }
@@ -1027,15 +1046,18 @@ void merge(value_sizer_t *sizer, leaf_node_t *left, leaf_node_t *right) {
     int mandatory = mandatory_cost(sizer, left, MANDATORY_TIMESTAMPS, &tstamp_back_offset);
 
     int left_copysize = mandatory;
-    // Uncount the uint16_t cost of mandatory  entries.  Sigh.
+    // Uncount the uint16_t cost of mandatory entries.  Sigh.
+    // This includes deletion entries *before* the `tstamp_back_offset`, as well
+    // as all non-deletion entries.
     for (int i = 0; i < left->num_pairs; ++i) {
-        if (left->pair_offsets[i] < tstamp_back_offset || entry_is_deletion(get_entry(left, left->pair_offsets[i]))) {
+        if (left->pair_offsets[i] < tstamp_back_offset
+            || !entry_is_deletion(get_entry(left, left->pair_offsets[i]))) {
             left_copysize -= sizeof(uint16_t);
         }
     }
 
     move_elements(sizer, left, 0, left->num_pairs, 0, right, left_copysize,
-                  tstamp_back_offset, NULL);
+                  tstamp_back_offset, nullptr);
 }
 
 // We move keys out of sibling and into node.
@@ -1058,7 +1080,7 @@ bool level(value_sizer_t *sizer, int nodecmp_node_with_sib,
     int sibling_weight = mandatory_cost(sizer, sibling, MANDATORY_TIMESTAMPS,
                                         &tstamp_back_offset);
 
-    rassert(node_weight < sibling_weight);
+    guarantee(node_weight < sibling_weight);
 
     if (nodecmp_node_with_sib < 0) {
         // node is to the left of sibling, so we want to move elements
@@ -1078,7 +1100,7 @@ bool level(value_sizer_t *sizer, int nodecmp_node_with_sib,
         wstep = -1;
     }
 
-    rassert(end - beg != sibling->num_pairs - 1);
+    guarantee(end - beg != sibling->num_pairs - 1);
 
     int prev_weight_movement = 0;
     int weight_movement = 0;
@@ -1120,7 +1142,7 @@ bool level(value_sizer_t *sizer, int nodecmp_node_with_sib,
         *w += wstep;
     }
 
-    rassert(end - beg < sibling->num_pairs - 1);
+    guarantee(end - beg < sibling->num_pairs - 1);
 
     if (prev_diff <= sibling_weight - node_weight) {
         *w -= wstep;
@@ -1130,7 +1152,7 @@ bool level(value_sizer_t *sizer, int nodecmp_node_with_sib,
 
     if (end < beg) {
         // Alas, there is no actual leveling to do.
-        rassert(end + 1 == beg);
+        guarantee(end + 1 == beg);
         return false;
     }
 
@@ -1241,6 +1263,23 @@ MUST_USE bool prepare_space_for_new_entry(
         bool allow_after_tstamp_cutpoint,
         char **space_out) {
 
+    /* Get an upper bound for the timestamp cutoff point in case we later call
+    `garbage_collect()`. We want to make sure that garbage collection cleans up
+    *at least* as much space as it would clean up now. This is crucial, because
+    our caller (in particular `insert()`) might have used `is_full()` in order to
+    check that the leaf node has enough space for a given entry.
+    If the key already exists, we are going to call `clear_entry()` on it below,
+    before we call `garbage_collect()`. However this can have the unwanted side
+    effect that `mandatory_cost` in `garbage_collect()` no longer exceeds the
+    `max_deletions_cost`, or exceeds it only at a later offset
+    (this is true in particular if the existing entry is a deletion entry).
+    As a consequence of that, `garbage_collect()` might clean up slightly less space
+    than was originally assumed.
+    We avoid this problem by getting the cutoff point now, and having `garbage_collect()`
+    pick the lower of the two. */
+    int gc_tstamp_cutoff_upper_bound;
+    mandatory_cost(sizer, node, MANDATORY_TIMESTAMPS - 1, &gc_tstamp_cutoff_upper_bound);
+
     /* Figure out where in `pair_offsets` to put the offset of the new entry,
     and simultaneously check for an existing entry for this key. If the entry
     already exists, clean it. */
@@ -1270,8 +1309,15 @@ MUST_USE bool prepare_space_for_new_entry(
         in the leaf node, we'll open up some space in `pair_offsets`. */
     }
 
-    /* Garbage collect if appropriate. We do it after cleaning up any existing
-    entry so that deletion always works no matter how full the node is. */
+    /* Garbage collect if appropriate.
+    We do it after cleaning up any existing entry so that adding a deletion entry
+    *almost* always works no matter how full the node is.
+    If the existing entry is smaller than the new deletion entry that we're trying
+    to add, we might not have enough space for it even after garbage collection.
+    This can happen if the previous entry didn't have a timestamp and had a very
+    small value size (in practice this should be really rare).
+    We check for this condition further down, and recover from it by dropping
+    all existing timestamps and discarding the delete entry by returning `false`. */
 
     if (offsetof(leaf_node_t, pair_offsets) +
             sizeof(uint16_t) * (node->num_pairs + (found ? 0 : 1)) +
@@ -1289,10 +1335,11 @@ MUST_USE bool prepare_space_for_new_entry(
             --node->num_pairs;
         }
 
-        /* Passing `&index` as the last parameter to `garbage_collect()`
+        /* Passing `&index` as a parameter to `garbage_collect()`
         guarantees that it will remain valid even as `pair_offsets` entries are
         moved around. */
-        garbage_collect(sizer, node, MANDATORY_TIMESTAMPS - 1, &index);
+        garbage_collect(sizer, node, MANDATORY_TIMESTAMPS - 1, &index,
+                        make_optional(gc_tstamp_cutoff_upper_bound));
 
         /* Make sure that `index` still refers to where the new key should be
         inserted. */
@@ -1338,9 +1385,27 @@ MUST_USE bool prepare_space_for_new_entry(
     }
 
     /* If a deletion would go after `tstamp_cutpoint`, instead we want to just
-    discard it entirely. */
-
+    discard it entirely (deletions have `allow_after_tstamp_cutpoint == false`). */
     bool actually_create_entry = new_entry_should_have_timestamp || allow_after_tstamp_cutpoint;
+
+    /* As mentioned above, it can theoretically happen that we're trying to replace
+    an entry by a deletion entry and we don't have enough space to write the deletion
+    entry.
+    We check for this here, and shift the timestamp cutoff point in order to
+    maintain correctness.
+    This will be very rare in practice, since values are usually larger than
+    deletion entries. */
+    bool drop_timestamps = false;
+    if (actually_create_entry
+        && !allow_after_tstamp_cutpoint
+        && offsetof(leaf_node_t, pair_offsets)
+           + sizeof(uint16_t) * (node->num_pairs + (found ? 0 : 1))
+           + new_entry_size
+           + sizeof(repli_timestamp_t)
+           > node->frontmost) {
+        actually_create_entry = false;
+        drop_timestamps = true;
+    }
 
     if (!actually_create_entry) {
         if (found) {
@@ -1352,6 +1417,10 @@ MUST_USE bool prepare_space_for_new_entry(
                 node->pair_offsets + index + 1,
                 sizeof(uint16_t) * (node->num_pairs - index - 1));
             --node->num_pairs;
+        }
+
+        if (drop_timestamps) {
+            erase_deletions(sizer, node, optional<repli_timestamp_t>());
         }
 
         return false;
@@ -1397,7 +1466,8 @@ MUST_USE bool prepare_space_for_new_entry(
     }
 
     node->frontmost -= total_space_for_new_entry;
-    rassert(offsetof(leaf_node_t, pair_offsets) + sizeof(uint16_t) * node->num_pairs <= node->frontmost);
+    guarantee(offsetof(leaf_node_t, pair_offsets)
+              + sizeof(uint16_t) * node->num_pairs <= node->frontmost);
 
     /* Write the timestamp if we need one, and update `node->tstamp_cutpoint` if
     we don't. */
@@ -1421,6 +1491,7 @@ MUST_USE bool prepare_space_for_new_entry(
     } else {
         *space_out = get_at_offset(node, start_of_where_new_entry_should_go);
     }
+    guarantee(end_of_where_new_entry_should_go <= sizer->block_size().value());
 
     return true;
 }
@@ -1440,11 +1511,11 @@ void insert(
     /* Make space for the entry itself */
 
     char *location_to_write_data;
-    DEBUG_VAR bool should_write = prepare_space_for_new_entry(sizer, node,
+    bool should_write = prepare_space_for_new_entry(sizer, node,
         key, key->full_size() + sizer->size(value), tstamp, maximum_existing_tstamp,
         true,
         &location_to_write_data);
-    rassert(should_write);
+    guarantee(should_write);
 
     /* Now copy the data into the node itself */
 
@@ -1521,27 +1592,30 @@ repli_timestamp_t min_deletion_timestamp(
         earliest_so_far = tstamp;
         iter.step(sizer, node);
     }
-    /* It's possible for us to forget a deletion with timestamp equal to the olddest
+    /* It's possible for us to forget a deletion with timestamp equal to the oldest
     timestamped entry, so the min deletion timestamp is one time unit newer than the
     oldest timestamped entry. */
     return earliest_so_far.next();
 }
 
 void erase_deletions(
-        value_sizer_t *sizer, leaf_node_t *node, repli_timestamp_t min_del_timestamp) {
+        value_sizer_t *sizer, leaf_node_t *node,
+        optional<repli_timestamp_t> min_del_timestamp) {
     int old_tstamp_cutpoint = node->tstamp_cutpoint;
     entry_iter_t iter = entry_iter_t::make(node);
 
-    /* Advance `iter` to the first entry with a timestamp that's lower than
-    `min_del_timestamp - 1`. */
-    while (true) {
-        if (iter.done(sizer) || iter.offset >= old_tstamp_cutpoint) {
-            return;
+    if (min_del_timestamp.has_value()) {
+        /* Advance `iter` to the first entry with a timestamp that's lower than
+        `min_del_timestamp - 1`. */
+        while (true) {
+            if (iter.done(sizer) || iter.offset >= old_tstamp_cutpoint) {
+                return;
+            }
+            if (get_timestamp(node, iter.offset).next() < *min_del_timestamp) {
+                break;
+            }
+            iter.step(sizer, node);
         }
-        if (get_timestamp(node, iter.offset).next() < min_del_timestamp) {
-            break;
-        }
-        iter.step(sizer, node);
     }
 
     /* We'll remove timestamps from all of the entries between `old_tstamp_cutpoint` and
@@ -1635,7 +1709,7 @@ continue_bool_t visit_entries(
 }
 
 iterator::iterator()
-    : node_(NULL), index_(-1) { }
+    : node_(nullptr), index_(-1) { }
 
 iterator::iterator(const leaf_node_t *node, int index)
     : node_(node), index_(index) { }

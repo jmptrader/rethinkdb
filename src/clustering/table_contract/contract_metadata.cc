@@ -1,7 +1,6 @@
 // Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "clustering/table_contract/contract_metadata.hpp"
 
-#include "boost_utils.hpp"
 #include "clustering/table_contract/cpu_sharding.hpp"
 #include "stl_utils.hpp"
 
@@ -9,7 +8,8 @@
 void contract_t::sanity_check() const {
     if (static_cast<bool>(primary)) {
         guarantee(replicas.count(primary->server) == 1);
-        if (static_cast<bool>(primary->hand_over) && !primary->hand_over->is_nil()) {
+        if (static_cast<bool>(primary->hand_over)
+            && !primary->hand_over->get_uuid().is_nil()) {
             guarantee(replicas.count(*primary->hand_over) == 1);
         }
     }
@@ -209,9 +209,9 @@ table_raft_state_t make_new_table_raft_state(
         contract_t contract;
         contract.replicas = shard_conf.all_replicas;
         contract.voters = shard_conf.voting_replicas();
-        if (!shard_conf.primary_replica.is_nil()) {
-            contract.primary = boost::make_optional(
-                contract_t::primary_t { shard_conf.primary_replica, boost::none });
+        if (!shard_conf.primary_replica.get_uuid().is_nil()) {
+            contract.primary.set(
+                contract_t::primary_t { shard_conf.primary_replica, r_nullopt });
         }
         contract.after_emergency_repair = false;
         for (size_t j = 0; j < CPU_SHARDING_FACTOR; ++j) {

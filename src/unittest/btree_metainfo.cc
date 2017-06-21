@@ -7,9 +7,13 @@
 #include "buffer_cache/cache_balancer.hpp"
 #include "containers/binary_blob.hpp"
 #include "unittest/unittest_utils.hpp"
-#include "serializer/config.hpp"
+#include "serializer/log/log_serializer.hpp"
 
 namespace unittest {
+
+#ifdef _MSC_VER
+int (&random)() = rand;
+#endif
 
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Wunreachable-code"
@@ -43,12 +47,12 @@ TPTEST(BtreeMetainfo, MetainfoTest) {
     io_backender_t io_backender(file_direct_io_mode_t::buffered_desired);
 
     filepath_file_opener_t file_opener(temp_file.name(), &io_backender);
-    standard_serializer_t::create(
+    log_serializer_t::create(
         &file_opener,
-        standard_serializer_t::static_config_t());
+        log_serializer_t::static_config_t());
 
-    standard_serializer_t serializer(
-        standard_serializer_t::dynamic_config_t(),
+    log_serializer_t serializer(
+        log_serializer_t::dynamic_config_t(),
         &file_opener,
         &get_global_perfmon_collection());
 
@@ -58,10 +62,14 @@ TPTEST(BtreeMetainfo, MetainfoTest) {
 
     {
         txn_t txn(&cache_conn, write_durability_t::HARD, 1);
-        buf_lock_t sb_lock(&txn, SUPERBLOCK_ID, alt_create_t::create);
-        real_superblock_t superblock(std::move(sb_lock));
-        btree_slice_t::init_real_superblock(&superblock,
-                                            std::vector<char>(), binary_blob_t());
+        {
+            buf_lock_t sb_lock(&txn, SUPERBLOCK_ID, alt_create_t::create);
+            real_superblock_t superblock(std::move(sb_lock));
+            btree_slice_t::init_real_superblock(
+                &superblock,
+                std::vector<char>(), binary_blob_t());
+        }
+        txn.commit();
     }
 
     for (int i = 0; i < 3; ++i) {
@@ -71,18 +79,21 @@ TPTEST(BtreeMetainfo, MetainfoTest) {
         }
         {
             scoped_ptr_t<txn_t> txn;
-            scoped_ptr_t<real_superblock_t> superblock;
-            get_btree_superblock_and_txn_for_writing(
-                &cache_conn, nullptr, write_access_t::write, 1,
-                write_durability_t::SOFT, &superblock, &txn);
-            std::vector<std::vector<char> > keys;
-            std::vector<binary_blob_t> values;
-            for (const auto &pair : metainfo) {
-                keys.push_back(string_to_vector(pair.first));
-                values.push_back(string_to_blob(pair.second));
+            {
+                scoped_ptr_t<real_superblock_t> superblock;
+                get_btree_superblock_and_txn_for_writing(
+                    &cache_conn, nullptr, write_access_t::write, 1,
+                    write_durability_t::SOFT, &superblock, &txn);
+                std::vector<std::vector<char> > keys;
+                std::vector<binary_blob_t> values;
+                for (const auto &pair : metainfo) {
+                    keys.push_back(string_to_vector(pair.first));
+                    values.push_back(string_to_blob(pair.second));
+                }
+                set_superblock_metainfo(superblock.get(), keys, values,
+                    cluster_version_t::v2_1);
             }
-            set_superblock_metainfo(superblock.get(), keys, values,
-                                    cluster_version_t::v2_1);
+            txn->commit();
         }
         {
             scoped_ptr_t<txn_t> txn;

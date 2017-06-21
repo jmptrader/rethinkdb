@@ -3,11 +3,9 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <set>
 #include <utility>
-
-#include "errors.hpp"
-#include <boost/make_shared.hpp>
 
 #include "concurrency/cross_thread_signal.hpp"
 #include "concurrency/pmap.hpp"
@@ -20,11 +18,11 @@
 
 template<class metadata_t>
 semilattice_manager_t<metadata_t>::semilattice_manager_t(
-        connectivity_cluster_t *connectivity_cluster,
+        connectivity_cluster_t *_connectivity_cluster,
         connectivity_cluster_t::message_tag_t message_tag,
         const metadata_t &initial_metadata) :
-    cluster_message_handler_t(connectivity_cluster, message_tag),
-    root_view(boost::make_shared<root_view_t>(this)),
+    cluster_message_handler_t(_connectivity_cluster, message_tag),
+    root_view(std::make_shared<root_view_t>(this)),
     metadata_version(0),
     metadata(initial_metadata),
     next_sync_from_query_id(0), next_sync_to_query_id(0),
@@ -40,11 +38,11 @@ semilattice_manager_t<metadata_t>::semilattice_manager_t(
 template<class metadata_t>
 semilattice_manager_t<metadata_t>::~semilattice_manager_t() THROWS_NOTHING {
     assert_thread();
-    root_view->parent = NULL;
+    root_view->parent = nullptr;
 }
 
 template<class metadata_t>
-boost::shared_ptr<semilattice_readwrite_view_t<metadata_t> > semilattice_manager_t<metadata_t>::get_root_view() {
+std::shared_ptr<semilattice_readwrite_view_t<metadata_t> > semilattice_manager_t<metadata_t>::get_root_view() {
     assert_thread();
     return root_view;
 }
@@ -85,7 +83,7 @@ void semilattice_manager_t<metadata_t>::root_view_t::join(const metadata_t &adde
              connection, connection_keepalive /* important to capture */,
              new_version, added_metadata]() {
                 metadata_writer_t writer(added_metadata, new_version);
-                new_semaphore_acq_t acq(&parent->semaphore, 1);
+                new_semaphore_in_line_t acq(&parent->semaphore, 1);
                 acq.acquisition_signal()->wait();
                 parent->get_connectivity_cluster()->send_message(connection,
                     connection_keepalive, parent->get_message_tag(), &writer);
@@ -265,7 +263,7 @@ void semilattice_manager_t<metadata_t>::root_view_t::sync_from(peer_id_t peer, s
     connectivity_cluster_t::connection_t *connection =
         parent->get_connectivity_cluster()->
             get_connection(peer, &connection_keepalive);
-    if (connection == NULL) {
+    if (connection == nullptr) {
         throw sync_failed_exc_t();
     }
 
@@ -277,7 +275,7 @@ void semilattice_manager_t<metadata_t>::root_view_t::sync_from(peer_id_t peer, s
     /* Send the sync-from message */
     sync_from_query_writer_t writer(query_id);
     {
-        new_semaphore_acq_t acq(&parent->semaphore, 1);
+        new_semaphore_in_line_t acq(&parent->semaphore, 1);
         wait_interruptible(acq.acquisition_signal(), interruptor);
         parent->get_connectivity_cluster()->send_message(connection,
             connection_keepalive, parent->get_message_tag(), &writer);
@@ -305,7 +303,7 @@ void semilattice_manager_t<metadata_t>::root_view_t::sync_to(peer_id_t peer, sig
     connectivity_cluster_t::connection_t *connection =
         parent->get_connectivity_cluster()->
             get_connection(peer, &connection_keepalive);
-    if (connection == NULL) {
+    if (connection == nullptr) {
         throw sync_failed_exc_t();
     }
 
@@ -317,7 +315,7 @@ void semilattice_manager_t<metadata_t>::root_view_t::sync_to(peer_id_t peer, sig
     /* Send the sync-to message */
     sync_to_query_writer_t writer(query_id, parent->metadata_version);
     {
-        new_semaphore_acq_t acq(&parent->semaphore, 1);
+        new_semaphore_in_line_t acq(&parent->semaphore, 1);
         wait_interruptible(acq.acquisition_signal(), interruptor);
         parent->get_connectivity_cluster()->send_message(
             connection, connection_keepalive, parent->get_message_tag(), &writer);
@@ -409,7 +407,7 @@ void semilattice_manager_t<metadata_t>::on_message(
                 {
                     on_thread_t thread_switcher(home_thread());
                     sync_from_reply_writer_t writer(query_id, metadata_version);
-                    new_semaphore_acq_t acq(&this->semaphore, 1);
+                    new_semaphore_in_line_t acq(&this->semaphore, 1);
                     acq.acquisition_signal()->wait();
                     {
                         on_thread_t thread_switcher_2(original_thread);
@@ -476,7 +474,7 @@ void semilattice_manager_t<metadata_t>::on_message(
                         return;
                     }
                     sync_to_reply_writer_t writer(query_id);
-                    new_semaphore_acq_t acq(&this->semaphore, 1);
+                    new_semaphore_in_line_t acq(&this->semaphore, 1);
                     acq.acquisition_signal()->wait();
                     {
                         on_thread_t thread_switcher_2(original_thread);
@@ -532,7 +530,7 @@ void semilattice_manager_t<metadata_t>::on_connection_change(
         coro_t::spawn_sometime([this, this_keepalive /* important to capture */,
                 connection, connection_keepalive /* important to capture */]() {
             metadata_writer_t writer(metadata, metadata_version);
-            new_semaphore_acq_t acq(&this->semaphore, 1);
+            new_semaphore_in_line_t acq(&this->semaphore, 1);
             acq.acquisition_signal()->wait();
             get_connectivity_cluster()->send_message(connection,
                 connection_keepalive, get_message_tag(), &writer);
@@ -567,7 +565,7 @@ void semilattice_manager_t<metadata_t>::wait_for_version_from_peer(peer_id_t pee
     connectivity_cluster_t::connection_t *connection =
         get_connectivity_cluster()->
             get_connection(peer, &connection_keepalive);
-    if (connection == NULL) {
+    if (connection == nullptr) {
         throw sync_failed_exc_t();
     }
 

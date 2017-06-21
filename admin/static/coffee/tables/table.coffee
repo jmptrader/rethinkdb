@@ -106,11 +106,14 @@ class TableContainer extends Backbone.View
                     table_status.eq(null),
                     null,
                     table_status.merge(
-                        max_shards: 32
+                        max_shards: 64
                         num_shards: table_config("shards").count().default(0)
                         num_servers: server_config.count()
                         num_default_servers: server_config.filter((server) ->
                             server('tags').contains('default')).count()
+                        max_num_shards: r.expr([64,
+                            server_config.filter(((server) ->
+                                server('tags').contains('default'))).count()]).min()
                         num_primary_replicas:
                             table_status("shards").count(
                                 (row) -> row('primary_replicas').isEmpty().not())
@@ -141,7 +144,7 @@ class TableContainer extends Backbone.View
                 r.db(table_config("db"))
                 .table(table_config("name"), read_mode: "single")
                 .indexStatus()
-                .pluck('index', 'ready', 'blocks_processed', 'blocks_total')
+                .pluck('index', 'ready', 'progress')
                 .merge( (index) -> {
                     id: index("index")
                     db: table_config("db")
@@ -489,6 +492,7 @@ class ReconfigurePanel extends Backbone.View
                 num_shards: @model.get('num_shards')
                 num_servers: @model.get('num_servers')
                 num_default_servers: @model.get('num_default_servers')
+                max_num_shards: @model.get('max_num_shards')
                 num_replicas_per_shard: @model.get('num_replicas_per_shard')
         @reconfigure_modal.render()
 
@@ -701,7 +705,7 @@ class SecondaryIndexesView extends Backbone.View
 
         if build_in_progress and @model.get('db')?
             query = r.db(@model.get('db')).table(@model.get('name')).indexStatus()
-                .pluck('index', 'ready', 'blocks_processed', 'blocks_total')
+                .pluck('index', 'ready', 'progress')
                 .merge( (index) => {
                     id: index("index")
                     db: @model.get("db")
@@ -886,7 +890,7 @@ class SecondaryIndexView extends Backbone.View
     initialize: (data) =>
         @container = data.container
 
-        @model.on 'change:blocks_processed', @update
+        @model.on 'change:progress', @update
         @model.on 'change:ready', @update
 
     update: (args) =>
@@ -910,8 +914,7 @@ class SecondaryIndexView extends Backbone.View
         @
 
     render_progress_bar: =>
-        blocks_processed = @model.get 'blocks_processed'
-        blocks_total = @model.get 'blocks_total'
+        progress = @model.get 'progress'
 
         if @progress_bar?
             if @model.get('ready') is true
@@ -920,7 +923,7 @@ class SecondaryIndexView extends Backbone.View
                     check: true
                     , => @render()
             else
-                @progress_bar.render blocks_processed, blocks_total,
+                @progress_bar.render progress, 1,
                     got_response: true
                     check: true
                     , => @render()

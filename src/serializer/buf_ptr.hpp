@@ -24,9 +24,9 @@ public:
     }
 
     buf_ptr_t(block_size_t size,
-            scoped_malloc_t<ser_buffer_t> ser_buffer)
+              scoped_device_block_aligned_ptr_t<ser_buffer_t> _ser_buffer)
         : block_size_(size),
-          ser_buffer_(std::move(ser_buffer)) {
+          ser_buffer_(std::move(_ser_buffer)) {
         guarantee(block_size_.ser_value() != 0);
         guarantee(ser_buffer_.has());
     }
@@ -68,19 +68,19 @@ public:
     // Returns the actual allocated size of the buffer, wich is
     // DEVICE_BLOCK_SIZE-aligned.  (Returns the value of block_size().ser_value()
     // rounded up to the next multiple of DEVICE_BLOCK_SIZE.)
-    uint32_t aligned_block_size() const {
+    uint16_t aligned_block_size() const {
         guarantee(ser_buffer_.has());
         return buf_ptr_t::compute_aligned_block_size(block_size_);
     }
 
     // Returns what aligned_block_size() would return for a buf_ptr_t that has the
     // given block size.
-    static uint32_t compute_aligned_block_size(block_size_t block_size) {
+    static uint16_t compute_aligned_block_size(block_size_t block_size) {
         return ceil_aligned(block_size.ser_value(), DEVICE_BLOCK_SIZE);
     }
 
     void release(block_size_t *block_size_out,
-                 scoped_malloc_t<ser_buffer_t> *ser_buffer_out) {
+                 scoped_device_block_aligned_ptr_t<ser_buffer_t> *ser_buffer_out) {
         buf_ptr_t tmp(std::move(*this));
         *block_size_out = tmp.block_size_;
         *ser_buffer_out = std::move(tmp.ser_buffer_);
@@ -113,7 +113,7 @@ private:
     // more efficiently write the buffer to disk.
     block_size_t block_size_;
     // The buffer, or empty if this buf_ptr_t is empty.
-    scoped_malloc_t<ser_buffer_t> ser_buffer_;
+    scoped_device_block_aligned_ptr_t<ser_buffer_t> ser_buffer_;
 
     DISABLE_COPYING(buf_ptr_t);
 };

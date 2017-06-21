@@ -21,7 +21,7 @@
 #ifndef RAPIDJSON_PRETTYWRITER_H_
 #define RAPIDJSON_PRETTYWRITER_H_
 
-#include "writer.h"
+#include "rapidjson/writer.h"
 
 #ifdef __GNUC__
 RAPIDJSON_DIAG_PUSH
@@ -37,7 +37,7 @@ RAPIDJSON_NAMESPACE_BEGIN
     \tparam TargetEncoding Encoding of output stream.
     \tparam StackAllocator Type of allocator for allocating memory of stack.
 */
-template<typename OutputStream, typename SourceEncoding = UTF8<>, typename TargetEncoding = UTF8<>, typename StackAllocator = CrtAllocator>
+template<typename OutputStream, typename SourceEncoding = UTF8<>, typename TargetEncoding = UTF8<>, typename StackAllocator = RAllocator>
 class PrettyWriter : public Writer<OutputStream, SourceEncoding, TargetEncoding, StackAllocator> {
 public:
     typedef Writer<OutputStream, SourceEncoding, TargetEncoding, StackAllocator> Base;

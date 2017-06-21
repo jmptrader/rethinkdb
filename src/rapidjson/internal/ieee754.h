@@ -21,7 +21,7 @@
 #ifndef RAPIDJSON_IEEE754_
 #define RAPIDJSON_IEEE754_
 
-#include "../rapidjson.h"
+#include "rapidjson/rapidjson.h"
 
 RAPIDJSON_NAMESPACE_BEGIN
 namespace internal {
@@ -29,8 +29,8 @@ namespace internal {
 class Double {
 public:
     Double() {}
-    Double(double d) : d(d) {}
-    Double(uint64_t u) : u(u) {}
+    Double(double _d) : d(_d) {}
+    Double(uint64_t _u) : u(_u) {}
 
     double Value() const { return d; }
     uint64_t Uint64Value() const { return u; }

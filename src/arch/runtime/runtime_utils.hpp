@@ -4,12 +4,44 @@
 
 #include <signal.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "config/args.hpp"
 #include "containers/intrusive_list.hpp"
 
+#ifdef _WIN32
+
+typedef HANDLE fd_t;
+const fd_t INVALID_FD = INVALID_HANDLE_VALUE;
+const fd_t STDOUT_FD = GetStdHandle(STD_OUTPUT_HANDLE);
+const fd_t STDERR_FD = GetStdHandle(STD_ERROR_HANDLE);
+
+inline SOCKET fd_to_socket(fd_t handle) {
+    CT_ASSERT(sizeof(SOCKET) == sizeof(HANDLE));
+    return reinterpret_cast<SOCKET>(handle);
+}
+
+inline fd_t socket_to_fd(SOCKET s) {
+    return reinterpret_cast<fd_t>(s);
+}
+
+#else
+
 typedef int fd_t;
-#define INVALID_FD fd_t(-1)
+const fd_t INVALID_FD = -1;
+const fd_t STDOUT_FD = STDOUT_FILENO;
+const fd_t STDERR_FD = STDERR_FILENO;
+
+inline int fd_to_socket(fd_t fd) {
+    return fd;
+}
+
+inline fd_t socket_to_fd(int fd) {
+    return fd;
+}
+
+#endif
+
 
 class linux_thread_message_t : public intrusive_list_node_t<linux_thread_message_t> {
 public:
@@ -80,8 +112,10 @@ struct assert_finite_coro_waiting_t {
 
 #endif  // NDEBUG
 
+#ifndef _WIN32
 struct sigaction make_sa_handler(int sa_flags, void (*sa_handler_func)(int));
 struct sigaction make_sa_sigaction(int sa_flags, void (*sa_sigaction_func)(int, siginfo_t *, void *));
+#endif
 
 
 #endif // ARCH_RUNTIME_RUNTIME_UTILS_HPP_

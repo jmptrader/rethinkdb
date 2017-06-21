@@ -21,12 +21,12 @@
 #ifndef RAPIDJSON_WRITER_H_
 #define RAPIDJSON_WRITER_H_
 
-#include "rapidjson.h"
-#include "internal/stack.h"
-#include "internal/strfunc.h"
-#include "internal/dtoa.h"
-#include "internal/itoa.h"
-#include "stringbuffer.h"
+#include "rapidjson/rapidjson.h"
+#include "rapidjson/internal/stack.h"
+#include "rapidjson/internal/strfunc.h"
+#include "rapidjson/internal/dtoa.h"
+#include "rapidjson/internal/itoa.h"
+#include "rapidjson/stringbuffer.h"
 #include <new>      // placement new
 
 #if RAPIDJSON_HAS_STDSTRING
@@ -36,6 +36,14 @@
 #ifdef _MSC_VER
 RAPIDJSON_DIAG_PUSH
 RAPIDJSON_DIAG_OFF(4127) // conditional expression is constant
+#endif
+
+// RethinkDB: Disable -Wtype-limits.
+// Notably on ARM, GCC complains about code such as `unsigned(c) < 256` always being
+// true when Ch is instantiated as `char`.
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wtype-limits"
 #endif
 
 RAPIDJSON_NAMESPACE_BEGIN
@@ -56,7 +64,7 @@ RAPIDJSON_NAMESPACE_BEGIN
     \tparam StackAllocator Type of allocator for allocating memory of stack.
     \note implements Handler concept
 */
-template<typename OutputStream, typename SourceEncoding = UTF8<>, typename TargetEncoding = UTF8<>, typename StackAllocator = CrtAllocator>
+template<typename OutputStream, typename SourceEncoding = UTF8<>, typename TargetEncoding = UTF8<>, typename StackAllocator = RAllocator>
 class Writer {
 public:
     typedef typename SourceEncoding::Ch Ch;
@@ -136,15 +144,23 @@ public:
       return String(str.data(), SizeType(str.size()));
     }
 
-    // RethinkDB addition: Inject a raw JSON string
-    bool RawJson(const std::basic_string<Ch>& raw) {
+#endif
+    // RethinkDB addition: Splice a buffer (containing an array) into the current array
+    bool SpliceArray(const rapidjson::StringBuffer &buffer) {
+        RAPIDJSON_ASSERT(level_stack_.template Top<Level>()->inArray);
         Prefix(kStringType); // The type doesn't matter here
-        for (const Ch &c : raw) {
-            os_->Put(c);
+
+        const Ch *data = buffer.GetString();
+        const size_t size = buffer.GetSize();
+
+        // Ignore the start and end square brackets in the array
+        RAPIDJSON_ASSERT(data[0] == '[');
+        RAPIDJSON_ASSERT(data[size - 1] == ']');
+        for (size_t i = 1; i < size - 1; ++i) {
+            os_->Put(data[i]);
         }
         return true;
     }
-#endif
 
     bool StartObject() {
         Prefix(kObjectType);
@@ -402,6 +418,11 @@ inline bool Writer<StringBuffer>::WriteDouble(double d) {
 }
 
 RAPIDJSON_NAMESPACE_END
+
+// RethinkDB: Re-enable all warnings
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
 
 #ifdef _MSC_VER
 RAPIDJSON_DIAG_POP

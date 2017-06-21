@@ -7,6 +7,29 @@
 #include "clustering/administration/tables/split_points.hpp"
 #include "clustering/table_manager/table_meta_client.hpp"
 #include "concurrency/cross_thread_signal.hpp"
+#include "containers/archive/string_stream.hpp"
+#include "rdb_protocol/terms/write_hook.hpp"
+
+table_config_artificial_table_backend_t::table_config_artificial_table_backend_t(
+        rdb_context_t *_rdb_context,
+        lifetime_t<name_resolver_t const &> name_resolver,
+        std::shared_ptr< semilattice_readwrite_view_t<
+            cluster_semilattice_metadata_t> > _semilattice_view,
+        real_reql_cluster_interface_t *_reql_cluster_interface,
+        admin_identifier_format_t _identifier_format,
+        server_config_client_t *_server_config_client,
+        table_meta_client_t *_table_meta_client)
+    : common_table_artificial_table_backend_t(
+        name_string_t::guarantee_valid("table_config"),
+        _rdb_context,
+        name_resolver,
+        _semilattice_view,
+        _table_meta_client,
+        _identifier_format),
+      rdb_context(_rdb_context),
+      reql_cluster_interface(_reql_cluster_interface),
+      server_config_client(_server_config_client) {
+}
 
 table_config_artificial_table_backend_t::~table_config_artificial_table_backend_t() {
     begin_changefeed_destruction();
@@ -64,7 +87,7 @@ bool convert_server_id_from_datum(
             return true;
         }
     } else {
-        if (!convert_uuid_from_datum(datum, server_id_out, error_out)) {
+        if (!convert_server_id_from_datum(datum, server_id_out, error_out)) {
             return false;
         }
         /* We know the server's UUID, but we need to confirm that it exists and determine
@@ -93,7 +116,7 @@ bool convert_server_id_from_datum(
         }
         *error_out = admin_err_t{
             strprintf("There is no server with UUID `%s`.",
-                      uuid_to_str(*server_id_out).c_str()),
+                      uuid_to_str(server_id_out->get_uuid()).c_str()),
             query_state_t::FAILED};
         return false;
     }
@@ -106,7 +129,7 @@ ql::datum_t convert_replica_list_to_datum(
     ql::datum_array_builder_t replicas_builder(ql::configured_limits_t::unlimited);
     for (const server_id_t &replica : replicas) {
         replicas_builder.add(convert_name_or_uuid_to_datum(
-            server_names.get(replica), replica, identifier_format));
+            server_names.get(replica), replica.get_uuid(), identifier_format));
     }
     return std::move(replicas_builder).to_datum();
 }
@@ -218,7 +241,7 @@ ql::datum_t convert_table_config_shard_to_datum(
             shard.nonvoting_replicas, identifier_format, server_names));
     builder.overwrite("primary_replica",
         convert_name_or_uuid_to_datum(server_names.get(shard.primary_replica),
-            shard.primary_replica, identifier_format));
+            shard.primary_replica.get_uuid(), identifier_format));
 
     return std::move(builder).to_datum();
 }
@@ -317,6 +340,37 @@ ql::datum_t convert_sindexes_to_datum(
     return std::move(sindexes_builder).to_datum();
 }
 
+ql::datum_t convert_write_hook_to_datum(
+    const optional<write_hook_config_t> &write_hook) {
+
+    ql::datum_t res = ql::datum_t::null();
+    if (write_hook) {
+        write_message_t wm;
+        serialize<cluster_version_t::LATEST_DISK>(
+            &wm, write_hook->func);
+        string_stream_t stream;
+        int write_res = send_write_message(&stream, &wm);
+
+        rcheck_toplevel(write_res == 0,
+                        ql::base_exc_t::LOGIC,
+                        "Invalid write hook.");
+
+        ql::datum_t binary = ql::datum_t::binary(
+            datum_string_t(write_hook_blob_prefix + stream.str()));
+        res =
+            ql::datum_t{
+                std::map<datum_string_t, ql::datum_t>{
+                    std::pair<datum_string_t, ql::datum_t>(
+                        datum_string_t("function"), binary),
+                        std::pair<datum_string_t, ql::datum_t>(
+                            datum_string_t("query"),
+                            ql::datum_t(
+                                datum_string_t(
+                                    format_write_hook_query(write_hook.get()))))}};
+    }
+    return res;
+}
+
 bool convert_sindexes_from_datum(
         ql::datum_t datum,
         std::set<std::string> *indexes_out,
@@ -330,8 +384,8 @@ bool convert_sindexes_from_datum(
     return true;
 }
 
-/* This is separate from `format_row()` because it needs to be publicly exposed so it can
-   be used to create the return value of `table.reconfigure()`. */
+/* This is separate from `format_row()` because it needs to be publicly exposed so it
+   can be used to create the return value of `table.reconfigure()`. */
 ql::datum_t convert_table_config_to_datum(
         namespace_id_t table_id,
         const ql::datum_t &db_name_or_uuid,
@@ -343,6 +397,7 @@ ql::datum_t convert_table_config_to_datum(
     builder.overwrite("db", db_name_or_uuid);
     builder.overwrite("id", convert_uuid_to_datum(table_id));
     builder.overwrite("indexes", convert_sindexes_to_datum(config.sindexes));
+    builder.overwrite("write_hook", convert_write_hook_to_datum(config.write_hook));
     builder.overwrite("primary_key", convert_string_to_datum(config.basic.primary_key));
     builder.overwrite("shards",
         convert_vector_to_datum<table_config_t::shard_t>(
@@ -355,10 +410,12 @@ ql::datum_t convert_table_config_to_datum(
         convert_write_ack_config_to_datum(config.write_ack_config));
     builder.overwrite("durability",
         convert_durability_to_datum(config.durability));
+    builder.overwrite("data", config.user_data.datum);
     return std::move(builder).to_datum();
 }
 
 void table_config_artificial_table_backend_t::format_row(
+        UNUSED auth::user_context_t const &user_context,
         const namespace_id_t &table_id,
         const table_config_and_shards_t &config,
         const ql::datum_t &db_name_or_uuid,
@@ -424,7 +481,7 @@ bool convert_table_config_and_name_from_datum(
     }
 
     /* As a special case, we allow the user to omit `indexes`, `primary_key`, `shards`,
-    `write_acks`, and/or `durability` for newly-created tables. */
+    `write_acks`, `durability`, and/or `data` for newly-created tables. */
 
     if (converter.has("indexes")) {
         ql::datum_t indexes_datum;
@@ -547,6 +604,39 @@ bool convert_table_config_and_name_from_datum(
         config_out->durability = write_durability_t::HARD;
     }
 
+    if (converter.has("write_hook")) {
+        ql::datum_t write_hook_datum;
+        if (!converter.get("write_hook", &write_hook_datum, error_out)) {
+            return false;
+        }
+        if (write_hook_datum.has()) {
+            if ((!old_config.config.write_hook &&
+                 write_hook_datum.get_type() != ql::datum_t::type_t::R_NULL ) ||
+                write_hook_datum
+                != convert_write_hook_to_datum(old_config.config.write_hook)) {
+                error_out->msg = "The `write_hook` field is read-only and can't" \
+                    " be used to create or drop a write hook function.";
+                return false;
+            }
+        }
+        config_out->write_hook = old_config.config.write_hook;
+    } else {
+        if (existed_before) {
+            error_out->msg = "Expected a field named `write_hook`.";
+            return false;
+        }
+    }
+
+    if (existed_before || converter.has("data")) {
+        ql::datum_t user_data_datum;
+        if (!converter.get("data", &user_data_datum, error_out)) {
+            return false;
+        }
+        config_out->user_data = {std::move(user_data_datum)};
+    } else {
+        config_out->user_data = default_user_data();
+    }
+
     if (!converter.check_no_extra_keys(error_out)) {
         return false;
     }
@@ -592,7 +682,10 @@ void table_config_artificial_table_backend_t::do_modify(
         new_config.config.shards.size(), old_config.shard_scheme, interruptor,
         &new_config.shard_scheme);
 
-    table_meta_client->set_config(table_id, new_config, interruptor);
+    table_config_and_shards_change_t table_config_and_shards_change(
+        table_config_and_shards_change_t::set_table_config_and_shards_t{ new_config });
+    table_meta_client->set_config(
+        table_id, table_config_and_shards_change, interruptor);
 }
 
 void table_config_artificial_table_backend_t::do_create(
@@ -622,6 +715,7 @@ void table_config_artificial_table_backend_t::do_create(
 }
 
 bool table_config_artificial_table_backend_t::write_row(
+        auth::user_context_t const &user_context,
         ql::datum_t primary_key,
         bool pkey_was_autogenerated,
         ql::datum_t *new_value_inout,
@@ -648,6 +742,10 @@ bool table_config_artificial_table_backend_t::write_row(
             table_basic_config_t old_basic_config;
             table_meta_client->get_name(table_id, &old_basic_config);
             guarantee(!pkey_was_autogenerated, "UUID collision happened");
+
+            user_context.require_config_permission(
+                rdb_context, old_basic_config.database, table_id);
+
             name_string_t old_db_name;
             if (!convert_database_id_to_datum(old_basic_config.database,
                     identifier_format, metadata, nullptr, &old_db_name)) {
@@ -656,8 +754,12 @@ bool table_config_artificial_table_backend_t::write_row(
 
             if (new_value_inout->has()) {
                 table_config_and_shards_t old_config;
-                table_meta_client->get_config(
-                    table_id, &interruptor_on_home, &old_config);
+                try {
+                    table_meta_client->get_config(
+                        table_id, &interruptor_on_home, &old_config);
+                } CATCH_OP_ERRORS(old_db_name, old_basic_config.name, error_out,
+                    "Failed to retrieve the table's configuration, it was not changed.",
+                    "Failed to retrieve the table's configuration, it was not changed.")
 
                 table_config_t new_config;
                 server_name_map_t new_server_names;
@@ -675,6 +777,13 @@ bool table_config_artificial_table_backend_t::write_row(
                 }
                 guarantee(new_table_id == table_id, "artificial_table_t shouldn't have "
                     "allowed the primary key to change");
+
+                // Verify the user is allowed to move the table to the new database.
+                if (new_config.basic.database != old_basic_config.database) {
+                    user_context.require_config_permission(
+                        rdb_context, new_config.basic.database);
+                }
+
                 try {
                     do_modify(table_id, std::move(old_config), std::move(new_config),
                         std::move(new_server_names), old_db_name, new_db_name,
@@ -738,8 +847,8 @@ bool table_config_artificial_table_backend_t::write_row(
             /* The user is deleting a table that doesn't exist. Do nothing. */
             return true;
         }
-    } catch (const admin_op_exc_t &msg) {
-        *error_out = admin_err_t{msg.what(), msg.query_state};
+    } catch (const admin_op_exc_t &admin_op_exc) {
+        *error_out = admin_op_exc.to_admin_err();
         return false;
     }
 }

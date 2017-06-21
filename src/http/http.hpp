@@ -10,13 +10,13 @@
 
 #include "errors.hpp"
 #include <boost/tokenizer.hpp>
-#include <boost/shared_array.hpp>
-#include <boost/optional.hpp>
 
 #include "arch/address.hpp"
+#include "arch/io/openssl.hpp"
 #include "arch/types.hpp"
 #include "concurrency/auto_drainer.hpp"
-#include "containers/scoped.hpp"
+#include "containers/optional.hpp"
+#include "containers/shared_buffer.hpp"
 #include "parsing/util.hpp"
 
 enum class http_method_t {
@@ -34,7 +34,7 @@ enum class http_method_t {
 struct http_req_t {
     class resource_t {
     public:
-        typedef boost::tokenizer<boost::char_separator<char>, char *> tokenizer;
+        typedef boost::tokenizer<boost::char_separator<char>, const char *> tokenizer;
         typedef tokenizer::iterator iterator;
 
         resource_t();
@@ -54,8 +54,7 @@ struct http_req_t {
         // This function returns a pointer to the beginning of the token (without the leading '/')
         const char* token_start_position(const iterator& it) const;
 
-        boost::shared_array<char> val;
-        size_t val_size;
+        counted_t<const shared_buf_t> val;
         iterator b;
         iterator e;
     } resource;
@@ -73,8 +72,8 @@ struct http_req_t {
     explicit http_req_t(const std::string &resource_path);
     http_req_t(const http_req_t &from, const resource_t::iterator& resource_start);
 
-    boost::optional<std::string> find_query_param(const std::string&) const;
-    boost::optional<std::string> find_header_line(const std::string&) const;
+    optional<std::string> find_query_param(const std::string&) const;
+    optional<std::string> find_header_line(const std::string&) const;
     void add_header_line(const std::string&, const std::string&);
     bool has_header_line(const std::string&) const;
 };
@@ -104,7 +103,6 @@ public:
     explicit http_res_t(http_status_code_t rescode);
     http_res_t(http_status_code_t rescode, const std::string &content_type,
                const std::string &content);
-    void add_last_modified(int);
 };
 
 bool maybe_gzip_response(const http_req_t &req, http_res_t *res);
@@ -153,7 +151,9 @@ protected:
  * msg that's a meaningful response */
 class http_server_t {
 public:
-    http_server_t(const std::set<ip_address_t> &local_addresses, int port, http_app_t *application);
+    http_server_t(
+        tls_ctx_t *tls_ctx, const std::set<ip_address_t> &local_addresses,
+        int port, http_app_t *application);
     ~http_server_t();
     int get_port() const;
 private:
@@ -161,6 +161,7 @@ private:
     http_app_t *application;
     auto_drainer_t auto_drainer;
     scoped_ptr_t<tcp_listener_t> tcp_listener;
+    tls_ctx_t *tls_ctx;
 };
 
 std::string percent_escaped_string(const std::string &s);

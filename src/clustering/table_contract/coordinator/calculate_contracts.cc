@@ -27,18 +27,18 @@ public:
     /* `state` and `branch` are the same as the corresponding fields of the original
     `contract_ack_t` */
     contract_ack_t::state_t state;
-    boost::optional<branch_id_t> branch;
+    optional<branch_id_t> branch;
 
     /* `version` is the value of the `version` field of the original `contract_ack_t` for
     the specific sub-region this fragment applies to. */
-    boost::optional<version_t> version;
+    optional<version_t> version;
 
     /* `common_ancestor` is the timestamp of the last common ancestor of the original
     `contract_ack_t` and the `current_branch` in the Raft state for the specific
     sub-region this fragment applies to. If `version` is blank, this will always be
     blank; if `version` is present, `common_ancestor` might or might not be blank
     depending on whether we expect to use the value. */
-    boost::optional<state_timestamp_t> common_ancestor;
+    optional<state_timestamp_t> common_ancestor;
 };
 
 region_map_t<contract_ack_frag_t> break_ack_into_fragments(
@@ -58,7 +58,7 @@ region_map_t<contract_ack_frag_t> break_ack_into_fragments(
         /* Fragment over branches and then over versions within each branch. */
         return ack.version->map_multi(region,
         [&](const region_t &ack_version_reg, const version_t &vers) {
-            base_frag.version = boost::make_optional(vers);
+            base_frag.version = make_optional(vers);
             return current_branches.map_multi(ack_version_reg,
             [&](const region_t &branch_reg, const branch_id_t &branch) {
                 region_map_t<version_t> points_on_canonical_branch;
@@ -67,12 +67,22 @@ region_map_t<contract_ack_frag_t> break_ack_into_fragments(
                         version_find_branch_common(&combined_branch_history,
                             vers, branch, branch_reg);
                 } catch (const missing_branch_exc_t &) {
+#ifndef NDEBUG
                     crash("Branch history is incomplete");
+#else
+                    logERR("The branch history is incomplete. This probably means "
+                           "that there is a bug in RethinkDB. Please report this "
+                           "at https://github.com/rethinkdb/rethinkdb/issues/ .");
+                    /* Recover by using the root branch */
+                    points_on_canonical_branch =
+                        region_map_t<version_t>(region_t::universe(),
+                                                version_t::zero());
+#endif
                 }
                 return points_on_canonical_branch.map(branch_reg,
                 [&](const version_t &common_vers) {
                     base_frag.common_ancestor =
-                        boost::make_optional(common_vers.timestamp);
+                        make_optional(common_vers.timestamp);
                     return base_frag;
                 });
             });
@@ -80,7 +90,7 @@ region_map_t<contract_ack_frag_t> break_ack_into_fragments(
     } else {
         return ack.version->map(region,
         [&](const version_t &vers) {
-            base_frag.version = boost::make_optional(vers);
+            base_frag.version = make_optional(vers);
             return base_frag;
         });
     }
@@ -96,12 +106,29 @@ bool invisible_to_majority_of_set(
             connections_map) {
     size_t count = 0;
     for (const server_id_t &s : judges) {
-        if (static_cast<bool>(connections_map->get_key(std::make_pair(s, target))) ||
-                !static_cast<bool>(connections_map->get_key(std::make_pair(s, s)))) {
+        if (connections_map->get_key(std::make_pair(s, target)).has_value() ||
+                !connections_map->get_key(std::make_pair(s, s)).has_value()) {
             ++count;
         }
     }
     return !(count > judges.size() / 2);
+}
+
+/* A small helper function for `calculate_contract()` to test whether a given
+replica is currently streaming. */
+bool is_streaming(
+        const contract_t &old_c,
+        const std::map<server_id_t, contract_ack_frag_t> &acks,
+        server_id_t server) {
+    auto it = acks.find(server);
+    if (it != acks.end() &&
+            (it->second.state == contract_ack_t::state_t::secondary_streaming ||
+            (static_cast<bool>(old_c.primary) &&
+                old_c.primary->server == server))) {
+        return true;
+    } else {
+        return false;
+    }
 }
 
 /* `calculate_contract()` calculates a new contract for a region. Whenever any of the
@@ -128,27 +155,90 @@ contract_t calculate_contract(
     new_c.replicas.insert(config.all_replicas.begin(), config.all_replicas.end());
 
     /* If there is a mismatch between `config.voting_replicas()` and `c.voters`, then
-    correct it */
+    add and/or remove voters until both sets match.
+    There are three important restrictions we have to consider here:
+    1. We should not remove voters if that would reduce the total number of voters
+       below the minimum of the size of the current voter set and the size of the
+       configured voter set. Consider the case where a user wants to replace
+       a few replicas by different ones. Without this restriction, we would often
+       remove all the old replicas from the voters set before enough of the new
+       replicas would become streaming to replace them.
+    2. To increase availability in some scenarios, we also don't remove replicas
+       if that would mean being left with less than a majority of streaming
+       replicas.
+    3. Only replicas that are streaming are guaranteed to have a complete branch
+       history. Once we make a replica voting, some parts of our logic assume that
+       the branch history is intact (most importantly our call to
+       `break_ack_into_fragments()` in `calculate_all_contracts()`).
+       To avoid this condition, we only add a replica to the voters list after it
+       has started streaming.
+       See https://github.com/rethinkdb/rethinkdb/issues/4866 for more details. */
     std::set<server_id_t> config_voting_replicas = config.voting_replicas();
     if (!static_cast<bool>(old_c.temp_voters) &&
             old_c.voters != config_voting_replicas) {
-        size_t num_streaming = 0;
+        bool voters_changed = false;
+        std::set<server_id_t> new_voters = old_c.voters;
+
+        /* Step 1: Check if we can add any voters */
         for (const server_id_t &server : config_voting_replicas) {
-            auto it = acks.find(server);
-            if (it != acks.end() &&
-                    (it->second.state == contract_ack_t::state_t::secondary_streaming ||
-                    (static_cast<bool>(old_c.primary) &&
-                        old_c.primary->server == server))) {
-                ++num_streaming;
+            if (old_c.voters.count(server)) {
+                /* The replica is already a voter */
+                continue;
+            }
+            if (is_streaming(old_c, acks, server)) {
+                /* The replica is streaming. We can add it to the voter set. */
+                new_voters.insert(server);
+                voters_changed = true;
             }
         }
 
-        /* We don't want to initiate the change until a majority of the new replicas are
-        already streaming, or else we'll lose write availability as soon as we set
-        `temp_voters`. */
-        if (num_streaming > config_voting_replicas.size() / 2) {
-            /* OK, we're ready to go */
-            new_c.temp_voters = boost::make_optional(config_voting_replicas);
+        /* Step 2: Remove voters */
+        /* We try to remove non-streaming replicas first before we start removing
+        streaming ones to maximize availability in case a replica fails. */
+        std::list<server_id_t> to_remove;
+        for (const server_id_t &server : new_voters) {
+            if (config_voting_replicas.count(server) > 0) {
+                /* The replica should remain a voter */
+                continue;
+            }
+            if (is_streaming(old_c, acks, server)) {
+                /* The replica is streaming. Put it at the end of the `to_remove`
+                list. */
+                to_remove.push_back(server);
+            } else {
+                /* The replica is not streaming. Removing it doesn't hurt
+                availability, so we put it at the front of the `to_remove` list. */
+                to_remove.push_front(server);
+            }
+        }
+
+        size_t num_streaming = 0;
+        for (const server_id_t &server : new_voters) {
+            if (is_streaming(old_c, acks, server)) {
+                ++num_streaming;
+            }
+        }
+        size_t min_voters_size = std::min(old_c.voters.size(),
+                                          config_voting_replicas.size());
+        for (const server_id_t &server_to_remove : to_remove) {
+            /* Check if we can remove more voters without going below
+            `min_voters_size`, and without losing a majority of streaming voters. */
+            size_t remaining_streaming = is_streaming(old_c, acks, server_to_remove)
+                                         ? num_streaming - 1
+                                         : num_streaming;
+            size_t remaining_total = new_voters.size() - 1;
+            bool would_lose_majority = remaining_streaming <= remaining_total / 2;
+            if (would_lose_majority || new_voters.size() <= min_voters_size) {
+                break;
+            }
+            new_voters.erase(server_to_remove);
+            voters_changed = true;
+        }
+
+        /* Step 3: If anything changed, stage the new voter set into `temp_voters` */
+        rassert(voters_changed == (old_c.voters != new_voters));
+        if (voters_changed) {
+            new_c.temp_voters.set(new_voters);
         }
     }
 
@@ -157,18 +247,23 @@ contract_t calculate_contract(
     if (static_cast<bool>(old_c.temp_voters)) {
         /* Before we change `voters`, we have to make sure that we'll preserve the
         invariant that every acked write is on a majority of `voters`. This is mostly the
-        job of the primary; it will not report `primary_running` unless it is requiring
+        job of the primary; it will not report `primary_ready` unless it is requiring
         acks from a majority of both `voters` and `temp_voters` before acking writes to
         the client, *and* it has ensured that every write that was acked before that
         policy was implemented has been backfilled to a majority of `temp_voters`. So we
-        can't switch voters unless the primary reports `primary_running`. */
+        can't switch voters unless the primary reports `primary_ready`.
+        See `primary_execution_t::is_contract_ackable` for the detailed semantics of
+        the `primary_ready` state. */
         if (static_cast<bool>(old_c.primary) &&
                 acks.count(old_c.primary->server) == 1 &&
                 acks.at(old_c.primary->server).state ==
                     contract_ack_t::state_t::primary_ready) {
+            /* The `acks` we just checked are based on `old_c`, so we really shouldn't
+            commit any different set of `temp_voters`. */
+            guarantee(new_c.temp_voters == old_c.temp_voters);
             /* OK, it's safe to commit. */
             new_c.voters = *new_c.temp_voters;
-            new_c.temp_voters = boost::none;
+            new_c.temp_voters.reset();
         }
     }
 
@@ -279,12 +374,12 @@ contract_t calculate_contract(
             /* The user's designated primary is eligible, so use it. */
             contract_t::primary_t p;
             p.server = config.primary_replica;
-            new_c.primary = boost::make_optional(p);
+            new_c.primary.set(p);
         } else if (!eligible_candidates.empty()) {
             /* The user's designated primary is ineligible. We have to decide if we'll
             wait for the user's designated primary to become eligible, or use one of the
             other eligible candidates. */
-            if (!config.primary_replica.is_nil() &&
+            if (!config.primary_replica.get_uuid().is_nil() &&
                     visible_voters.count(config.primary_replica) == 1 &&
                     acks.count(config.primary_replica) == 0) {
                 /* The user's designated primary is visible to a majority of its peers,
@@ -296,7 +391,7 @@ contract_t calculate_contract(
                 contract_t::primary_t p;
                 /* `eligible_candidates` is ordered by how up-to-date they are */
                 p.server = eligible_candidates.back();
-                new_c.primary = boost::make_optional(p);
+                new_c.primary.set(p);
             }
         }
 
@@ -311,14 +406,14 @@ contract_t calculate_contract(
         has three voters, A, B, and C. Suppose that voter B is lagging behind the others,
         and voter C is removed by emergency repair. Then the normal algorithm could pick
         voter B as the primary, even though it's missing some data. */
-        server_id_t best_primary = nil_uuid();
+        server_id_t best_primary = server_id_t::from_server_uuid(nil_uuid());
         state_timestamp_t best_timestamp = state_timestamp_t::zero();
         bool all_present = true;
         for (const server_id_t &server : new_c.voters) {
             if (acks.count(server) == 1 && acks.at(server).state ==
                     contract_ack_t::state_t::secondary_need_primary) {
                 state_timestamp_t timestamp = acks.at(server).version->timestamp;
-                if (best_primary.is_nil() || timestamp > best_timestamp) {
+                if (best_primary.get_uuid().is_nil() || timestamp > best_timestamp) {
                     best_primary = server;
                     best_timestamp = timestamp;
                 }
@@ -330,7 +425,7 @@ contract_t calculate_contract(
         if (all_present) {
             contract_t::primary_t p;
             p.server = best_primary;
-            new_c.primary = boost::make_optional(p);
+            new_c.primary.set(p);
         }
     }
 
@@ -362,14 +457,14 @@ contract_t calculate_contract(
         }
 
         if (should_kill_primary) {
-            new_c.primary = boost::none;
+            new_c.primary.reset();
         } else if (old_c.primary->server != config.primary_replica) {
             /* The old primary is still a valid replica, but it isn't equal to
             `config.primary_replica`. So we have to do a hand-over to ensure that after
             we kill the primary, `config.primary_replica` will be a valid candidate. */
 
             if (old_c.primary->hand_over !=
-                    boost::make_optional(config.primary_replica)) {
+                    make_optional(config.primary_replica)) {
                 /* We haven't started the hand-over yet, or we're in the middle of a
                 hand-over to a different primary. */
                 if (acks.count(config.primary_replica) == 1 &&
@@ -377,8 +472,7 @@ contract_t calculate_contract(
                             contract_ack_t::state_t::secondary_streaming &&
                         visible_voters.count(config.primary_replica) == 1) {
                     /* The new primary is ready, so begin the hand-over. */
-                    new_c.primary->hand_over =
-                        boost::make_optional(config.primary_replica);
+                    new_c.primary->hand_over.set(config.primary_replica);
                 } else {
                     /* We're not ready to switch to the new primary yet. */
                     if (static_cast<bool>(old_c.primary->hand_over)) {
@@ -386,7 +480,7 @@ contract_t calculate_contract(
                         and then the user changed `config.primary_replica`. But the new
                         primary isn't ready yet, so cancel the old hand-over. (This is
                         very uncommon.) */
-                        new_c.primary->hand_over = boost::none;
+                        new_c.primary->hand_over.reset();
                     }
                 }
             } else {
@@ -397,12 +491,14 @@ contract_t calculate_contract(
                     /* The hand over is complete. Now it's safe to stop the old primary.
                     The new primary will be started later, after a majority of the
                     replicas acknowledge that they are no longer listening for writes
-                    from the old primary. */
-                    new_c.primary = boost::none;
+                    from the old primary.
+                    See `primary_execution_t::is_contract_ackable` for a detailed
+                    explanation of what the `primary_ready` state implies. */
+                    new_c.primary.reset();
                 } else if (visible_voters.count(config.primary_replica) == 0) {
                     /* Something went wrong with the new primary before the hand-over was
                     complete. So abort the hand-over. */
-                    new_c.primary->hand_over = boost::none;
+                    new_c.primary->hand_over.reset();
                 }
             }
         } else {
@@ -410,7 +506,7 @@ contract_t calculate_contract(
                 /* We were in the middle of a hand over, but then the user changed
                 `config.primary_replica` back to what it was before. (This is very
                 uncommon.) */
-                new_c.primary->hand_over = boost::none;
+                new_c.primary->hand_over.reset();
             }
         }
     }
@@ -529,7 +625,7 @@ void calculate_all_contracts(
                     connections_map);
 
                 /* Register a branch if a primary is asking us to */
-                boost::optional<branch_id_t> registered_new_branch;
+                optional<branch_id_t> registered_new_branch;
                 if (static_cast<bool>(old_contract.primary) &&
                         static_cast<bool>(new_contract.primary) &&
                         old_contract.primary->server ==
@@ -548,13 +644,26 @@ void calculate_all_contracts(
                         auto res = register_current_branches_out->insert(
                             std::make_pair(reg, to_register));
                         guarantee(res.second);
+                        /* Due to branch garbage collection on the executor,
+                        the branch history in the contract_ack might be incomplete.
+                        Usually this isn't a problem, because the executor is
+                        only going to garbage collect branches when it is sure
+                        that the current branches are already present in the Raft
+                        state. In that case `copy_branch_history_for_branch()` is
+                        not going to traverse to the GCed branches.
+                        However this assumption no longer holds if the Raft state
+                        has just been overwritten by an emergency repair operation.
+                        Hence we ignore missing branches in the copy operation. */
+                        bool ignore_missing_branches
+                            = old_contract.after_emergency_repair;
                         copy_branch_history_for_branch(
                             to_register,
                             this_contract_acks->at(
                                 old_contract.primary->server).branch_history,
                             old_state,
+                            ignore_missing_branches,
                             add_branches_out);
-                        registered_new_branch = boost::make_optional(to_register);
+                        registered_new_branch = make_optional(to_register);
                     }
                 }
 

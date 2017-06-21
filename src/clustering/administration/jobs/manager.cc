@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "clustering/administration/jobs/manager.hpp"
 
 #include <functional>
@@ -36,7 +36,7 @@ jobs_manager_t::jobs_manager_t(mailbox_manager_t *_mailbox_manager,
                                       this, ph::_1, ph::_2)),
     job_interrupt_mailbox(_mailbox_manager,
                           std::bind(&jobs_manager_t::on_job_interrupt,
-                                    this, ph::_1, ph::_2)) { }
+                                    this, ph::_1, ph::_2, ph::_3)) { }
 
 jobs_manager_business_card_t jobs_manager_t::get_business_card() {
     business_card_t business_card;
@@ -80,22 +80,24 @@ void jobs_manager_t::on_get_job_reports(
         {
             on_thread_t thread((threadnum_t(threadnum)));
 
-            for (auto const &query_cache
+            for (const auto &query_cache
                     : *rdb_context->get_query_caches_for_this_thread()) {
-                for (auto const &pair : *query_cache) {
+                for (const auto &pair : *query_cache) {
                     if (pair.second->persistent_interruptor.is_pulsed()) {
                         continue;
                     }
 
-                    auto render = pprint::render_as_javascript(
-                        pair.second->original_query->query());
+                    std::string render = pprint::pretty_print_as_js(
+                        printed_query_columns,
+                        pair.second->term_storage->root_term());
 
                     query_job_reports_inner.emplace_back(
                         pair.second->job_id,
                         time - std::min(pair.second->start_time, time),
                         server_id,
                         query_cache->get_client_addr_port(),
-                        pretty_print(printed_query_columns, render));
+                        std::move(render),
+                        query_cache->get_user_context());
                 }
             }
         }
@@ -109,74 +111,80 @@ void jobs_manager_t::on_get_job_reports(
             table_persistence_interface->is_gc_active()) {
         // Note that "disk_compaction" jobs do not have a duration.
         disk_compaction_job_reports.emplace_back(
-            uuid_u::from_hash(base_disk_compaction_id, uuid_to_str(server_id)),
+            uuid_u::from_hash(base_disk_compaction_id, uuid_to_str(server_id.get_uuid())),
             -1,
             server_id);
     }
 
-    multi_table_manager->visit_tables(interruptor,
-    [&](const namespace_id_t &table_id,
-            UNUSED multistore_ptr_t *multistore_ptr,
-            table_manager_t *table_manager) {
-        std::map<std::string, std::pair<sindex_config_t, sindex_status_t> > statuses =
-            table_manager->get_sindex_manager().get_status(interruptor);
-        for (const auto &status : statuses) {
-            uuid_u id = uuid_u::from_hash(
-                base_sindex_id, uuid_to_str(table_id) + status.first);
+    try {
+        multi_table_manager->visit_tables(interruptor, access_t::read,
+        [&](const namespace_id_t &table_id,
+                UNUSED multistore_ptr_t *multistore_ptr,
+                table_manager_t *table_manager) {
+            std::map<std::string, std::pair<sindex_config_t, sindex_status_t> > statuses =
+                table_manager->get_sindex_manager().get_status(interruptor);
+            for (const auto &status : statuses) {
+                uuid_u id = uuid_u::from_hash(
+                    base_sindex_id, uuid_to_str(table_id) + status.first);
 
-            /* Note that we only calculate the duration if the index construction is
-               still in progress. */
-            double duration = status.second.second.ready
-                ? 0
-                : time - std::min(status.second.second.start_time, time);
+                /* Note that we only calculate the duration if the index construction is
+                   still in progress. */
+                double duration = status.second.second.ready
+                    ? 0.0
+                    : time - std::min<double>(status.second.second.start_time, time);
 
-            index_construction_job_reports.emplace_back(
-                id,
-                duration,
-                server_id,
-                table_id,
-                status.first,
-                status.second.second.ready,
-                status.second.second.blocks_processed,
-                status.second.second.blocks_total);
-        }
+                index_construction_job_reports.emplace_back(
+                    id,
+                    duration,
+                    server_id,
+                    table_id,
+                    status.first,
+                    status.second.second.ready,
+                    status.second.second.progress_numerator,
+                    status.second.second.progress_denominator);
+            }
 
-        std::map<region_t, backfill_progress_tracker_t::progress_tracker_t> backfills =
-            table_manager->get_backfill_progress_tracker().get_progress_trackers();
-        std::string base_str = uuid_to_str(server_id) + uuid_to_str(table_id);
-        for (const auto &backfill : backfills) {
-            uuid_u id = uuid_u::from_hash(
-                base_backfill_id,
-                base_str + uuid_to_str(backfill.second.source_server_id));
+            std::map<region_t, backfill_progress_tracker_t::progress_tracker_t> backfills =
+                table_manager->get_backfill_progress_tracker().get_progress_trackers();
+            std::string base_str = uuid_to_str(server_id.get_uuid()) + uuid_to_str(table_id);
+            for (const auto &backfill : backfills) {
+                uuid_u id = uuid_u::from_hash(
+                    base_backfill_id,
+                    base_str + uuid_to_str(backfill.second.source_server_id.get_uuid()));
 
-            /* As above we only calculate the duration if the backfill is still in
-               progress. */
-            double duration = backfill.second.is_ready
-                ? 0
-                : time - std::min(backfill.second.start_time, time);
+                /* As above we only calculate the duration if the backfill is still in
+                   progress. */
+                double duration = backfill.second.is_ready
+                    ? 0.0
+                    : time - std::min<double>(backfill.second.start_time, time);
 
-            backfill_job_reports.emplace_back(
-                id,
-                duration,
-                server_id,
-                table_id,
-                backfill.second.is_ready,
-                backfill.second.progress,
-                backfill.second.source_server_id,
-                server_id);
-        }
-    });
+                backfill_job_reports.emplace_back(
+                    id,
+                    duration,
+                    server_id,
+                    table_id,
+                    backfill.second.is_ready,
+                    backfill.second.progress,
+                    backfill.second.source_server_id,
+                    server_id);
+            }
+        });
 
-    send(mailbox_manager,
-         reply_address,
-         query_job_reports,
-         disk_compaction_job_reports,
-         index_construction_job_reports,
-         backfill_job_reports);
+        send(mailbox_manager,
+             reply_address,
+             query_job_reports,
+             disk_compaction_job_reports,
+             index_construction_job_reports,
+             backfill_job_reports);
+    } catch (const interrupted_exc_t &) {
+        // Do nothing
+    }
 }
 
 void jobs_manager_t::on_job_interrupt(
-        UNUSED signal_t *interruptor, uuid_u const &id) {
+        UNUSED signal_t *interruptor,
+        uuid_u const &id,
+        auth::user_context_t const &user_context) {
     if (drainer.is_draining()) {
         // We're shutting down, the query job will be interrupted regardless.
         return;
@@ -189,9 +197,16 @@ void jobs_manager_t::on_job_interrupt(
 
         if (rdb_context != nullptr) {
             for (auto &&query_cache : *rdb_context->get_query_caches_for_this_thread()) {
+                if (!user_context.is_admin_user() &&
+                        user_context != query_cache->get_user_context()) {
+                    continue;
+                }
+
                 for (auto &&pair : *query_cache) {
                     if (pair.second->job_id == id) {
-                        pair.second->persistent_interruptor.pulse_if_not_already_pulsed();
+                        query_cache->terminate_internal(pair.second.get());
+                        pair.second->interrupt_reason =
+                            ql::query_cache_t::interrupt_reason_t::DELETE;
                         return;
                     }
                 }

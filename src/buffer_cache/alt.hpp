@@ -52,7 +52,7 @@ public:
     // cache account / priority thing is just one ghetto hack amidst a dozen other
     // throttling systems.  TODO: Come up with a consistent priority scheme,
     // i.e. define a "default" priority etc.  TODO: As soon as we can support it, we
-    // might consider supporting a mem_cap paremeter.
+    // might consider supporting a mem_cap parameter.
     cache_account_t create_cache_account(int priority);
 
 private:
@@ -90,6 +90,12 @@ public:
 
     ~txn_t();
 
+    // Every write transaction must be committed before it's
+    // destructed.
+    // There is no roll-back / abort! Destructing an uncommitted
+    // write-transaction will terminate the server.
+    void commit();
+
     cache_t *cache() { return cache_; }
     alt::page_txn_t *page_txn() { return page_txn_.get(); }
     access_t access() const { return access_; }
@@ -122,6 +128,8 @@ private:
     const write_durability_t durability_;
 
     scoped_ptr_t<alt::page_txn_t> page_txn_;
+
+    bool is_committed_;
 
     DISABLE_COPYING(txn_t);
 };
@@ -168,12 +176,14 @@ public:
     // Creates a block, a new child of the given parent.  It gets assigned a block id
     // from one of the unused block id's.
     buf_lock_t(buf_parent_t parent,
-               alt_create_t create);
+               alt_create_t create,
+               block_type_t block_type = block_type_t::normal);
 
     // Creates a block, a new child of the given parent.  It gets assigned a block id
     // from one of the unused block id's.
     buf_lock_t(buf_lock_t *parent,
-               alt_create_t create);
+               alt_create_t create,
+               block_type_t block_type = block_type_t::normal);
 
     ~buf_lock_t();
 
@@ -183,20 +193,21 @@ public:
     void swap(buf_lock_t &other);
     void reset_buf_lock();
     bool empty() const {
-        return txn_ == NULL;
+        return txn_ == nullptr;
     }
 
+    bool is_snapshotted() const;
     void snapshot_subdag();
 
     void detach_child(block_id_t child_id);
 
     block_id_t block_id() const {
-        guarantee(txn_ != NULL);
+        guarantee(txn_ != nullptr);
         return current_page_acq()->block_id();
     }
 
-    // It is illegal to call this on a buf lock that has been mark_deleted.  This
-    // never returns repli_timestamp_t::invalid.
+    // It is illegal to call this on a buf lock that has been mark_deleted, or that
+    // is a lock on an aux block.  This never returns repli_timestamp_t::invalid.
     repli_timestamp_t get_recency() const;
 
     // Sets the buf's recency to `superceding_recency`, which must be greater than or
@@ -226,7 +237,10 @@ public:
 
 private:
     void help_construct(buf_parent_t parent, block_id_t block_id, access_t access);
-    void help_construct(buf_parent_t parent, alt_create_t create);
+    void help_construct(
+        buf_parent_t parent,
+        alt_create_t create,
+        block_type_t block_type);
     void help_construct(buf_parent_t parent, block_id_t block_id, alt_create_t create);
 
     static alt_snapshot_node_t *help_make_child(cache_t *cache, block_id_t child_id);
@@ -270,27 +284,27 @@ private:
 
 class buf_parent_t {
 public:
-    buf_parent_t() : txn_(NULL), lock_or_null_(NULL) { }
+    buf_parent_t() : txn_(nullptr), lock_or_null_(nullptr) { }
 
     explicit buf_parent_t(buf_lock_t *lock)
         : txn_(lock->txn()), lock_or_null_(lock) {
-        guarantee(lock != NULL);
+        guarantee(lock != nullptr);
         guarantee(!lock->empty());
     }
 
-    explicit buf_parent_t(txn_t *txn)
-        : txn_(txn), lock_or_null_(NULL) {
-        rassert(txn != NULL);
+    explicit buf_parent_t(txn_t *_txn)
+        : txn_(_txn), lock_or_null_(nullptr) {
+        rassert(_txn != NULL);
     }
 
     void detach_child(block_id_t child_id) {
-        if (lock_or_null_ != NULL) {
+        if (lock_or_null_ != nullptr) {
             lock_or_null_->detach_child(child_id);
         }
     }
 
     bool empty() const {
-        return txn_ == NULL;
+        return txn_ == nullptr;
     }
 
     txn_t *txn() const {
@@ -313,9 +327,9 @@ public:
     explicit buf_read_t(buf_lock_t *lock);
     ~buf_read_t();
 
-    const void *get_data_read(uint32_t *block_size_out);
+    const void *get_data_read(uint16_t *block_size_out);
     const void *get_data_read() {
-        uint32_t block_size;
+        uint16_t block_size;
         const void *data = get_data_read(&block_size);
         guarantee(block_size == lock_->cache()->max_block_size().value());
         return data;
@@ -333,7 +347,7 @@ public:
     explicit buf_write_t(buf_lock_t *lock);
     ~buf_write_t();
 
-    void *get_data_write(uint32_t block_size);
+    void *get_data_write(uint16_t block_size);
     // Equivalent to passing the max_block_size.
     void *get_data_write();
 

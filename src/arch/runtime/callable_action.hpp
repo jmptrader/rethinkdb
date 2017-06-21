@@ -3,10 +3,11 @@
 
 #include <utility>
 
+#include "arch/compiler.hpp"
 #include "errors.hpp"
 
 /* The below classes may be used to create a generic callable object without
-  boost::function so as to avoid the heap allocation that boost::functions use.
+  std::function so as to avoid the heap allocation that std::functions use.
   Allocate a callable_action_wrapper_t (preferrably on the stack), then assign
   any callable object into it.  The wrapper will only use the heap if it can't
   fit inside the internal pre-allocated buffer. */
@@ -48,6 +49,10 @@ public:
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunreachable-code"
 #endif
+#if defined(__GNUC__) && (100 * __GNUC__ + __GNUC_MINOR__ >= 600)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wplacement-new="
+#endif
         // Allocate the action inside this object, if possible, or the heap otherwise
         if (sizeof(callable_action_instance_t<Callable>) > CALLABLE_CUTOFF_SIZE) {
             action_ = new callable_action_instance_t<Callable>(
@@ -58,6 +63,9 @@ public:
                     std::forward<Callable>(action));
             action_on_heap = false;
         }
+#if defined(__GNUC__) && (100 * __GNUC__ + __GNUC_MINOR__ >= 600)
+#pragma GCC diagnostic pop
+#endif
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
@@ -70,7 +78,7 @@ public:
 private:
     bool action_on_heap;
     callable_action_t *action_;
-    char action_data[CALLABLE_CUTOFF_SIZE] __attribute__((aligned(sizeof(void*))));
+    ATTR_ALIGNED(sizeof(void*)) char action_data[CALLABLE_CUTOFF_SIZE];
 
     DISABLE_COPYING(callable_action_wrapper_t);
 };
