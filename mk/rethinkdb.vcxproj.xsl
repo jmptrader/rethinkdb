@@ -155,6 +155,7 @@
               ssleay32.lib; libeay32.lib;
               v8_base_0.lib; v8_base_1.lib; v8_base_2.lib; v8_base_3.lib;
               v8_snapshot.lib; v8_libbase.lib; v8_libplatform.lib;
+              icui18n.lib; icuuc.lib;
               <xsl:if test="@configuration = 'Debug'">
                 gtest.lib;
               </xsl:if>
@@ -170,8 +171,6 @@
         </ItemDefinitionGroup>
 
         <ItemGroup Condition="'$(Configuration)|$(Platform)'=='{@configuration}|{@platform}'">
-          <ResourceCompile Include="build\bundle_assets\web_assets.rc" />
-          <ClCompile Include="build\bundle_assets\web_assets.cc" />
           <ClCompile Include="build\proto\rdb_protocol\ql2.pb.cc" />
           <ClCompile Include="src\**\*.cc">
             <xsl:choose>

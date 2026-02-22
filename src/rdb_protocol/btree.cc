@@ -130,9 +130,8 @@ void kv_location_delete(keyvalue_location_t *kv_location,
 
     kv_location->value.reset();
     rdb_value_sizer_t sizer(block_size);
-    null_key_modification_callback_t null_cb;
     apply_keyvalue_change(&sizer, kv_location, key.btree_key(), timestamp,
-            deletion_context->balancing_detacher(), &null_cb, delete_mode);
+            deletion_context->balancing_detacher(), delete_mode);
 }
 
 MUST_USE ql::serialization_result_t
@@ -174,11 +173,10 @@ kv_location_set(keyvalue_location_t *kv_location,
 
     // Actually update the leaf, if needed.
     kv_location->value = std::move(new_value);
-    null_key_modification_callback_t null_cb;
     rdb_value_sizer_t sizer(block_size);
     apply_keyvalue_change(&sizer, kv_location, key.btree_key(),
                           timestamp,
-                          deletion_context->balancing_detacher(), &null_cb,
+                          deletion_context->balancing_detacher(),
                           delete_mode_t::REGULAR_QUERY);
     return ql::serialization_result_t::SUCCESS;
 }
@@ -201,10 +199,9 @@ kv_location_set(keyvalue_location_t *kv_location,
     // Update the leaf, if needed.
     kv_location->value = std::move(new_value);
 
-    null_key_modification_callback_t null_cb;
     rdb_value_sizer_t sizer(kv_location->buf.cache()->max_block_size());
     apply_keyvalue_change(&sizer, kv_location, key.btree_key(), timestamp,
-                          deletion_context->balancing_detacher(), &null_cb,
+                          deletion_context->balancing_detacher(),
                           delete_mode_t::REGULAR_QUERY);
     return ql::serialization_result_t::SUCCESS;
 }
@@ -318,10 +315,10 @@ batched_replace_response_t rdb_replace_and_return_superblock(
 }
 
 ql::datum_t btree_batched_replacer_t::apply_write_hook(
-    ql::env_t *env,
     const datum_string_t &pkey,
     const ql::datum_t &d,
     const ql::datum_t &res_,
+    const ql::datum_t &write_timestamp,
     const counted_t<const ql::func_t> &write_hook) const {
     ql::datum_t res = res_;
     if (write_hook.has()) {
@@ -336,9 +333,18 @@ ql::datum_t btree_batched_replacer_t::apply_write_hook(
         }
         ql::datum_t modified;
         try {
-            modified = write_hook->call(env,
+            cond_t non_interruptor;
+            ql::env_t write_hook_env(&non_interruptor,
+                                     ql::return_empty_normal_batches_t::NO,
+                                     reql_version_t::LATEST);
+
+            ql::datum_object_builder_t builder;
+            builder.overwrite("primary_key", std::move(primary_key));
+            builder.overwrite("timestamp", write_timestamp);
+
+            modified = write_hook->call(&write_hook_env,
                                         std::vector<ql::datum_t>{
-                                            primary_key,
+                                            std::move(builder).to_datum(),
                                                 d,
                                                 res})->as_datum();
         } catch (ql::exc_t &e) {

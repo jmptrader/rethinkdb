@@ -1,11 +1,13 @@
 // Copyright 2015 RethinkDB, all rights reserved.
 
+#include <functional>
+
 #include "pprint/pprint.hpp"
 #include "unittest/gtest.hpp"
 
 namespace unittest {
 
-using namespace pprint;
+using pprint::pprint_streamer;
 
 std::string pretty_print(size_t width, pprint_streamer &&stream) {
     return pretty_print(width, std::move(stream).elems());
@@ -64,7 +66,7 @@ document_t make_text(std::string&& text) {
 }
 
 document_t make_cond(std::string &&l, std::string &&r, std::string &&t) {
-    cond_elem_spec elem{std::move(l), std::move(r), std::move(t)};
+    pprint::cond_elem_spec elem{std::move(l), std::move(r), std::move(t)};
     return document_t{[elem](pprint_streamer *pp) {
         pp->add(elem);
     }};
@@ -79,7 +81,7 @@ document_t make_group(document_t child) {
 
 document_t make_nest(document_t child) {
     return document_t{[child](pprint_streamer *pp) {
-        nested nest(pp);
+        pprint::nested nest(pp);
         child.func(pp);
     }};
 }
@@ -249,7 +251,7 @@ TEST(PPrintTest, GroupedCondWithTail) {
     {
         grouped group(&stream);
         stream.add_text("some text");
-        stream.add(cond_elem_spec{" ", "", " \\"});
+        stream.add(pprint::cond_elem_spec{" ", "", " \\"});
         stream.add_text("some more text");
     }
     pprint_streamer copy = stream;

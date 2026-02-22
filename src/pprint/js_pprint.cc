@@ -623,6 +623,12 @@ private:
         case Term::MUL:
         case Term::DIV:
         case Term::MOD:
+        case Term::BIT_AND:
+        case Term::BIT_OR:
+        case Term::BIT_XOR:
+        case Term::BIT_NOT:
+        case Term::BIT_SAL:
+        case Term::BIT_SAR:
         case Term::OBJECT:
         case Term::RANGE:
         case Term::DB_CREATE:
@@ -850,6 +856,7 @@ std::string pretty_print_as_js(size_t width, const ql::raw_term_t &t) {
 // - `should_continue_string` should add the new Term to the list if
 //   it should be used in a string-of-dotted-expressions context.  So
 //   like `r.foo(1).bar(2).baz(4)` instead of `r.eq(1, 2)`.
+//   ^^ What does this mean??
 // - `should_use_rdot` should add the new Term to the list if it
 //   represents some sort of specialized language feature--for example
 //   literals like 4, or strings, or variable names.  These are very
@@ -920,6 +927,12 @@ static void pprint_update_reminder() {
     case Term::MUL:
     case Term::DIV:
     case Term::MOD:
+    case Term::BIT_AND:
+    case Term::BIT_OR:
+    case Term::BIT_XOR:
+    case Term::BIT_NOT:
+    case Term::BIT_SAL:
+    case Term::BIT_SAR:
     case Term::APPEND:
     case Term::PREPEND:
     case Term::DIFFERENCE:

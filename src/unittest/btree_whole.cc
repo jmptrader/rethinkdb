@@ -2,6 +2,7 @@
 
 #include "arch/io/disk.hpp"
 #include "arch/types.hpp"
+#include "btree/depth_first_traversal.hpp"
 #include "btree/reql_specific.hpp"
 #include "buffer_cache/cache_balancer.hpp"
 #include "rdb_protocol/btree.hpp"
@@ -54,7 +55,8 @@ public:
                 std::move(inner_serializer),
                 MERGER_SERIALIZER_MAX_ACTIVE_WRITES);
 
-        cache = make_scoped<cache_t>(serializer.get(), &balancer, &get_global_perfmon_collection());
+        cache = make_scoped<cache_t>(serializer.get(), &balancer, &get_global_perfmon_collection(),
+                                     which_cpu_shard_t{0, 1});
         cache_conn = make_scoped<cache_conn_t>(cache.get());
         sizer = make_scoped<short_value_sizer_t>(cache.get()->max_block_size());
 
@@ -138,7 +140,6 @@ public:
             profile::trace_t trace;
             noop_value_deleter_t deleter;
             rdb_live_deletion_context_t deletion_context;
-            null_key_modification_callback_t null_cb;
 
             keyvalue_location_t kv_location;
             find_keyvalue_location_for_write(
@@ -162,7 +163,6 @@ public:
                 key.btree_key(),
                 timestamp,
                 &deleter,
-                &null_cb,
                 delete_mode_t::REGULAR_QUERY);
         });
 
@@ -180,7 +180,6 @@ public:
             profile::trace_t trace;
             noop_value_deleter_t deleter;
             rdb_live_deletion_context_t deletion_context;
-            null_key_modification_callback_t null_cb;
 
             keyvalue_location_t kv_location;
             find_keyvalue_location_for_write(
@@ -202,7 +201,6 @@ public:
                 key.btree_key(),
                 timestamp,
                 &deleter,
-                &null_cb,
                 delete_mode_t::REGULAR_QUERY);
         });
 

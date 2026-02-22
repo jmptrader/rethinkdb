@@ -12,12 +12,13 @@
 #include <iterator>
 
 #include "errors.hpp"
-#include <boost/detail/endian.hpp>
+#include <boost/predef/other/endian.h>
 
 #include "arch/runtime/coroutines.hpp"
 #include "cjson/json.hpp"
 #include "containers/archive/stl_types.hpp"
 #include "containers/scoped.hpp"
+#include "math.hpp"
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/rapidjson.h"
 #include "rapidjson/stringbuffer.h"
@@ -1121,7 +1122,7 @@ std::string datum_t::encode_tag_num(uint64_t tag_num) {
             "tag_size constant is assumed to be the size of a uint64_t.");
 #if defined(__s390x__)
     tag_num = __builtin_bswap64(tag_num);
-#elif !defined(BOOST_LITTLE_ENDIAN)
+#elif !defined(BOOST_ENDIAN_LITTLE_BYTE)
     static_assert(false, "This piece of code will break on big-endian systems.");
 #endif
     return std::string(reinterpret_cast<const char *>(&tag_num), tag_size);
@@ -1250,7 +1251,7 @@ components_t parse_secondary(const std::string &key) THROWS_NOTHING {
         uint64_t t = *reinterpret_cast<const uint64_t *>(tag_str.data());
 #if defined(__s390x__)
         t = __builtin_bswap64(t);
-#elif !defined(BOOST_LITTLE_ENDIAN)
+#elif !defined(BOOST_ENDIAN_LITTLE_BYTE)
         static_assert(false, "This piece of code will break on big endian systems.");
 #endif
         tag_num.set(t);
@@ -1519,15 +1520,15 @@ datum_t datum_t::get_field(const char *key, throw_bool_t throw_bool) const {
 }
 
 template <class json_writer_t>
-void datum_t::write_json_unchecked_stack(json_writer_t *writer) const {
-    switch (get_type()) {
-    case MINVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.minval` to JSON.");
-    case MAXVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.maxval` to JSON.");
-    case R_NULL: writer->Null(); break;
-    case R_BINARY: pseudo::encode_base64_ptype(as_binary(), writer); break;
-    case R_BOOL: writer->Bool(as_bool()); break;
-    case R_NUM: {
-        const double d = as_num();
+void write_json_unchecked_stack(const datum_t &datum, json_writer_t *writer) {
+    switch (datum.get_type()) {
+    case datum_t::MINVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.minval` to JSON.");
+    case datum_t::MAXVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.maxval` to JSON.");
+    case datum_t::R_NULL: writer->Null(); break;
+    case datum_t::R_BINARY: pseudo::encode_base64_ptype(datum.as_binary(), writer); break;
+    case datum_t::R_BOOL: writer->Bool(datum.as_bool()); break;
+    case datum_t::R_NUM: {
+        const double d = datum.as_num();
         // Always print -0.0 as a double since integers cannot represent -0.
         // Otherwise check if the number is an integer and print it as such.
         int64_t i;
@@ -1538,26 +1539,26 @@ void datum_t::write_json_unchecked_stack(json_writer_t *writer) const {
             writer->Double(d);
         }
     } break;
-    case R_STR: writer->String(as_str().data(), as_str().size()); break;
-    case R_ARRAY: {
+    case datum_t::R_STR: writer->String(datum.as_str().data(), datum.as_str().size()); break;
+    case datum_t::R_ARRAY: {
         writer->StartArray();
-        const size_t sz = arr_size();
+        const size_t sz = datum.arr_size();
         for (size_t i = 0; i < sz; ++i) {
-            unchecked_get(i).write_json(writer);
+            datum.unchecked_get(i).write_json(writer);
         }
         writer->EndArray();
     } break;
-    case R_OBJECT: {
+    case datum_t::R_OBJECT: {
         writer->StartObject();
-        const size_t sz = obj_size();
+        const size_t sz = datum.obj_size();
         for (size_t i = 0; i < sz; ++i) {
-            auto pair = get_pair(i);
+            auto pair = datum.get_pair(i);
             writer->Key(pair.first.data(), pair.first.size());
             pair.second.write_json(writer);
         }
         writer->EndObject();
     } break;
-    case UNINITIALIZED: // fallthru
+    case datum_t::UNINITIALIZED: // fallthru
     default: unreachable();
     }
 }
@@ -1565,7 +1566,7 @@ void datum_t::write_json_unchecked_stack(json_writer_t *writer) const {
 template <class json_writer_t>
 void datum_t::write_json(json_writer_t *writer) const {
     call_with_enough_stack_datum([&] {
-            return this->write_json_unchecked_stack<json_writer_t>(writer);
+            return write_json_unchecked_stack<json_writer_t>(*this, writer);
         });
 }
 
@@ -1574,43 +1575,6 @@ template void datum_t::write_json(
     rapidjson::Writer<rapidjson::StringBuffer> *writer) const;
 template void datum_t::write_json(
     rapidjson::PrettyWriter<rapidjson::StringBuffer> *writer) const;
-
-rapidjson::Value datum_t::as_json(rapidjson::Value::AllocatorType *allocator) const {
-    switch (get_type()) {
-    case MINVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.minval` to JSON.");
-    case MAXVAL: rfail_datum(base_exc_t::LOGIC, "Cannot convert `r.maxval` to JSON.");
-    case R_NULL: return rapidjson::Value(rapidjson::kNullType);
-    case R_BINARY: return pseudo::encode_base64_ptype(as_binary(), allocator);
-    case R_BOOL: return rapidjson::Value(as_bool());
-    case R_NUM: return rapidjson::Value(as_num());
-    case R_STR: return rapidjson::Value(as_str().data(), as_str().size(), *allocator);
-    case R_ARRAY: {
-        rapidjson::Value res(rapidjson::kArrayType);
-        for (size_t i = 0; i < arr_size(); ++i) {
-            const datum_t el = unchecked_get(i);
-            el.call_with_enough_stack_datum([&]() {
-                    res.PushBack(el.as_json(allocator), *allocator);
-                });
-        }
-        return res;
-    } break;
-    case R_OBJECT: {
-        rapidjson::Value res(rapidjson::kObjectType);
-        for (size_t i = 0; i < obj_size(); ++i) {
-            auto pair = get_pair(i);
-            pair.second.call_with_enough_stack_datum([&]() {
-                    res.AddMember(rapidjson::Value(pair.first.data(),
-                                                   pair.first.size(), *allocator),
-                                  pair.second.as_json(allocator), *allocator);
-                });
-        }
-        return res;
-    } break;
-    case UNINITIALIZED: // fallthru
-    default: unreachable();
-    }
-    unreachable();
-}
 
 cJSON *datum_t::as_json_raw() const {
     switch (get_type()) {

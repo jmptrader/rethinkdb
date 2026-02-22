@@ -4,7 +4,12 @@ WEB_ASSETS_SRC_FILES := $(shell find $(TOP)/admin -path $(TOP)/admin/node_module
 
 ALL_WEB_ASSETS := $(BUILD_ROOT_DIR)/web-assets
 
-$(BUILD_ROOT_DIR)/web-assets: $(WEB_ASSETS_SRC_FILES) $(JS_BUILD_DIR)/rethinkdb.js | $(GULP_BIN_DEP)
+$(BUILD_ROOT_DIR)/packages/js:
+	@mkdir -p $@
+	@cp -r $(TOP)/external/rethinkdb_js_2.4.2/*  $@
+	@cd $@ && npm install
+
+$(BUILD_ROOT_DIR)/web-assets: $(WEB_ASSETS_SRC_FILES) $(BUILD_ROOT_DIR)/packages/js | $(GULP_BIN_DEP)
 	$P GULP
 	$(GULP) build --cwd $(TOP)/admin $(if $(filter $(VERBOSE),0), --silent) --version $(RETHINKDB_VERSION) $(if $(filter $(UGLIFY),1), --uglify)
 	touch $@
@@ -16,22 +21,6 @@ web-assets-watch:
 .PHONY: web-assets
 web-assets: $(ALL_WEB_ASSETS)
 
-ifeq (1,$(USE_PRECOMPILED_WEB_ASSETS))
-
-$(BUILD_ROOT_DIR)/bundle_assets/web_assets.cc: $(PRECOMPILED_DIR)/bundle_assets/web_assets.cc | $(BUILD_ROOT_DIR)/bundle_assets/.
-	$P CP
-	cp -f $< $@
-
-else # Don't use precompiled assets
-
-ifeq ($(OS),Windows)
-$(BUILD_ROOT_DIR)/bundle_assets/web_%.cc $(BUILD_ROOT_DIR)/bundle_assets/web_%.rc: $(TOP)/scripts/build-web-%-rc.py $(ALL_WEB_ASSETS) | $(BUILD_ROOT_DIR)/bundle_assets/.
-	$P GENERATE
-	$(TOP)/scripts/build-web-assets-rc.py $(WEB_ASSETS_BUILD_DIR) $(dir $@)
-else
-$(BUILD_ROOT_DIR)/bundle_assets/web_assets.cc: $(TOP)/scripts/compile-web-assets.py $(ALL_WEB_ASSETS) | $(BUILD_ROOT_DIR)/bundle_assets/.
-	$P GENERATE
-	$(TOP)/scripts/compile-web-assets.py $(WEB_ASSETS_BUILD_DIR) > $@
-endif
-
-endif
+.PHONY: generate-web-assets-cc
+generate-web-assets-cc: web-assets
+	$(TOP)/scripts/compile-web-assets.py $(TOP)/build/web_assets > src/gen/web_assets.cc

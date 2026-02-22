@@ -3,6 +3,7 @@
 
 #include <map>
 
+#include "math.hpp"
 #include "rdb_protocol/batching.hpp"
 #include "rdb_protocol/datum_stream/array.hpp"
 #include "rdb_protocol/datum_stream/eq_join.hpp"
@@ -35,8 +36,6 @@
 #include "rdb_protocol/term.hpp"
 #include "rdb_protocol/val.hpp"
 #include "utils.hpp"
-
-#include "debug.hpp"
 
 namespace ql {
 
@@ -1892,9 +1891,7 @@ ordered_union_datum_stream_t::ordered_union_datum_stream_t(
           env->get_rdb_ctx(),
           env->return_empty_normal_batches,
           &non_interruptor,
-          env->get_all_optargs(),
-          env->get_user_context(),
-          env->get_deterministic_time(),
+          env->get_serializable_env(),
           nullptr)),
       lt(_comparisons),
       merge_cache(merge_less_t{merge_env.get(), nullptr, &lt}) {

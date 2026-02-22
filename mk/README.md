@@ -43,9 +43,6 @@ its web UI also requires the web assets.
 
 * `make tags`, `make etags`: Generate tag files used by vim and emacs.
 
-* `make ALLOW_WARNINGS=0`: Fail if the C++ compiler generates a
-  warning, by enabling `-Werror`.
-
 * `./configure CXX=... CXXFLAGS=...`: Build with a different compiler
   or flags.
 
@@ -76,39 +73,18 @@ Web assets
 
 * `make web-assets`: Build only the web assets.
 
-* If there is a `precompiled/web` folder, the web assets will not be
-  rebuilt unless the `--disable-precompiled-web` flag is passed to
-  `./configure`
-
 * The web assets are compiled into the executable. To speed up
   development time and avoid rebuilding the executable, the
   `--web-static-directory` option can be used. For example:
   `build/release/rethinkdb --web-static-directory build/web_assets`
 
-Drivers
--------
-
-* `make ruby-driver`: Build the Ruby driver
-
-* `make python-driver`: Build the Python driver.
-
-* `make js-driver`: Build the JavaScript driver.
-
-* `make drivers`: Build all the drivers.
-
-
 Test
----
+----
 
-* `make unit`: Build and run the unit tests.
-
-* `make test`: Run the unit tests, reql tests and integration
-  tests. The `TEST` variables determines which tests to run. See
-  `test/run -h` for more documentation.
-
+* `make test`: Invokes `./test/run`
 
 Dependencies
----
+------------
 
 * `make support` or `make support-<dep>`: Build the dependencies that
   have not been built yet.
@@ -127,7 +103,7 @@ Dependencies
 
 
 Installation
----
+------------
 
 * `./configure --prefix`: Set the prefix folder used by `make install`.
 
@@ -139,7 +115,7 @@ Installation
 
 
 Packaging
----
+---------
 
 Packaging is usually automated by the BuildBot instance running on
 `dr-doom:8010` in our intranet.

@@ -32,16 +32,17 @@
 #include "perfmon/perfmon.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
+#include "rapidjson/writer.h"
 #include "rdb_protocol/rdb_backtrace.hpp"
 #include "rdb_protocol/base64.hpp"
+#include "rdb_protocol/datum_json.hpp"
 #include "rdb_protocol/env.hpp"
-#include "rpc/semilattice/view.hpp"
-#include "time.hpp"
-
-#include "rdb_protocol/ql2.pb.h"
+#include "rdb_protocol/ql2proto.hpp"
 #include "rdb_protocol/query_server.hpp"
 #include "rdb_protocol/query_cache.hpp"
 #include "rdb_protocol/response.hpp"
+#include "rpc/semilattice/view.hpp"
+#include "time.hpp"
 
 http_conn_cache_t::http_conn_t::http_conn_t(rdb_context_t *rdb_ctx,
                                             ip_and_port_t client_addr_port) :
@@ -174,12 +175,13 @@ void http_conn_cache_t::on_ring() {
 }
 
 size_t http_conn_cache_t::sha_hasher_t::operator()(const conn_key_t &x) const {
-    EVP_MD_CTX c;
-    EVP_DigestInit(&c, EVP_sha256());
-    EVP_DigestUpdate(&c, x.data(), x.size());
+    EVP_MD_CTX *c = EVP_MD_CTX_create();
+    EVP_DigestInit(c, EVP_sha256());
+    EVP_DigestUpdate(c, x.data(), x.size());
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int digest_size = 0;
-    EVP_DigestFinal(&c, digest, &digest_size);
+    EVP_DigestFinal(c, digest, &digest_size);
+    EVP_MD_CTX_destroy(c);
     rassert(digest_size >= sizeof(size_t));
     size_t res = 0;
     memcpy(&res, digest, std::min(sizeof(size_t), static_cast<size_t>(digest_size)));
@@ -709,14 +711,14 @@ void query_server_t::handle(const http_req_t &req,
                 ticks_t start = get_ticks();
                 // We don't throttle HTTP queries.
                 handler->run_query(query.get(), &response, &true_interruptor);
-                ticks_t ticks = get_ticks() - start;
+                ticks_t ticks = ticks_t{get_ticks().nanos - start.nanos};
 
                 if (!response.profile()) {
                     ql::datum_array_builder_t array_builder(
                         ql::configured_limits_t::unlimited);
                     ql::datum_object_builder_t object_builder;
                     object_builder.overwrite("duration(ms)",
-                        ql::datum_t(static_cast<double>(ticks) / MILLION));
+                        ql::datum_t(static_cast<double>(ticks.nanos) / MILLION));
                     array_builder.add(std::move(object_builder).to_datum());
                     response.set_profile(std::move(array_builder).to_datum());
                 }

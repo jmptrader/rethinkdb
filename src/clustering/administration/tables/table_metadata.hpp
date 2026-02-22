@@ -10,15 +10,12 @@
 
 #include "buffer_cache/types.hpp"   // for `write_durability_t`
 #include "clustering/administration/servers/server_metadata.hpp"
-#include "clustering/administration/tables/database_metadata.hpp"
 #include "clustering/generic/nonoverlapping_regions.hpp"
 #include "containers/name_string.hpp"
+#include "containers/optional.hpp"
 #include "containers/uuid.hpp"
 #include "rdb_protocol/protocol.hpp"
-#include "rpc/semilattice/joins/deletable.hpp"
 #include "rpc/semilattice/joins/macros.hpp"
-#include "rpc/semilattice/joins/map.hpp"
-#include "rpc/semilattice/joins/versioned.hpp"
 #include "rpc/serialize_macros.hpp"
 
 /* This is the metadata for a single table. */
@@ -46,6 +43,29 @@ ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(
     write_ack_config_t::SINGLE,
     write_ack_config_t::MAJORITY);
 
+class flush_interval_default_t {
+public:
+    bool operator==(flush_interval_default_t) const { return true; }
+    RDB_MAKE_ME_SERIALIZABLE_0(flush_interval_default_t);
+};
+class flush_interval_never_t {
+public:
+    bool operator==(flush_interval_never_t) const { return true; }
+    RDB_MAKE_ME_SERIALIZABLE_0(flush_interval_never_t);
+};
+
+class flush_interval_config_t {
+public:
+    // Use the default value, or never flush, or specify a non-negative double.
+    boost::variant<flush_interval_default_t,
+                   flush_interval_never_t,
+                   double> variant;
+};
+
+flush_interval_config_t default_flush_interval_config();
+
+RDB_MAKE_SERIALIZABLE_1(flush_interval_config_t, variant);
+
 class user_data_t {
 public:
     ql::datum_t datum;
@@ -60,14 +80,7 @@ class table_config_t {
 public:
     class shard_t {
     public:
-        std::set<server_id_t> voting_replicas() const {
-            std::set<server_id_t> s;
-            std::set_difference(
-                all_replicas.begin(), all_replicas.end(),
-                nonvoting_replicas.begin(), nonvoting_replicas.end(),
-                std::inserter(s, s.end()));
-            return s;
-        }
+        std::set<server_id_t> voting_replicas() const;
 
         /* `nonvoting_replicas` must be a subset of `all_replicas`. `primary_replica`
         must be in `all_replicas` and not in `nonvoting_replicas`. */
@@ -81,6 +94,7 @@ public:
     optional<write_hook_config_t> write_hook;
     write_ack_config_t write_ack_config;
     write_durability_t durability;
+    flush_interval_config_t flush_interval;
     user_data_t user_data;  // has user-exposed name "data"
 };
 
@@ -88,6 +102,8 @@ RDB_DECLARE_EQUALITY_COMPARABLE(table_config_t);
 
 RDB_DECLARE_SERIALIZABLE(table_config_t::shard_t);
 RDB_DECLARE_EQUALITY_COMPARABLE(table_config_t::shard_t);
+
+flush_interval_t get_flush_interval(const table_config_t &);
 
 class table_shard_scheme_t {
 public:
@@ -101,27 +117,8 @@ public:
         return split_points.size() + 1;
     }
 
-    key_range_t get_shard_range(size_t i) const {
-        guarantee(i < num_shards());
-        store_key_t left = (i == 0) ? store_key_t::min() : split_points[i-1];
-        if (i != num_shards() - 1) {
-            return key_range_t(
-                key_range_t::closed, left,
-                key_range_t::open, split_points[i]);
-        } else {
-            return key_range_t(
-                key_range_t::closed, left,
-                key_range_t::none, store_key_t());
-        }
-    }
-
-    size_t find_shard_for_key(const store_key_t &key) const {
-        size_t ix = 0;
-        while (ix < split_points.size() && key >= split_points[ix]) {
-            ++ix;
-        }
-        return ix;
-    }
+    key_range_t get_shard_range(size_t i) const;
+    size_t find_shard_for_key(const store_key_t &key) const;
 };
 
 RDB_DECLARE_SERIALIZABLE(table_shard_scheme_t);
@@ -195,21 +192,9 @@ public:
 
     /* Note, it's important that `apply_change` does not change
     `table_config_and_shards` if it returns false. */
-    bool apply_change(table_config_and_shards_t *table_config_and_shards) const {
-        return boost::apply_visitor(
-            apply_change_visitor_t(table_config_and_shards), change);
-    }
+    bool apply_change(table_config_and_shards_t *table_config_and_shards) const;
 
-    bool name_and_database_equal(const table_basic_config_t &table_basic_config) const {
-        const set_table_config_and_shards_t *set_table_config_and_shards =
-            boost::get<set_table_config_and_shards_t>(&change);
-        if (set_table_config_and_shards == nullptr) {
-            return true;
-        } else {
-            return set_table_config_and_shards->new_config_and_shards.config.basic.name == table_basic_config.name &&
-                set_table_config_and_shards->new_config_and_shards.config.basic.database == table_basic_config.database;
-        }
-    }
+    bool name_and_database_equal(const table_basic_config_t &table_basic_config) const;
 
     RDB_MAKE_ME_SERIALIZABLE_1(table_config_and_shards_change_t, change);
 
@@ -222,66 +207,7 @@ private:
         write_hook_create_t,
         write_hook_drop_t> change;
 
-    class apply_change_visitor_t
-        : public boost::static_visitor<bool> {
-    public:
-        explicit apply_change_visitor_t(
-                table_config_and_shards_t *_table_config_and_shards)
-            : table_config_and_shards(_table_config_and_shards) { }
-
-        result_type operator()(
-                const set_table_config_and_shards_t &set_table_config_and_shards) const {
-            *table_config_and_shards =
-                set_table_config_and_shards.new_config_and_shards;
-            return true;
-        }
-
-        result_type operator()(const write_hook_create_t &write_hook_create) const {
-            table_config_and_shards->config.write_hook.set(write_hook_create.config);
-            return true;
-        }
-
-        result_type operator()(UNUSED const write_hook_drop_t &write_hook_drop) const {
-            table_config_and_shards->config.write_hook = r_nullopt;
-            return true;
-        }
-
-        result_type operator()(const sindex_create_t &sindex_create) const {
-            auto pair = table_config_and_shards->config.sindexes.insert(
-                std::make_pair(sindex_create.name, sindex_create.config));
-            return pair.second;
-        }
-
-        result_type operator()(const sindex_drop_t &sindex_drop) const {
-            auto size = table_config_and_shards->config.sindexes.erase(sindex_drop.name);
-            return size == 1;
-        }
-
-        result_type operator()(const sindex_rename_t &sindex_rename) const {
-            if (table_config_and_shards->config.sindexes.count(
-                    sindex_rename.name) == 0) {
-                /* The index `sindex_rename.name` does not exist. */
-                return false;
-            }
-            if (sindex_rename.name != sindex_rename.new_name) {
-                if (table_config_and_shards->config.sindexes.count(
-                            sindex_rename.new_name) == 1 &&
-                        sindex_rename.overwrite == false) {
-                    /* The index `sindex_rename.new_name` already exits and should not be
-                    overwritten. */
-                    return false;
-                } else {
-                    table_config_and_shards->config.sindexes[sindex_rename.new_name] =
-                        table_config_and_shards->config.sindexes.at(sindex_rename.name);
-                    table_config_and_shards->config.sindexes.erase(sindex_rename.name);
-                }
-            }
-            return true;
-        }
-
-    private:
-        table_config_and_shards_t *table_config_and_shards;
-    };
+    class apply_change_visitor_t;
 };
 
 RDB_DECLARE_SERIALIZABLE(table_config_and_shards_change_t::set_table_config_and_shards_t);

@@ -5,7 +5,7 @@
 #include "containers/counted.hpp"
 #include "rdb_protocol/datum.hpp"
 #include "rdb_protocol/error.hpp"
-#include "rdb_protocol/ql2.pb.h"
+#include "rdb_protocol/ql2proto.hpp"
 #include "rdb_protocol/val.hpp"
 #include "rdb_protocol/term_storage.hpp"
 
@@ -35,7 +35,7 @@ class table_t;
 class table_slice_t;
 class var_captures_t;
 class compile_env_t;
-enum class deterministic_t;
+class deterministic_t;
 
 enum eval_flags_t {
     NO_FLAGS = 0,

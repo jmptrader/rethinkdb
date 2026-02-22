@@ -4,8 +4,8 @@
 
 #include <map>
 #include <set>
+#include <stdexcept>
 
-#include "concurrency/interruptor.hpp"
 #include "concurrency/signal.hpp"
 #include "containers/uuid.hpp"
 #include "region/region_map.hpp"

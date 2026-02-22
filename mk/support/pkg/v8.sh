@@ -1,4 +1,6 @@
-if [[ "$OS" = Windows ]]; then
+ARCH=`uname -m`
+
+if [[ "$OS" = Windows || "$ARCH" = "ppc64le" ]]; then
     # V8 3.30 doesn't play well with Visual Studio 2015
     # But 4.7 has no source distribution, making it harder to build on Linux
     version=4.7.80.23
@@ -60,29 +62,31 @@ pkg_install-include () {
 
     if [[ "$($CXX -dumpmachine)" = "s390x-linux-gnu" ]]; then
         # for s390x we need to generate correct header files
-       cd $build_dir
-       export PATH=$(pwd)/depot_tools:$PATH
-       #cd v8z
-       make dependencies
-       make s390x -j4 library=static
+        cd $build_dir
+        export PATH=$(pwd)/depot_tools:$PATH
+        #cd v8z
+        make dependencies
+        make s390x -j4 library=static
 
-       #s390x cp -RL "$src_dir/include/." "$install_dir/include"
-       cp -RL "$build_dir/include/." "$install_dir/include"
-       cp -RL "$build_dir/third_party/icu/source/common/." "$install_dir/include"
-       sed -i.bak 's/include\///' "$install_dir/include/libplatform/libplatform.h"
+        #s390x cp -RL "$src_dir/include/." "$install_dir/include"
+        cp -RL "$build_dir/include/." "$install_dir/include"
+        cp -RL "$build_dir/third_party/icu/source/common/." "$install_dir/include"
+        sed -i.bak 's/include\///' "$install_dir/include/libplatform/libplatform.h"
+    elif [[ $ARCH = "ppc64le" ]]; then
+        cp -RL "$src_dir/include/." "$install_dir/include"
+        sed -i.bak 's/include\///' "$install_dir/include/libplatform/libplatform.h"
     else
-       cp -RL "$src_dir/include/." "$install_dir/include"
-       sed -i.bak 's/include\///' "$install_dir/include/libplatform/libplatform.h"
+        cp -RL "$src_dir/include/." "$install_dir/include"
+        sed -i.bak 's/include\///' "$install_dir/include/libplatform/libplatform.h"
 
-       # -- assemble the icu headers
-       if [[ "$CROSS_COMPILING" = 1 ]]; then
-           ( cross_build_env; in_dir "$build_dir/third_party/icu" ./configure --prefix="$(niceabspath "$install_dir")" --enable-static "$@" )
-       else
-           in_dir "$build_dir/third_party/icu/source" ./configure --prefix="$(niceabspath "$install_dir")" --enable-static --disable-layout "$@"
-       fi
+        # -- assemble the icu headers
+        if [[ "$CROSS_COMPILING" = 1 ]]; then
+            ( cross_build_env; in_dir "$build_dir/third_party/icu/source" ./configure --prefix="$(niceabspath "$install_dir")" --enable-static --disable-layout "$@" )
+        else
+            in_dir "$build_dir/third_party/icu/source" ./configure --prefix="$(niceabspath "$install_dir")" --enable-static --disable-layout "$@"
+        fi
 
-       in_dir "$build_dir/third_party/icu/source" make install-headers-recursive
-
+        in_dir "$build_dir/third_party/icu/source" make install-headers-recursive
     fi
 }
 
@@ -126,14 +130,17 @@ pkg_install () {
         export GYP_DEFINES='mac_deployment_target=10.7'
     fi
     arch_gypflags=
-    raspberry_pi_gypflags='-Darm_version=6 -Darm_fpu=vfpv2'
+    arm_gypflags='-Darm_version=6 -Darm_fpu=vfpv2'
     host=$($CXX -dumpmachine)
     case ${host%%-*} in
-        i?86)   arch=ia32 ;;
-        x86_64) arch=x64 ;;
-        arm*)   arch=arm; arch_gypflags=$raspberry_pi_gypflags ;;
-        s390x)  arch=s390x ;;
-        *)      arch=native ;;
+        i?86)    arch=ia32 ;;
+        x86_64)  arch=x64 ;;
+        arm64)   arch=arm64; arch_gypflags=$arm_gypflags ;;
+        aarch64) arch=aarch64; arch_gypflags=$arm_gypflags ;;
+        arm*)    arch=arm; arch_gypflags=$arm_gypflags ;;
+        s390x)   arch=s390x ;;
+	ppc64le*|powerpc*) arch=ppc64 ;;
+        *)       arch=native ;;
     esac
     mode=release
     if [[ "$arch" = "s390x" ]]; then
@@ -142,22 +149,36 @@ pkg_install () {
            cp $lib "$install_dir/lib/${name/.$arch/}"
        done
     else
-       pkg_make $arch.$mode CXX=$CXX LINK=$CXX LINK.target=$CXX GYPFLAGS="-Dwerror= $arch_gypflags" V=1
-       for lib in `find "$build_dir/out/$arch.$mode" -maxdepth 1 -name \*.a` `find "$build_dir/out/$arch.$mode/obj.target" -name \*.a`; do
-           name=`basename $lib`
-           cp $lib "$install_dir/lib/${name/.$arch/}"
-       done
-       touch "$install_dir/lib/libv8.a" # Create a dummy libv8.a because the makefile looks for it
+        if [[ "$CROSS_COMPILING" = 1 ]]; then
+            arch_gypflags="$arch_gypflags -Dwant_separate_host_toolset=1"
+        fi
+        if [[ "$arch" = "ppc64" ]]; then
+            arch_gypflags="$arch_gypflags -Duse_system_icu=1"
+        fi
+        pkg_make $arch.$mode CXX=$CXX LINK=$CXX LINK.target=$CXX GYPFLAGS="-Dwerror= $arch_gypflags" V=1
+        for lib in `find "$build_dir/out/$arch.$mode" -maxdepth 1 -name \*.a` `find "$build_dir/out/$arch.$mode/obj.target" -name \*.a`; do
+            name=`basename $lib`
+            cp $lib "$install_dir/lib/${name/.$arch/}"
+        done
+        touch "$install_dir/lib/libv8.a" # Create a dummy libv8.a because the makefile looks for it
     fi
 }
 
 pkg_link-flags () {
     # These are the necessary libraries recommended by the docs:
     # https://developers.google.com/v8/get_started#hello
-    for lib in libv8_{base,libbase,snapshot,libplatform}; do
-        echo "$install_dir/lib/$lib.a"
-    done
-    for lib in libicu{i18n,uc,data}; do
-        echo "$install_dir/lib/$lib.a"
-    done
+     if [[ "$ARCH" != "ppc64le" ]]; then
+	 for lib in libv8_{base,libbase,snapshot,libplatform}; do
+             echo "$install_dir/lib/$lib.a"
+    	 done
+    	 for lib in libicu{i18n,uc,data}; do
+             echo "$install_dir/lib/$lib.a"
+    	done
+    elif [[ "$ARCH" == "ppc64le" ]]; then
+        # ICU is linked separately
+        for lib in libv8_{base,libbase,nosnapshot,libplatform}; do
+                echo "$install_dir/lib/$lib.a"
+        done
+        echo "-licui18n -licuuc -ldl"
+    fi
 }
